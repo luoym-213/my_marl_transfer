@@ -16,7 +16,7 @@ def weights_init(m):
 
 class MPNN(nn.Module):
     def __init__(self, action_space, num_agents, num_entities, input_size=16, hidden_dim=128, embed_dim=None,
-                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=1, mask_dist=None, entity_mp=False):
+                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=1, mask_dist=None, mask_obs_dist=None, entity_mp=False):
         super().__init__()
 
         self.h_dim = hidden_dim
@@ -27,6 +27,7 @@ class MPNN(nn.Module):
         self.embed_dim = self.h_dim if embed_dim is None else embed_dim
         self.n_heads = n_heads
         self.mask_dist = mask_dist
+        self.mask_obs_dist = mask_obs_dist
         self.input_size = input_size
         self.entity_mp = entity_mp
         # this index must be from the beginning of observation vector
@@ -34,7 +35,7 @@ class MPNN(nn.Module):
 
         self.encoder = nn.Sequential(nn.Linear(self.input_size,self.h_dim),
                                      self.nonlin(inplace=True))
-
+                
         self.messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
 
         self.update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
@@ -46,6 +47,14 @@ class MPNN(nn.Module):
 
         self.policy_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
                                          self.nonlin(inplace=True))
+        
+        self.agent_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
+                                     self.nonlin(inplace=True))
+        
+        self.agent_messages = MultiHeadAttention(n_heads=1,input_dim=self.h_dim,embed_dim=self.embed_dim)
+
+        self.agent_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
+                                          self.nonlin(inplace=True))
 
         if self.entity_mp:
             self.entity_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
@@ -78,7 +87,10 @@ class MPNN(nn.Module):
         
         pos = inp[:, self.pos_index:self.pos_index+2]
         bsz = inp.size(0)//self.num_agents
+        pos_obs = inp[:, self.pos_index:self.pos_index+2]
+        bsz_obs = inp.size(0)//self.num_agents
         mask = torch.full(size=(bsz,self.num_agents,self.num_agents),fill_value=0,dtype=torch.uint8)
+        mask_agents = torch.full(size=(bsz_obs,self.num_agents,self.num_agents),fill_value=0,dtype=torch.uint8)
         
         if self.mask_dist is not None and self.mask_dist > 0: 
             for i in range(1,self.num_agents):
@@ -87,7 +99,7 @@ class MPNN(nn.Module):
                 restrict = dists > self.mask_dist
                 for x in range(self.num_agents):
                     mask[:,x,(x+i)%self.num_agents].copy_(restrict[bsz*x:bsz*(x+1)])
-        
+       
         elif self.mask_dist is not None and self.mask_dist == -10:
            if self.dropout_mask is None or bsz!=self.dropout_mask.shape[0] or np.random.random_sample() < 0.1: # sample new dropout mask
                temp = torch.rand(mask.size()) > 0.85
@@ -95,14 +107,22 @@ class MPNN(nn.Module):
                self.dropout_mask = (temp+temp.transpose(1,2))!=0
            mask.copy_(self.dropout_mask)
 
-        return mask            
+        if self.mask_obs_dist is not None and self.mask_obs_dist > 0: 
+            for j in range(1,self.num_agents):
+                shifted_obs = torch.roll(pos_obs,-bsz_obs*j,0)
+                dists_obs = torch.norm(pos_obs-shifted_obs,dim=1)
+                restrict_obs = dists_obs > self.mask_obs_dist
+                for y in range(self.num_agents):
+                    mask_agents[:,y,(y+j)%self.num_agents].copy_(restrict_obs[bsz_obs*y:bsz_obs*(y+1)])
+
+        return mask,mask_agents            
 
 
     def _fwd(self, inp):
         # inp should be (batch_size,input_size)
         # inp - {iden, vel(2), pos(2), entities(...)}
         agent_inp = inp[:,:self.input_size]         
-        mask = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted
+        mask, mask_agents = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted
 
         h = self.encoder(agent_inp) # should be (batch_size,self.h_dim)
         if self.entity_mp:
