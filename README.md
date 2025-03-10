@@ -12,6 +12,7 @@ This work has been presented at the [Learning and Reasoning with Graph-Structure
 See `requirements.txt` file for the list of dependencies. Create a virtualenv with python 3.5 and setup everything by executing `pip install -r requirements.txt`. 
 
 ## Examples
+
 See `arguments.py` file for the list of various command line arguments one can set while running scripts. 
 
 ### Normal Training
@@ -28,6 +29,7 @@ Similarly scripts for **Formation Control** (`simple_formation`) and **Line Cont
 Specify the flag `--test` if you do not want to save anything. 
 
 ### Curriculum Training
+
 To start curriculum training, specify the number of agents in `automate.py` file and execute:
 
 `python automate.py --env-name simple_spread --entity-mp --save-dir 0`

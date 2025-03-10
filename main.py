@@ -12,14 +12,12 @@ from eval import evaluate
 from learner import setup_master
 from pprint import pprint
 
-
 np.set_printoptions(suppress=True, precision=4)
-
 
 def train(args, return_early=False):
     writer = SummaryWriter(args.log_dir)    
     envs = utils.make_parallel_envs(args) 
-    master = setup_master(args) 
+    master = setup_master(args)
     # used during evaluation only
     eval_master, eval_env = setup_master(args, return_env=True) 
     obs = envs.reset() # shape - num_processes x num_agents x obs_dim
@@ -39,9 +37,14 @@ def train(args, return_early=False):
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
+            #print("step: ", step)
+            #print("masks: ", masks)
             final_rewards *= masks
+            #print("rewards: ", reward)
             final_rewards += (1 - masks) * episode_rewards
+            #print("final_rewards2: ", final_rewards)
             episode_rewards *= masks
+            #print("episode_rewards: ", episode_rewards)
 
             master.update_rollout(obs, reward, masks)
           

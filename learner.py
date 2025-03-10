@@ -39,6 +39,12 @@ def setup_master(args, env=None, return_env=False):
         pol_obs_dim = env.observation_space[i].shape[0] - 2*num_entities
     else:
         pol_obs_dim = env.observation_space[i].shape[0]
+    
+    '''
+    print("action_space: ", action_space)
+    print("observation_space:", env.observation_space[i].shape[0])
+    print("pol_obs_dim: ", pol_obs_dim)
+    '''
 
     # index at which agent's position is present in its observation
     pos_index = args.identity_size + 2
@@ -59,7 +65,7 @@ def setup_master(args, env=None, return_env=False):
     
     if args.continue_training:
         print("Loading pretrained model")
-        master.load_models(torch.load(args.load_dir)['models'])
+        master.load_models(torch.load(args.load_dir, map_location=torch.device('cpu'))['models'])
 
     if return_env:
         return master, env
