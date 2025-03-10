@@ -36,7 +36,7 @@ def setup_master(args, env=None, return_env=False):
         raise NotImplementedError('Unknown environment, define entity_mp for this!')
 
     if entity_mp:
-        pol_obs_dim = env.observation_space[i].shape[0] - 2*num_entities
+        pol_obs_dim = env.observation_space[i].shape[0] - 2*(2*num_entities-1)
     else:
         pol_obs_dim = env.observation_space[i].shape[0]
     

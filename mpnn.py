@@ -101,14 +101,14 @@ class MPNN(nn.Module):
     def _fwd(self, inp):
         # inp should be (batch_size,input_size)
         # inp - {iden, vel(2), pos(2), entities(...)}
-        agent_inp = inp[:,:self.input_size]          
+        agent_inp = inp[:,:self.input_size]         
         mask = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted
 
         h = self.encoder(agent_inp) # should be (batch_size,self.h_dim)
         if self.entity_mp:
-            landmark_inp = inp[:,self.input_size:] # x,y pos of landmarks wrt agents
+            landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
             # should be (batch_size,self.num_entities,self.h_dim)
-            he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim) 
+            he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim)
             entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
             h = self.entity_update(torch.cat((h,entity_message),1)) # should be (batch_size,self.h_dim)
 
@@ -120,6 +120,7 @@ class MPNN(nn.Module):
         h = h.transpose(0,1).contiguous().view(-1,self.h_dim)
         
         self.attn_mat = attn.squeeze().detach().cpu().numpy()
+        # print("h shape: ", h.shape)
         return h # should be <batch_size, self.h_dim> again
 
     def forward(self, inp, state, mask=None):

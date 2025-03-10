@@ -21,6 +21,7 @@ def train(args, return_early=False):
     # used during evaluation only
     eval_master, eval_env = setup_master(args, return_env=True) 
     obs = envs.reset() # shape - num_processes x num_agents x obs_dim
+    print("obs shape: ", obs.shape)
     master.initialize_obs(obs)
     n = len(master.all_agents)
     episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
@@ -31,6 +32,7 @@ def train(args, return_early=False):
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
+                # print("step: ", step)
                 actions_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             obs, reward, done, info = envs.step(agent_actions)
