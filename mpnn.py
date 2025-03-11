@@ -114,6 +114,8 @@ class MPNN(nn.Module):
                 restrict_obs = dists_obs > self.mask_obs_dist
                 for y in range(self.num_agents):
                     mask_agents[:,y,(y+j)%self.num_agents].copy_(restrict_obs[bsz_obs*y:bsz_obs*(y+1)])
+        
+        mask_agents = mask_agents.masked_select(~torch.eye(self.num_agents, self.num_agents, device=mask_agents.device, dtype=torch.bool)).view(bsz_obs, self.num_agents, self.num_agents-1)
 
         return mask,mask_agents            
 
@@ -125,6 +127,14 @@ class MPNN(nn.Module):
         mask, mask_agents = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted
 
         h = self.encoder(agent_inp) # should be (batch_size,self.h_dim)
+
+        agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
+        ha = self.agent_encoder(agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
+        #print("ha shape: ", ha.shape) 
+        agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True)
+        h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
+        #print("h shape: ", h.shape)
+
         if self.entity_mp:
             landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
             # should be (batch_size,self.num_entities,self.h_dim)
@@ -239,7 +249,7 @@ class MultiHeadAttention(nn.Module):
         hflat = h.contiguous().view(-1, input_dim)
         qflat = q.contiguous().view(-1, input_dim)
 
-        # last dimension can be different for keys and values
+        # last dimension can be different for keys and values 定义形状
         shp = (self.n_heads, batch_size, graph_size, -1)
         shp_q = (self.n_heads, batch_size, n_query, -1)
 
