@@ -23,6 +23,7 @@ def get_args():
     parser.add_argument('--num-processes', type=int, default=32, help='how many training CPU processes to use (default: 32)')
     parser.add_argument('--num-steps', type=int, default=128, help='number of forward steps in PPO (default: 128)')
     parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
+    parser.add_argument('--mps', action='store_true', default=False, help='if use mac gpu')
     parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')
     parser.add_argument('--arena-size', type=int, default=1, help='size of arena')
 
@@ -65,6 +66,7 @@ def get_args():
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     args.device = torch.device("cuda" if args.cuda else "cpu")
+    args.device = torch.device("mps" if args.mps else args.device)
     args.save_dir = '../marlsave/save_new/'+args.save_dir
     args.log_dir = args.save_dir + '/' + args.log_dir
 
