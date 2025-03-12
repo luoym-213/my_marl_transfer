@@ -42,7 +42,7 @@ for i, file_path in enumerate(file_paths):
 
     color = colors[i % len(colors)]
     if args.smooth:
-        df['Value'] = df['Value'].rolling(window=5).mean()
+        df['Value'] = df['Value'].rolling(window=2).mean()
     plt.plot(df['Step'], df['Value'], color=color, label=labels[i])
 
 

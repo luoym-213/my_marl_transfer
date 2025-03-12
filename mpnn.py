@@ -16,7 +16,7 @@ def weights_init(m):
 
 class MPNN(nn.Module):
     def __init__(self, action_space, num_agents, num_entities, input_size=16, hidden_dim=128, embed_dim=None,
-                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=1, mask_dist=None, mask_obs_dist=None, entity_mp=False):
+                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None, entity_mp=False):
         super().__init__()
 
         self.h_dim = hidden_dim
@@ -51,7 +51,7 @@ class MPNN(nn.Module):
         self.agent_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
                                      self.nonlin(inplace=True))
         
-        self.agent_messages = MultiHeadAttention(n_heads=1,input_dim=self.h_dim,embed_dim=self.embed_dim)
+        self.agent_messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
 
         self.agent_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
                                           self.nonlin(inplace=True))
@@ -60,7 +60,7 @@ class MPNN(nn.Module):
             self.entity_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
                                                 self.nonlin(inplace=True))
             
-            self.entity_messages = MultiHeadAttention(n_heads=1,input_dim=self.h_dim,embed_dim=self.embed_dim)
+            self.entity_messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
             
             self.entity_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
                                                self.nonlin(inplace=True))
@@ -128,6 +128,8 @@ class MPNN(nn.Module):
 
         h = self.encoder(agent_inp) # should be (batch_size,self.h_dim)
 
+
+        ### agnet_observe procession ###
         agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
         ha = self.agent_encoder(agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
         #print("ha shape: ", ha.shape) 
@@ -135,6 +137,7 @@ class MPNN(nn.Module):
         h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
         #print("h shape: ", h.shape)
 
+        ### entity_observe procession ###
         if self.entity_mp:
             landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
             # should be (batch_size,self.num_entities,self.h_dim)
@@ -144,13 +147,16 @@ class MPNN(nn.Module):
 
         h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
         
+
+        ### communication ###
         for k in range(self.K):
             m, attn = self.messages(h, mask=mask, return_attn=True) # should be <batch_size/N,N,self.embed_dim>
             h = self.update(torch.cat((h,m),2)) # should be <batch_size/N,N,self.h_dim>
         h = h.transpose(0,1).contiguous().view(-1,self.h_dim)
         
         self.attn_mat = attn.squeeze().detach().cpu().numpy()
-        # print("h shape: ", h.shape)
+        
+        
         return h # should be <batch_size, self.h_dim> again
 
     def forward(self, inp, state, mask=None):
