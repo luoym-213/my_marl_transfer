@@ -86,7 +86,7 @@ class MPNN(nn.Module):
         # inp is batch_size x self.input_size where batch_size is num_processes*num_agents
         
         pos = inp[:, self.pos_index:self.pos_index+2]
-        bsz = inp.size(0)//self.num_agents
+        bsz = inp.size(0)//self.num_agents  # num_processes
         pos_obs = inp[:, self.pos_index:self.pos_index+2]
         bsz_obs = inp.size(0)//self.num_agents
         mask = torch.full(size=(bsz,self.num_agents,self.num_agents),fill_value=0,dtype=torch.uint8)
@@ -117,7 +117,15 @@ class MPNN(nn.Module):
         
         mask_agents = mask_agents.masked_select(~torch.eye(self.num_agents, self.num_agents, device=mask_agents.device, dtype=torch.bool)).view(bsz_obs, self.num_agents, self.num_agents-1)
 
-        return mask,mask_agents            
+        return mask,mask_agents
+
+    def calculate_mask_entity(self, inp):
+        # inp: landmark's positon, [num_processes * num_agents, num_agents]
+        bsz = inp.size(0)//self.num_agents  # num_processes
+        dists = torch.norm(inp.contiguous().view(bsz * self.num_agents, self.num_agents, 2), p=2, dim=2) # [bsz*num_agents, num_agents]
+        restrict = dists > self.mask_obs_dist # [bsz*num_agents, num_agents]
+        mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
+        return mask            
 
 
     def _fwd(self, inp):
@@ -130,9 +138,10 @@ class MPNN(nn.Module):
 
 
         ### agnet_observe procession ###
-        agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
-        ha = self.agent_encoder(agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
+        other_agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
+        ha = self.agent_encoder(other_agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
         #print("ha shape: ", ha.shape) 
+        #print("mask_agents shape: ", mask_agents.shape)
         agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True)
         h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
         #print("h shape: ", h.shape)
@@ -141,9 +150,13 @@ class MPNN(nn.Module):
         if self.entity_mp:
             landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
             # should be (batch_size,self.num_entities,self.h_dim)
+            # compute entity mask
+            mask_entity = self.calculate_mask_entity(landmark_inp)
+            #print("mask_entity shape: ", mask_entity.shape)
             he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim)
-            entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
-            h = self.entity_update(torch.cat((h,entity_message),1)) # should be (batch_size,self.h_dim)
+            #entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
+            entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
+            h = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
 
         h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
         
@@ -156,7 +169,7 @@ class MPNN(nn.Module):
         
         self.attn_mat = attn.squeeze().detach().cpu().numpy()
         
-        
+
         return h # should be <batch_size, self.h_dim> again
 
     def forward(self, inp, state, mask=None):
@@ -269,7 +282,7 @@ class MultiHeadAttention(nn.Module):
         compatibility = self.norm_factor * torch.matmul(Q, K.transpose(2, 3))
         # Optionally apply mask to prevent attention
         if mask is not None:
-            mask = mask.view(1, batch_size, n_query, graph_size).expand_as(compatibility)
+            mask = mask.contiguous().view(1, batch_size, n_query, graph_size).expand_as(compatibility)
             compatibility[mask] = -math.inf
 
         attn = F.softmax(compatibility, dim=-1)
