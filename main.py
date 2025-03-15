@@ -7,10 +7,13 @@ import utils
 import random
 from copy import deepcopy
 from arguments import get_args
-from tensorboardX import SummaryWriter
+#from tensorboardX import SummaryWriter
+from torch.utils.tensorboard import SummaryWriter
 from eval import evaluate
 from learner import setup_master
 from pprint import pprint
+
+from mpnn import ActWrapper
 
 np.set_printoptions(suppress=True, precision=4)
 
@@ -24,6 +27,12 @@ def train(args, return_early=False):
     print("obs shape: ", obs.shape)
     master.initialize_obs(obs)
     n = len(master.all_agents)
+
+    #add graph to tensorboard
+    fake_input = torch.rand([args.num_processes*n, obs.shape[2]])
+    act_warp = ActWrapper(master.policies_list[0])
+    writer.add_graph(act_warp, input_to_model=fake_input)
+
     episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
     final_rewards = torch.zeros([args.num_processes, n], device=args.device)
 

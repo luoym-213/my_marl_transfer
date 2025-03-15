@@ -84,7 +84,7 @@ class MPNN(nn.Module):
 
     def calculate_mask(self, inp):
         # inp is batch_size x self.input_size where batch_size is num_processes*num_agents
-        
+
         pos = inp[:, self.pos_index:self.pos_index+2]
         bsz = inp.size(0)//self.num_agents  # num_processes
         pos_obs = inp[:, self.pos_index:self.pos_index+2]
@@ -94,7 +94,7 @@ class MPNN(nn.Module):
         
         if self.mask_dist is not None and self.mask_dist > 0: 
             for i in range(1,self.num_agents):
-                shifted = torch.roll(pos,-bsz*i,0)
+                shifted = torch.roll(pos,-int(bsz)*i,0)
                 dists = torch.norm(pos-shifted,dim=1)
                 restrict = dists > self.mask_dist
                 for x in range(self.num_agents):
@@ -109,7 +109,7 @@ class MPNN(nn.Module):
 
         if self.mask_obs_dist is not None and self.mask_obs_dist > 0: 
             for j in range(1,self.num_agents):
-                shifted_obs = torch.roll(pos_obs,-bsz_obs*j,0)
+                shifted_obs = torch.roll(pos_obs,-int(bsz_obs)*j,0)
                 dists_obs = torch.norm(pos_obs-shifted_obs,dim=1)
                 restrict_obs = dists_obs > self.mask_obs_dist
                 for y in range(self.num_agents):
@@ -122,9 +122,11 @@ class MPNN(nn.Module):
     def calculate_mask_entity(self, inp):
         # inp: landmark's positon, [num_processes * num_agents, num_agents]
         bsz = inp.size(0)//self.num_agents  # num_processes
+        mask = torch.full(size=(bsz,self.num_agents,self.num_agents),fill_value=0,dtype=torch.uint8)
         dists = torch.norm(inp.contiguous().view(bsz * self.num_agents, self.num_agents, 2), p=2, dim=2) # [bsz*num_agents, num_agents]
         restrict = dists > self.mask_obs_dist # [bsz*num_agents, num_agents]
-        mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
+        result =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
+        mask.copy_(result)
         return mask            
 
 
@@ -140,8 +142,6 @@ class MPNN(nn.Module):
         ### agnet_observe procession ###
         other_agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
         ha = self.agent_encoder(other_agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
-        #print("ha shape: ", ha.shape) 
-        #print("mask_agents shape: ", mask_agents.shape)
         agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True)
         h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
         #print("h shape: ", h.shape)
@@ -152,9 +152,8 @@ class MPNN(nn.Module):
             # should be (batch_size,self.num_entities,self.h_dim)
             # compute entity mask
             mask_entity = self.calculate_mask_entity(landmark_inp)
-            #print("mask_entity shape: ", mask_entity.shape)
             he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim)
-            #entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
+            # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
             entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
             h = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
 
@@ -303,3 +302,14 @@ class MultiHeadAttention(nn.Module):
         if return_attn:
             return out, attn
         return out
+
+class ActWrapper(nn.Module):
+    def __init__(self, inner_model):
+        super(ActWrapper, self).__init__()
+        self.inner_model = inner_model
+
+    def forward(self, inp):
+        dummy_state = None
+        dummy_mask = None
+        value, action, action_log_probs, new_state = self.inner_model.act(inp, dummy_state, dummy_mask)
+        return action
