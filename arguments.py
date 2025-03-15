@@ -67,8 +67,10 @@ def get_args():
     args.cuda = not args.no_cuda and torch.cuda.is_available()
     args.device = torch.device("cuda" if args.cuda else "cpu")
     args.device = torch.device("mps" if args.mps else args.device)
+    args.log_dir = args.log_dir + '_' + args.save_dir
     args.save_dir = '../marlsave/save_new/'+args.save_dir
     args.log_dir = args.save_dir + '/' + args.log_dir
+    print('log dir: ', args.log_dir)
 
     if args.continue_training:
         assert args.load_dir is not None and os.path.exists(args.load_dir), \
