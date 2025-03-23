@@ -54,6 +54,7 @@ def get_args():
     # Miscellaneous
     parser.add_argument('--test', action='store_true')
     parser.add_argument('--load-dir', default=None, help='filename to load all policies from')
+    parser.add_argument('--return-early', action='store_true')
     parser.add_argument('--eval-interval', default=50, type=int)
     parser.add_argument('--continue-training', action='store_true')
 

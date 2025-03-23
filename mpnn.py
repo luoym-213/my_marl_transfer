@@ -65,6 +65,11 @@ class MPNN(nn.Module):
             self.entity_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
                                                self.nonlin(inplace=True))
         
+        self.group_messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
+
+        self.group_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
+                                         self.nonlin(inplace=True))
+
         num_actions = action_space.n
         self.dist = Categorical(self.h_dim,num_actions)
 
@@ -142,8 +147,9 @@ class MPNN(nn.Module):
         ### agnet_observe procession ###
         other_agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
         ha = self.agent_encoder(other_agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
-        agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True)
-        h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
+        agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True) # (batch_size,1,self.h_dim)
+        #print("agent_message shape: ", agent_message.shape)
+        #hah = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
         #print("h shape: ", h.shape)
 
         ### entity_observe procession ###
@@ -154,8 +160,13 @@ class MPNN(nn.Module):
             mask_entity = self.calculate_mask_entity(landmark_inp)
             he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim)
             # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
-            entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
-            h = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
+            entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,1,self.h_dim)
+            #print("entity_message shape: ", entity_message.shape)
+            #heh = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
+
+        ha_he = torch.cat((ha,he),1)
+        group_message = self.group_messages(h.unsqueeze(1),ha_he) # should be (batch_size,1,self.h_dim)
+        h = self.group_update(torch.cat((h,group_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
 
         h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
         

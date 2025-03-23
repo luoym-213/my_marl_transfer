@@ -41,7 +41,7 @@ def train(args, return_early=False):
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
-                #print("step: ", step)
+                # print("step: ", step)
                 actions_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             obs, reward, done, info = envs.step(agent_actions)
@@ -144,4 +144,4 @@ if __name__ == '__main__':
             params = deepcopy(vars(args))
             params.pop('device')
             json.dump(params, f)
-    train(args)
+    train(args, args.return_early)
