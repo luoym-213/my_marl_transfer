@@ -164,8 +164,8 @@ class MPNN(nn.Module):
             #print("entity_message shape: ", entity_message.shape)
             #heh = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
 
-        ha_he = torch.cat((ha,he),1)
-        group_message = self.group_messages(h.unsqueeze(1),ha_he) # should be (batch_size,1,self.h_dim)
+        amsg_emsg = torch.cat((agent_message,entity_message),1) # should be (batch_size,2,self.h_dim)
+        group_message = self.group_messages(h.unsqueeze(1),amsg_emsg) # should be (batch_size,1,self.h_dim)
         h = self.group_update(torch.cat((h,group_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
 
         h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
