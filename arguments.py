@@ -3,6 +3,7 @@ import os
 import sys
 import torch
 import shutil
+import subprocess
 
 
 def get_args():
@@ -54,11 +55,20 @@ def get_args():
     parser.add_argument('--load-dir', default=None, help='filename to load all policies from')
     parser.add_argument('--eval-interval', default=50, type=int)
     parser.add_argument('--continue-training', action='store_true')
+    parser.add_argument('--branch', default=None, help='Git branch name (auto-detected if not provided)')
 
     # we always set these to TRUE, so automating this
     parser.add_argument('--no-clipped-value-loss', action='store_true')
     
     args = parser.parse_args()
+
+    # add branch
+    if args.branch is None:
+        try:
+            args.branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).decode('utf-8').strip()
+        except Exception:
+            args.branch = 'unknown'
+
 
     args.clipped_value_loss = not args.no_clipped_value_loss
 
