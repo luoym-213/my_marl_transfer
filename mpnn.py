@@ -16,7 +16,7 @@ def weights_init(m):
 
 class MPNN(nn.Module):
     def __init__(self, action_space, num_agents, num_entities, input_size=16, hidden_dim=128, embed_dim=None,
-                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=1, mask_dist=None, mask_obs_dist=None, entity_mp=False):
+                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None, entity_mp=False):
         super().__init__()
 
         self.h_dim = hidden_dim
@@ -51,7 +51,7 @@ class MPNN(nn.Module):
         self.agent_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
                                      self.nonlin(inplace=True))
         
-        self.agent_messages = MultiHeadAttention(n_heads=1,input_dim=self.h_dim,embed_dim=self.embed_dim)
+        self.agent_messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
 
         self.agent_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
                                           self.nonlin(inplace=True))
@@ -60,7 +60,7 @@ class MPNN(nn.Module):
             self.entity_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
                                                 self.nonlin(inplace=True))
             
-            self.entity_messages = MultiHeadAttention(n_heads=1,input_dim=self.h_dim,embed_dim=self.embed_dim)
+            self.entity_messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
             
             self.entity_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
                                                self.nonlin(inplace=True))
@@ -114,9 +114,17 @@ class MPNN(nn.Module):
                 restrict_obs = dists_obs > self.mask_obs_dist
                 for y in range(self.num_agents):
                     mask_agents[:,y,(y+j)%self.num_agents].copy_(restrict_obs[bsz_obs*y:bsz_obs*(y+1)])
-
+        mask_agents = mask_agents.masked_select(~torch.eye(self.num_agents, self.num_agents, device=mask_agents.device, dtype=torch.bool)).view(bsz_obs, self.num_agents, self.num_agents-1)
+        
         return mask,mask_agents             
 
+    def calculate_mask_entity(self, inp):
+        # inp: landmark's positon, [num_processes * num_agents, num_agents]
+        bsz = inp.size(0)//self.num_agents  # num_processes
+        dists = torch.norm(inp.contiguous().view(bsz * self.num_agents, self.num_agents, 2), p=2, dim=2) # [bsz*num_agents, num_agents]
+        restrict = dists > self.mask_obs_dist # [bsz*num_agents, num_agents]
+        mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
+        return mask 
 
     def _fwd(self, inp):
         # inp should be (batch_size,input_size)
@@ -125,12 +133,23 @@ class MPNN(nn.Module):
         mask, mask_agents = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted         
 
         h = self.encoder(agent_inp) # should be (batch_size,self.h_dim)
+
+        other_agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
+        ha = self.agent_encoder(other_agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
+        #print("ha shape: ", ha.shape) 
+        agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True)
+        h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
+        #print("h shape: ", h.shape)
+
         if self.entity_mp:
             landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
             # should be (batch_size,self.num_entities,self.h_dim)
+            # compute entity mask
+            mask_entity = self.calculate_mask_entity(landmark_inp)
             he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim)
-            entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
-            h = self.entity_update(torch.cat((h,entity_message),1)) # should be (batch_size,self.h_dim)
+            # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
+            entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
+            h = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
 
         h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
         
@@ -253,7 +272,7 @@ class MultiHeadAttention(nn.Module):
         compatibility = self.norm_factor * torch.matmul(Q, K.transpose(2, 3))
         # Optionally apply mask to prevent attention
         if mask is not None:
-            mask = mask.view(1, batch_size, n_query, graph_size).expand_as(compatibility)
+            mask = mask.contiguous().view(1, batch_size, n_query, graph_size).expand_as(compatibility)
             compatibility[mask] = -math.inf
 
         attn = F.softmax(compatibility, dim=-1)
