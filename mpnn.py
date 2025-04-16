@@ -133,14 +133,14 @@ class MPNN(nn.Module):
         mask, mask_agents = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted         
 
         h = self.encoder(agent_inp) # should be (batch_size,self.h_dim)
-
+        '''
         other_agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
         ha = self.agent_encoder(other_agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
         #print("ha shape: ", ha.shape) 
         agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True)
         h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
         #print("h shape: ", h.shape)
-
+        '''
         if self.entity_mp:
             landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
             # should be (batch_size,self.num_entities,self.h_dim)
