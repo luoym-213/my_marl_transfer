@@ -1,0 +1,12 @@
+Metadata-Version: 2.1
+Name: gym_vecenv
+Version: 1.0
+Summary: Python3 wrapper for running multiple OpenAI Gym compatible environments in parallel
+Home-page: https://github.com/agakshat/gym_vecenv
+Author: Akshat Agarwal
+Author-email: agarwalaks30@gmail.com
+License: MIT
+License-File: LICENSE
+Requires-Dist: cloudpickle
+Requires-Dist: gym
+Requires-Dist: numpy
