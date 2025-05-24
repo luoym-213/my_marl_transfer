@@ -141,7 +141,7 @@ class Learner(object):
 
             all_value = torch.chunk(next_value,len(team))
             for i in range(len(team)):
-                team[i].wrap_horizon(all_value[i])
+                team[i].wrap_horizon(all_value[i])  # 计算每个agent的reward
 
     def after_update(self):
         for agent in self.all_agents:
