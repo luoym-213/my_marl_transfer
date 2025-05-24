@@ -146,7 +146,8 @@ class MPNN(nn.Module):
             # should be (batch_size,self.num_entities,self.h_dim)
             # compute entity mask
             mask_entity = self.calculate_mask_entity(landmark_inp)
-            he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim)
+            #print("mask_entity: ", mask_entity)
+            he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim) # [num_agents*numprocesses, num_entities, 128]
             # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
             entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
             h = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
@@ -172,6 +173,7 @@ class MPNN(nn.Module):
         return self.policy_head(x)
 
     def act(self, inp, state, mask=None, deterministic=False):
+        # 收集team中每个agent的观察 
         x = self._fwd(inp)
         value = self._value(x)
         dist = self.dist(self._policy(x))

@@ -1,5 +1,7 @@
 from rlcore.algo import PPO
 from rlcore.storage import RolloutStorage
+import torch
+import torch.nn as nn
 
 
 class Neo(object):
@@ -39,3 +41,39 @@ class Neo(object):
 
   def update(self):
     return self.trainer.update(self.rollouts)
+  
+  def filter_obs(self, step, obs, input_size = 4):
+    # obs:[32,14]
+    # 仅提取entity的obs
+    # 新增实体过滤逻辑
+    num_entities = self.args.num_agents
+    mask_obs_dist = self.args.mask_obs_dist
+
+    entity_inp = obs[:, input_size:input_size+self.args.num_agents*2]
+  
+    # 将entity_inp重塑为[processes, num_entities, 2]
+    entities = entity_inp.view(-1, num_entities, 2)
+    
+    # 计算相对距离（L2范数）
+    distances = torch.norm(entities, p=2, dim=2)  # [processes, num_entities]
+    
+    # 生成观测掩码
+    valid_mask = (distances <= mask_obs_dist)
+    # 构建带标签的观测列表
+    labeled_entities = torch.cat([
+        entities,
+        torch.zeros_like(entities[:, :, :1])  # 添加label维度，初始化为0
+    ], dim=2)  # [processes, num_entities, 3]
+    
+    # 应用掩码过滤
+    valid_observations = [
+        [entity.tolist() for entity, valid in zip(process_entities, process_mask) if valid]
+        for process_entities, process_mask in zip(labeled_entities, valid_mask)
+    ]
+    
+    # 收集有效观测数据
+    for process_idx, observations in enumerate(valid_observations):
+        self.rollouts.obs_valid.collect_observations(step, process_idx, observations)
+    
+    # return valid_observations
+    

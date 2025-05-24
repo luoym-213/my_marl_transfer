@@ -33,6 +33,7 @@ class PPO():
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
 
     def update(self, rollouts):
+        print("i am ppo")
         advantages = rollouts.returns[:-1] - rollouts.value_preds[:-1]
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
 
@@ -114,6 +115,7 @@ class JointPPO():
 
     def update(self, rollouts_list):
         # rollouts_list - list of rollouts of agents which share self.actor_critic policy
+        print("i am jointppo")
         advantages_list = []
         for rollout in rollouts_list:
             advantages = rollout.returns[:-1] - rollout.value_preds[:-1]

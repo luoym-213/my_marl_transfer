@@ -4,7 +4,7 @@ from rlcore.algo import JointPPO
 from rlagent import Neo
 from mpnn import MPNN
 from utils import make_multiagent_env
-
+from diaf import DIAF
 
 def setup_master(args, env=None, return_env=False):
     if env is None:
@@ -39,12 +39,6 @@ def setup_master(args, env=None, return_env=False):
         pol_obs_dim = env.observation_space[i].shape[0] - 2*(2*num_entities-1)
     else:
         pol_obs_dim = env.observation_space[i].shape[0]
-    
-    '''
-    print("action_space: ", action_space)
-    print("observation_space:", env.observation_space[i].shape[0])
-    print("pol_obs_dim: ", pol_obs_dim)
-    '''
 
     # index at which agent's position is present in its observation
     pos_index = args.identity_size + 2
@@ -61,7 +55,10 @@ def setup_master(args, env=None, return_env=False):
                 policy2 = MPNN(input_size=pol_obs_dim,num_agents=num_friendly,num_entities=num_entities,action_space=action_space,
                                pos_index=pos_index, mask_dist=args.mask_dist,mask_obs_dist=args.mask_obs_dist,entity_mp=entity_mp).to(args.device)
             team2.append(Neo(args,policy2,(obs_dim,),action_space))
-    master = Learner(args, [team1, team2], [policy1, policy2], env)
+
+    diaf_method = DIAF(args, num_agents=args.num_agents, num_entities=num_entities, input_size=pol_obs_dim).to(args.device)
+    
+    master = Learner(args, [team1, team2], [policy1, policy2], env, diaf_method)
     
     if args.continue_training:
         print("Loading pretrained model")
@@ -74,7 +71,7 @@ def setup_master(args, env=None, return_env=False):
 
 class Learner(object):
     # supports centralized training of agents in a team
-    def __init__(self, args, teams_list, policies_list, env):
+    def __init__(self, args, teams_list, policies_list, env, dm):
         self.teams_list = [x for x in teams_list if len(x)!=0]
         self.all_agents = [agent for team in teams_list for agent in team]
         self.policies_list = [x for x in policies_list if x is not None]
@@ -82,7 +79,9 @@ class Learner(object):
                                        args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
                                        use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
         self.device = args.device
+        self.args = args
         self.env = env
+        self.dm = dm
 
     @property
     def all_policies(self):
@@ -100,11 +99,24 @@ class Learner(object):
 
     def act(self, step):
         actions_list = []
+        dm = self.dm
         for team, policy in zip(self.teams_list, self.policies_list):
             # concatenate all inputs
             all_obs = torch.cat([agent.rollouts.obs[step] for agent in team])
             all_hidden = torch.cat([agent.rollouts.recurrent_hidden_states[step] for agent in team])
             all_masks = torch.cat([agent.rollouts.masks[step] for agent in team])
+
+            mask = dm.calculate_mask(all_obs) # mask: [96,5]，通信范围内为true，否则为false，与后面的mpnn的判断逻辑恰好相反
+            # 第一步时进行初始化
+            if step == 0:
+                # 第一步需要对两个last以及卡尔曼参数进行初始化
+                dm.initialize_last(team, mask)
+                dm.initialize_kalman(team)
+                
+            else: # 后面的步骤进行提取融合
+                new_value, new_mask = dm.infer_and_fuse(all_obs, mask, team, step)
+            
+            all_value = torch.cat([agent.rollouts.last_value[step] for agent in team])
 
             props = policy.act(all_obs, all_hidden, all_masks, deterministic=False) # a single forward pass 
 
@@ -112,6 +124,7 @@ class Learner(object):
             n = len(team)
             all_value, all_action, all_action_log_prob, all_states = [torch.chunk(x, n) for x in props]
             for i in range(n):
+                # 这里规定了所有agent的self.states, self.action, self.action_log_prob, self.value
                 team[i].value = all_value[i]
                 team[i].action = all_action[i]
                 team[i].action_log_prob = all_action_log_prob[i]

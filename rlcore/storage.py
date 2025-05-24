@@ -10,6 +10,10 @@ class RolloutStorage(object):
     def __init__(self, num_steps, num_processes, obs_shape, action_space, recurrent_hidden_state_size):
         self.obs = torch.zeros(num_steps + 1, num_processes, *obs_shape)    # (129,32,14)
         self.recurrent_hidden_states = torch.zeros(num_steps + 1, num_processes, recurrent_hidden_state_size)
+        self.last_value = torch.zeros(num_steps + 1, num_processes, *obs_shape) # (129,32,14)
+        self.last_mask = torch.zeros(num_steps + 1, num_processes, *((dim - 4)//2 for dim in obs_shape)) # (129,32,5)
+        self.kalman_vel = torch.zeros(num_steps + 1, num_processes, *obs_shape) # （129,32,14）
+        self.kalman_P = torch.zeros(num_steps + 1, num_processes, *((dim - 4)//2 for dim in obs_shape),4, 4) # 协方差矩阵 (129,32,5,4,4)
         self.rewards = torch.zeros(num_steps, num_processes, 1)
         self.value_preds = torch.zeros(num_steps + 1, num_processes, 1)
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
@@ -23,6 +27,10 @@ class RolloutStorage(object):
     def to(self, device):
         self.obs = self.obs.to(device)
         self.recurrent_hidden_states = self.recurrent_hidden_states.to(device)
+        self.last_value = self.last_value.to(device)
+        self.last_mask = self.last_mask.to(device)
+        self.kalman_vel = self.kalman_vel.to(device)
+        self.kalman_P = self.kalman_P.to(device)
         self.rewards = self.rewards.to(device)
         self.value_preds = self.value_preds.to(device)
         self.returns = self.returns.to(device)
