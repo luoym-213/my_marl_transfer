@@ -105,8 +105,10 @@ class Learner(object):
             all_obs = torch.cat([agent.rollouts.obs[step] for agent in team])
             all_hidden = torch.cat([agent.rollouts.recurrent_hidden_states[step] for agent in team])
             all_masks = torch.cat([agent.rollouts.masks[step] for agent in team])
+            print("all_obs: ", all_obs[0][4:10])
 
             mask = dm.calculate_mask(all_obs) # mask: [96,5]，通信范围内为true，否则为false，与后面的mpnn的判断逻辑恰好相反
+            print("mask_old: ", mask[0])
             # 第一步时进行初始化
             if step == 0:
                 # 第一步需要对两个last以及卡尔曼参数进行初始化
@@ -115,9 +117,11 @@ class Learner(object):
                 
             else: # 后面的步骤进行提取融合
                 new_value, new_mask = dm.infer_and_fuse(all_obs, mask, team, step)
+                # new_value: [96,14]，new_mask: [96,5]
+                print("new_value: ", new_value[0][4:10])
+                print("new_mask: ", new_mask[0])
             
-            all_value = torch.cat([agent.rollouts.last_value[step] for agent in team])
-
+            
             props = policy.act(all_obs, all_hidden, all_masks, deterministic=False) # a single forward pass 
 
             # split all outputs

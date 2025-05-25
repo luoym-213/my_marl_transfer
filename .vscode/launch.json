@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+      {
+        "name": "Python: Launch with args",
+        "type": "python",
+        "request": "launch",
+        "program": "${workspaceFolder}/main.py",  // 主程序路径
+        "console": "integratedTerminal",          // 或 "externalTerminal"
+        "args": [
+          "--env-name", "simple_spread",
+          "--num-agents", "3",
+          "--entity-mp",
+          "--num-frames", "40500000",
+          "--num-eval-episodes", "50",
+          "--save-dir", "test",
+          "--num-processes", "32",
+          "--masking",
+          "--mask-dist", "2",
+          "--mask-obs-dist", "1"
+        ]
+      }
+    ]
+  }

@@ -34,7 +34,10 @@ class DIAF(nn.Module):
     
     def initialize_last(self, team, mask):
         for i,agent in enumerate(team):
-            agent.rollouts.last_value[0].copy_(agent.rollouts.obs[0])
+            position_abs = agent.rollouts.obs[0].clone()  # 创建原始数据的副本 [32,14]
+            ego = agent.rollouts.obs[0][:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
+            position_abs[:, 4:] = agent.rollouts.obs[0][:, 4:] + ego # [96,10]，这里的位置数据已经是绝对位置
+            agent.rollouts.last_value[0].copy_(position_abs)
             ini_mask = (mask.contiguous().view(self.num_agents, self.args.num_processes, self.num_agents * 2 - 1) > 0).float().permute(1, 0, 2)
             agent.rollouts.last_mask[0].copy_(ini_mask[:,i,:]).to(self.args.device)
     
@@ -125,7 +128,7 @@ class DIAF(nn.Module):
         ], device=value.device, dtype=torch.float32)  # [2, 4]
 
         # 观测的是位置，所以观测噪声为0.01
-        R = torch.diag(torch.tensor([0.01, 0.01], device=value.device))  # [2, 2]
+        R = torch.diag(torch.tensor([1e-5, 1e-5], device=value.device))  # [2, 2]
 
         # 创新（residual）
         z_pred = state @ H.T  # [N, 2]
@@ -213,6 +216,8 @@ class DIAF(nn.Module):
         # 情况3：lm!=0, mask==0
         # a. lm <= 5 -> rv=lv, rm=lm+1
         cond3a = cond3 & (lm <= 5)
+        # print("rv[cond3a][0]:", rv[cond3a][0])
+        # print("lv[cond3a][0]:", lv[cond3a][0])
         rv[cond3a] = lv[cond3a]
         rm[cond3a] = lm[cond3a] + 1
         rvel[cond3a] = lvel[cond3a]
@@ -253,10 +258,10 @@ class DIAF(nn.Module):
         agent_value = last_value[:,self.input_size+self.num_entities*2:]
         am = last_mask[:,self.num_entities:]
         # 计算绝对位置
-        landmark_value = landmark_value + last_value[:,2:4].repeat_interleave(self.num_entities, dim=1) # [96,6]
-        agent_value = agent_value + last_value[:,2:4].repeat_interleave(self.num_agents-1, dim=1) # [96,4]
         all_obs_abs = all_obs.clone()  # 创建原始数据的副本
-        all_obs_abs[:, 4:] = all_obs[:, 4:] + all_obs[:, 2:4].repeat_interleave(self.num_entities+self.num_agents-1, dim=1) # [96,14]，这里的观测数据已经是绝对位置
+        ego = all_obs[:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
+        all_obs_abs[:, 4:] = all_obs[:, 4:] + ego # [96,14]，这里的观测数据已经是绝对位置
+        print("all_obs_abs: ", all_obs_abs[0][4:10])
         # 提取上一步的预测速度
         landmark_vel = kalman_vel[:,self.input_size:self.input_size+self.num_entities*2]
         agent_vel = kalman_vel[:,self.input_size+self.num_entities*2:]
@@ -265,6 +270,7 @@ class DIAF(nn.Module):
         # agent_P = kalman_P[:,self.num_entities:,:,:]
         # 计算两种对象的推理值
         lv, lP, lvel = self._infer(landmark_value, landmark_vel, landmark_P)
+        print("lv: ", lv[0])
         # av, aP, avel = self._infer(agent_value, agent_vel, agent_P)
         # 计算融合值
         return_lv, return_lm, return_vel, return_P = self._fuse(lv, lm, all_obs_abs[:,self.input_size:self.input_size+self.num_entities*2], mask[:,:self.num_entities], lvel, lP)
@@ -275,10 +281,18 @@ class DIAF(nn.Module):
         kalman_P[:, :self.num_entities, :, :] = return_P  # [96, 3, 4, 4]
         self._update_kalman_rollout(team, step, kalman_vel, kalman_P)
 
-        # 保存当步的融合值和mask
+        # 保存当步的融合值和mask，这里的融合值是绝对位置
+        last_value[:, :self.input_size] = all_obs_abs[:, :self.input_size]  # [96, 4]
         last_value[:, self.input_size:self.input_size+self.num_entities*2] = return_lv  # [96, 6]
+        last_value[:, self.input_size+self.num_entities*2:] = all_obs_abs[:, self.input_size+self.num_entities*2:]  # [96, 6]
+        print("last_value_abs: ", last_value[0][4:10])
         last_mask[:, :self.num_entities] = return_lm  # [96, 3]
         self._update_last_rollout(team, step, last_value, last_mask)
 
-
-        return return_lv, return_lm
+        # 计算相对距离
+        # 计算ego位置
+        return_obs_value = all_obs.clone()  # 创建原始数据的副本
+        ego_pos = all_obs_abs[:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
+        return_obs_value[:,4:].copy_(last_value[:, self.input_size:] - ego_pos)  # [96, 10]
+        
+        return return_obs_value, last_mask
