@@ -15,6 +15,23 @@ class DIAF(nn.Module):
         self.num_agents = num_agents
         self.num_entities = num_entities
         self.input_size = input_size
+        self.obs_shape = self.input_size+(self.num_entities+self.num_agents-1)*2 
+        self.eval_last_value = torch.zeros(self.num_agents, self.obs_shape) #[3,14]
+        self.eval_last_mask = torch.zeros(self.num_agents, self.num_entities+self.num_agents-1) #[3,5]
+        self.eval_kalman_vel = torch.zeros(self.num_agents, self.obs_shape) #[3,14]
+        self.eval_kalman_P = torch.zeros(self.num_agents, self.num_entities+self.num_agents-1, 4, 4) #[3,5,4,4]
+
+    def initialize_eval(self, obs, mask):
+        self.eval_last_value.copy_(obs)
+        ego = obs[:,2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
+        self.eval_last_value[:,4:] = obs[:,4:] + ego
+
+        self.eval_last_mask.copy_((mask>0).float())
+
+        self.eval_kalman_vel.zero_()
+
+        diag_vals = torch.tensor([1.0, 1.0, 10.0, 10.0], device=self.args.device)
+        self.eval_kalman_P.copy_(torch.diag(diag_vals).unsqueeze(0).repeat(self.num_agents, self.num_entities+self.num_agents-1, 1, 1))
 
     def calculate_mask(self, obs):
         # obs:[96,14]
@@ -56,6 +73,16 @@ class DIAF(nn.Module):
         for i,agent in enumerate(team):
             agent.rollouts.last_value[step].copy_(value[self.args.num_processes*i:self.args.num_processes*(i+1), :])
             agent.rollouts.last_mask[step].copy_(mask[self.args.num_processes*i:self.args.num_processes*(i+1), :])
+    
+    def _update_eval(self, kalman_P, kalman_vel, last_value, last_mask):
+        self.eval_last_value.copy_(last_value)
+
+        self.eval_last_mask.copy_(last_mask)
+
+        self.eval_kalman_vel.copy_(kalman_vel)
+
+        self.eval_kalman_P.copy_(kalman_P)
+
 
     def _infer(self, value, vel, P):
         # 计算value的推理值
@@ -261,7 +288,6 @@ class DIAF(nn.Module):
         all_obs_abs = all_obs.clone()  # 创建原始数据的副本
         ego = all_obs[:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
         all_obs_abs[:, 4:] = all_obs[:, 4:] + ego # [96,14]，这里的观测数据已经是绝对位置
-        print("all_obs_abs: ", all_obs_abs[0][4:10])
         # 提取上一步的预测速度
         landmark_vel = kalman_vel[:,self.input_size:self.input_size+self.num_entities*2]
         agent_vel = kalman_vel[:,self.input_size+self.num_entities*2:]
@@ -270,23 +296,21 @@ class DIAF(nn.Module):
         # agent_P = kalman_P[:,self.num_entities:,:,:]
         # 计算两种对象的推理值
         lv, lP, lvel = self._infer(landmark_value, landmark_vel, landmark_P)
-        print("lv: ", lv[0])
         # av, aP, avel = self._infer(agent_value, agent_vel, agent_P)
         # 计算融合值
         return_lv, return_lm, return_vel, return_P = self._fuse(lv, lm, all_obs_abs[:,self.input_size:self.input_size+self.num_entities*2], mask[:,:self.num_entities], lvel, lP)
         # return_av, return_am = self._fuse(av, am, all_obs_abs[:,self.input_size+self.num_entities*2:], mask[:,self.num_entities:])
 
         # 保存当步的预测速度和预测协方差
-        kalman_vel[:, self.input_size:self.input_size+self.num_entities*2] = return_vel  # [96, 6]
-        kalman_P[:, :self.num_entities, :, :] = return_P  # [96, 3, 4, 4]
+        kalman_vel[:, self.input_size:self.input_size+self.num_entities*2].copy_(return_vel)  # [96, 6]
+        kalman_P[:, :self.num_entities, :, :].copy_(return_P)  # [96, 3, 4, 4]
         self._update_kalman_rollout(team, step, kalman_vel, kalman_P)
 
         # 保存当步的融合值和mask，这里的融合值是绝对位置
-        last_value[:, :self.input_size] = all_obs_abs[:, :self.input_size]  # [96, 4]
-        last_value[:, self.input_size:self.input_size+self.num_entities*2] = return_lv  # [96, 6]
-        last_value[:, self.input_size+self.num_entities*2:] = all_obs_abs[:, self.input_size+self.num_entities*2:]  # [96, 6]
-        print("last_value_abs: ", last_value[0][4:10])
-        last_mask[:, :self.num_entities] = return_lm  # [96, 3]
+        last_value[:, :self.input_size].copy_(all_obs_abs[:, :self.input_size])  # [96, 4]
+        last_value[:, self.input_size:self.input_size+self.num_entities*2].copy_(return_lv)  # [96, 6]
+        last_value[:, self.input_size+self.num_entities*2:].copy_(all_obs_abs[:, self.input_size+self.num_entities*2:])  # [96, 6]
+        last_mask[:, :self.num_entities].copy_(return_lm)  # [96, 3]
         self._update_last_rollout(team, step, last_value, last_mask)
 
         # 计算相对距离
@@ -295,4 +319,50 @@ class DIAF(nn.Module):
         ego_pos = all_obs_abs[:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
         return_obs_value[:,4:].copy_(last_value[:, self.input_size:] - ego_pos)  # [96, 10]
         
+        return return_obs_value, last_mask
+    
+    def eval_infer_and_fuse(self,all_obs,mask):
+        """
+        input:
+            obs: [3,14]
+            mask:[3,5]
+        """
+        # 提取上一步内容
+        last_value = self.eval_last_value.clone()
+        last_mask = self.eval_last_mask.clone()
+        kalman_vel = self.eval_kalman_vel.clone()
+        kalman_P = self.eval_kalman_P.clone()
+        # 筛选出对应agent以及entity的value和mask
+        landmark_value = last_value[:,self.input_size:self.input_size+self.num_entities*2]
+        lm = last_mask[:,:self.num_entities]
+        agent_value = last_value[:,self.input_size+self.num_entities*2:]
+        am = last_mask[:,self.num_entities:]
+        # 计算绝对位置
+        all_obs_abs = all_obs.clone()  # 创建原始数据的副本
+        ego = all_obs[:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
+        all_obs_abs[:, 4:] = all_obs[:, 4:] + ego # [3,14]，这里的观测数据已经是绝对位置
+        # 提取上一步的预测速度
+        landmark_vel = kalman_vel[:,self.input_size:self.input_size+self.num_entities*2]
+        agent_vel = kalman_vel[:,self.input_size+self.num_entities*2:]
+        # 提取上一步的协方差矩阵
+        landmark_P = kalman_P[:,:self.num_entities,:,:]
+        # 计算两种对象的推理值
+        lv, lP, lvel = self._infer(landmark_value, landmark_vel, landmark_P)
+        # 计算融合值
+        return_lv, return_lm, return_vel, return_P = self._fuse(lv, lm, all_obs_abs[:,self.input_size:self.input_size+self.num_entities*2], mask[:,:self.num_entities], lvel, lP)
+        
+        # 保存当步的预测速度和预测协方差,以及两个last
+        kalman_vel[:, self.input_size:self.input_size+self.num_entities*2].copy_(return_vel)
+        kalman_P[:, :self.num_entities, :, :].copy_(return_P)
+        last_value[:, :self.input_size].copy_(all_obs_abs[:, :self.input_size])  # [3, 4]
+        last_value[:, self.input_size:self.input_size+self.num_entities*2].copy_(return_lv)  # [3, 6]
+        last_value[:, self.input_size+self.num_entities*2:].copy_(all_obs_abs[:, self.input_size+self.num_entities*2:])  # [3 6]
+        last_mask[:, :self.num_entities].copy_(return_lm)  # [3 3]
+        self._update_eval(kalman_P, kalman_vel, last_value, last_mask)
+        
+        # 计算返回的new_value，相对值  
+        return_obs_value = all_obs.clone()  # 创建原始数据的副本
+        ego_pos = all_obs_abs[:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
+        return_obs_value[:,4:].copy_(last_value[:, self.input_size:] - ego_pos)  # [96, 10]
+
         return return_obs_value, last_mask

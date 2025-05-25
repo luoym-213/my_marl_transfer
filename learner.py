@@ -105,10 +105,8 @@ class Learner(object):
             all_obs = torch.cat([agent.rollouts.obs[step] for agent in team])
             all_hidden = torch.cat([agent.rollouts.recurrent_hidden_states[step] for agent in team])
             all_masks = torch.cat([agent.rollouts.masks[step] for agent in team])
-            print("all_obs: ", all_obs[0][4:10])
 
             mask = dm.calculate_mask(all_obs) # mask: [96,5]，通信范围内为true，否则为false，与后面的mpnn的判断逻辑恰好相反
-            print("mask_old: ", mask[0])
             # 第一步时进行初始化
             if step == 0:
                 # 第一步需要对两个last以及卡尔曼参数进行初始化
@@ -116,13 +114,16 @@ class Learner(object):
                 dm.initialize_kalman(team)
                 
             else: # 后面的步骤进行提取融合
-                new_value, new_mask = dm.infer_and_fuse(all_obs, mask, team, step)
                 # new_value: [96,14]，new_mask: [96,5]
-                print("new_value: ", new_value[0][4:10])
-                print("new_mask: ", new_mask[0])
+                new_value, new_mask = dm.infer_and_fuse(all_obs, mask, team, step)
+                # 重新设置agent.rollouts.obs[0]
+                for i,agent in enumerate(team):
+                    agent.rollouts.obs[step].copy_(new_value[self.args.num_processes*i:self.args.num_processes*(i+1), :])
             
+            new_value = torch.cat([agent.rollouts.obs[step] for agent in team])
+            new_mask = torch.cat([agent.rollouts.last_mask[step] for agent in team])
             
-            props = policy.act(all_obs, all_hidden, all_masks, deterministic=False) # a single forward pass 
+            props = policy.act(new_value, all_hidden, all_masks, new_mask, deterministic=False) # a single forward pass 
 
             # split all outputs
             n = len(team)
@@ -152,9 +153,10 @@ class Learner(object):
             last_obs = torch.cat([agent.rollouts.obs[-1] for agent in team])
             last_hidden = torch.cat([agent.rollouts.recurrent_hidden_states[-1] for agent in team])
             last_masks = torch.cat([agent.rollouts.masks[-1] for agent in team])
+            obs_mask = torch.cat([agent.rollouts.last_mask[-1] for agent in team]) # 提取最后的一个观测遮罩
             
             with torch.no_grad():
-                next_value = policy.get_value(last_obs, last_hidden, last_masks)
+                next_value = policy.get_value(last_obs, last_hidden, last_masks, obs_mask)
 
             all_value = torch.chunk(next_value,len(team))
             for i in range(len(team)):
@@ -174,11 +176,12 @@ class Learner(object):
         for agent, policy in zip(self.all_agents, policies_list):
             agent.load_model(policy)
 
-    def eval_act(self, obs, recurrent_hidden_states, mask):
+    def eval_act(self, obs, recurrent_hidden_states, mask, step):
         # used only while evaluating policies. Assuming that agents are in order of team!
         obs1 = []
         obs2 = []
         all_obs = []
+        dm = self.dm
         for i in range(len(obs)):
             agent = self.env.world.policy_agents[i]
             if hasattr(agent, 'adversary') and agent.adversary:
@@ -189,11 +192,23 @@ class Learner(object):
             all_obs.append(obs1)
         if len(obs2)!=0:
             all_obs.append(obs2)
+                
+        ego_obs = torch.cat(all_obs[0])
+        obs_mask = dm.calculate_mask(ego_obs)
+        if step == 0:
+            # 第一步初始化
+            dm.initialize_eval(ego_obs, obs_mask)
+            new_value = ego_obs
+            new_mask = obs_mask
+        
+        else: #提取融合
+            new_value, new_mask = dm.eval_infer_and_fuse(ego_obs, obs_mask)
 
         actions = []
+        # 注意这里测试改动的只适用于simple——spread的时候了
         for team,policy,obs in zip(self.teams_list,self.policies_list,all_obs):
             if len(obs)!=0:
-                _,action,_,_ = policy.act(torch.cat(obs).to(self.device),None,None,deterministic=True)
+                _,action,_,_ = policy.act(new_value.to(self.device),None,None,new_mask,deterministic=True)
                 actions.append(action.squeeze(1).cpu().numpy())
 
         return np.hstack(actions)

@@ -115,7 +115,6 @@ class JointPPO():
 
     def update(self, rollouts_list):
         # rollouts_list - list of rollouts of agents which share self.actor_critic policy
-        print("i am jointppo")
         advantages_list = []
         for rollout in rollouts_list:
             advantages = rollout.returns[:-1] - rollout.value_preds[:-1]
@@ -136,10 +135,10 @@ class JointPPO():
 
             for sample in data_generator:
                 obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch,\
-                masks_batch, old_action_log_probs_batch, adv_targ = sample
+                masks_batch, obs_mask_batch, old_action_log_probs_batch, adv_targ = sample
                 # Reshape to do in a single forward pass for all steps
                 values, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(obs_batch,
-                                 recurrent_hidden_states_batch, masks_batch, actions_batch)
+                                 recurrent_hidden_states_batch, masks_batch, actions_batch, obs_mask_batch)
 
                 ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
                 surr1 = ratio * adv_targ
@@ -186,10 +185,11 @@ def magent_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch
         value_preds_batch=torch.cat([rollout.value_preds[:-1].view(-1, 1)[indices] for rollout in rollouts_list],0)
         return_batch = torch.cat([rollout.returns[:-1].view(-1, 1)[indices] for rollout in rollouts_list],0)
         masks_batch = torch.cat([rollout.masks[:-1].view(-1, 1)[indices] for rollout in rollouts_list],0)
+        obs_mask_batch = torch.cat([rollout.last_mask[:-1].view(-1, rollout.last_mask.size(-1))[indices] for rollout in rollouts_list],0)
         old_action_log_probs_batch=torch.cat([rollout.action_log_probs.view(-1,1)[indices] for rollout in rollouts_list],0)
         adv_targ = torch.cat([advantages.view(-1, 1)[indices] for advantages in advantages_list],0)
 
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch,\
-              masks_batch, old_action_log_probs_batch, adv_targ
+              masks_batch, obs_mask_batch, old_action_log_probs_batch, adv_targ
 
         

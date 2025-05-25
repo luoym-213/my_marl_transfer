@@ -126,7 +126,7 @@ class MPNN(nn.Module):
         mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
         return mask 
 
-    def _fwd(self, inp):
+    def _fwd(self, inp, obs_mask=None):
         # inp should be (batch_size,input_size)
         # inp - {iden, vel(2), pos(2), entities(...)}
         agent_inp = inp[:,:self.input_size]
@@ -145,7 +145,8 @@ class MPNN(nn.Module):
             landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
             # should be (batch_size,self.num_entities,self.h_dim)
             # compute entity mask
-            mask_entity = self.calculate_mask_entity(landmark_inp)
+            mask_weight_entity = obs_mask[:,:self.num_entities]
+            mask_entity = (mask_weight_entity == 0)
             #print("mask_entity: ", mask_entity)
             he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim) # [num_agents*numprocesses, num_entities, 128]
             # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
@@ -172,9 +173,9 @@ class MPNN(nn.Module):
     def _policy(self, x):
         return self.policy_head(x)
 
-    def act(self, inp, state, mask=None, deterministic=False):
+    def act(self, inp, state, mask=None, obs_mask=None, deterministic=False):
         # 收集team中每个agent的观察 
-        x = self._fwd(inp)
+        x = self._fwd(inp, obs_mask)
         value = self._value(x)
         dist = self.dist(self._policy(x))
         if deterministic:
@@ -184,16 +185,16 @@ class MPNN(nn.Module):
         action_log_probs = dist.log_probs(action).view(-1,1)
         return value,action,action_log_probs,state
 
-    def evaluate_actions(self, inp, state, mask, action):
-        x = self._fwd(inp)
+    def evaluate_actions(self, inp, state, mask, action, obs_mask):
+        x = self._fwd(inp, obs_mask)
         value = self._value(x)
         dist = self.dist(self._policy(x))
         action_log_probs = dist.log_probs(action)
         dist_entropy = dist.entropy().mean()
         return value,action_log_probs,dist_entropy,state
 
-    def get_value(self, inp, state, mask):
-        x = self._fwd(inp)
+    def get_value(self, inp, state, mask, obs_mask):
+        x = self._fwd(inp, obs_mask)
         value = self._value(x)
         return value
 
