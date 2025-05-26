@@ -16,12 +16,17 @@ class DIAF(nn.Module):
         self.num_entities = num_entities
         self.input_size = input_size
         self.obs_shape = self.input_size+(self.num_entities+self.num_agents-1)*2 
-        self.eval_last_value = torch.zeros(self.num_agents, self.obs_shape) #[3,14]
-        self.eval_last_mask = torch.zeros(self.num_agents, self.num_entities+self.num_agents-1) #[3,5]
-        self.eval_kalman_vel = torch.zeros(self.num_agents, self.obs_shape) #[3,14]
-        self.eval_kalman_P = torch.zeros(self.num_agents, self.num_entities+self.num_agents-1, 4, 4) #[3,5,4,4]
+        # 确保所有张量都在 GPU 上创建
+        self.eval_last_value = torch.zeros(self.num_agents, self.obs_shape, device=args.device) #[3,14]
+        self.eval_last_mask = torch.zeros(self.num_agents, self.num_entities+self.num_agents-1, device=args.device) #[3,5]
+        self.eval_kalman_vel = torch.zeros(self.num_agents, self.obs_shape, device=args.device) #[3,14]
+        self.eval_kalman_P = torch.zeros(self.num_agents, self.num_entities+self.num_agents-1, 4, 4, device=args.device) #[3,5,4,4]
 
     def initialize_eval(self, obs, mask):
+        # 确保输入数据在 GPU 上
+        obs = obs.to(self.args.device)
+        mask = mask.to(self.args.device)
+        
         self.eval_last_value.copy_(obs)
         ego = obs[:,2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
         self.eval_last_value[:,4:] = obs[:,4:] + ego
@@ -51,12 +56,12 @@ class DIAF(nn.Module):
     
     def initialize_last(self, team, mask):
         for i,agent in enumerate(team):
-            position_abs = agent.rollouts.obs[0].clone()  # 创建原始数据的副本 [32,14]
+            position_abs = agent.rollouts.obs[0].clone().to(self.args.device)  # 创建原始数据的副本并移到 GPU
             ego = agent.rollouts.obs[0][:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
-            position_abs[:, 4:] = agent.rollouts.obs[0][:, 4:] + ego # [96,10]，这里的位置数据已经是绝对位置
+            position_abs[:, 4:] = agent.rollouts.obs[0][:, 4:].to(self.args.device) + ego # 确保数据在 GPU 上
             agent.rollouts.last_value[0].copy_(position_abs)
             ini_mask = (mask.contiguous().view(self.num_agents, self.args.num_processes, self.num_agents * 2 - 1) > 0).float().permute(1, 0, 2)
-            agent.rollouts.last_mask[0].copy_(ini_mask[:,i,:]).to(self.args.device)
+            agent.rollouts.last_mask[0].copy_(ini_mask[:,i,:].to(self.args.device))
     
     def initialize_kalman(self, team):
         for agent in team:
