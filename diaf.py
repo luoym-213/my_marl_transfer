@@ -54,20 +54,21 @@ class DIAF(nn.Module):
 
         return valid_mask
     
-    def initialize_last(self, team, mask):
+    def initialize_last(self, step, team, mask):
         for i,agent in enumerate(team):
-            position_abs = agent.rollouts.obs[0].clone().to(self.args.device)  # 创建原始数据的副本并移到 GPU
-            ego = agent.rollouts.obs[0][:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
-            position_abs[:, 4:] = agent.rollouts.obs[0][:, 4:].to(self.args.device) + ego # 确保数据在 GPU 上
-            agent.rollouts.last_value[0].copy_(position_abs)
+            position_abs = agent.rollouts.obs[step].clone().to(self.args.device)  # 创建原始数据的副本并移到 GPU
+            ego = agent.rollouts.obs[step][:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
+            position_abs[:, 4:] = agent.rollouts.obs[step][:, 4:].to(self.args.device) + ego # 确保数据在 GPU 上
+            agent.rollouts.last_value[step].copy_(position_abs)
             ini_mask = (mask.contiguous().view(self.num_agents, self.args.num_processes, self.num_agents * 2 - 1) > 0).float().permute(1, 0, 2)
-            agent.rollouts.last_mask[0].copy_(ini_mask[:,i,:].to(self.args.device))
+            agent.rollouts.last_mask[step].copy_(ini_mask[:,i,:].to(self.args.device))
     
-    def initialize_kalman(self, team):
+    def initialize_kalman(self, step, team):
         for agent in team:
-            agent.rollouts.kalman_vel[0].zero_()
+            agent.rollouts.kalman_vel[step].zero_()
+            # agent.rollouts.kalman_vel[0][:, 4:10] = 1.0  # Set columns 4-9 to 1
             diag_vals = torch.tensor([1.0, 1.0, 10.0, 10.0], device=self.args.device)
-            agent.rollouts.kalman_P[0].copy_(torch.diag(diag_vals).unsqueeze(0).repeat(self.args.num_processes, self.num_agents*2-1, 1, 1))
+            agent.rollouts.kalman_P[step].copy_(torch.diag(diag_vals).unsqueeze(0).repeat(self.args.num_processes, self.num_agents*2-1, 1, 1))
 
     def _update_kalman_rollout(self, team, step, vel, P):
         for i,agent in enumerate(team):
@@ -293,6 +294,12 @@ class DIAF(nn.Module):
         all_obs_abs = all_obs.clone()  # 创建原始数据的副本
         ego = all_obs[:, 2:4].unsqueeze(1).repeat(1, self.num_entities+self.num_agents-1, 1).reshape(-1, 2 * (self.num_entities+self.num_agents-1))
         all_obs_abs[:, 4:] = all_obs[:, 4:] + ego # [96,14]，这里的观测数据已经是绝对位置
+        # print("当前观测绝对值1：", all_obs_abs[0][4:10])
+        # print("当前观测绝对值2：", all_obs_abs[32][4:10])
+        # print("当前观测绝对值3：", all_obs_abs[64][4:10])
+        # print("上一步的地标值：", landmark_value[0])
+        # print("当前观测遮罩：", mask[0])
+        # print("上一步的地标遮罩：", lm[0])
         # 提取上一步的预测速度
         landmark_vel = kalman_vel[:,self.input_size:self.input_size+self.num_entities*2]
         agent_vel = kalman_vel[:,self.input_size+self.num_entities*2:]
@@ -301,10 +308,15 @@ class DIAF(nn.Module):
         # agent_P = kalman_P[:,self.num_entities:,:,:]
         # 计算两种对象的推理值
         lv, lP, lvel = self._infer(landmark_value, landmark_vel, landmark_P)
+        # print("推理值：", lv[0])
+        # print("协方差矩阵：", lP[0])
+        # print("预测速度：", lvel[0])
         # av, aP, avel = self._infer(agent_value, agent_vel, agent_P)
         # 计算融合值
         return_lv, return_lm, return_vel, return_P = self._fuse(lv, lm, all_obs_abs[:,self.input_size:self.input_size+self.num_entities*2], mask[:,:self.num_entities], lvel, lP)
         # return_av, return_am = self._fuse(av, am, all_obs_abs[:,self.input_size+self.num_entities*2:], mask[:,self.num_entities:])
+        # print("融合值：", return_lv[0])
+        # print("融合遮罩：", return_lm[0])
 
         # 保存当步的预测速度和预测协方差
         kalman_vel[:, self.input_size:self.input_size+self.num_entities*2].copy_(return_vel)  # [96, 6]

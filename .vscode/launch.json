@@ -8,6 +8,7 @@
         "program": "${workspaceFolder}/main.py",  // 主程序路径
         "console": "integratedTerminal",          // 或 "externalTerminal"
         "args": [
+          "--num-steps", "50",
           "--env-name", "simple_spread",
           "--num-agents", "3",
           "--entity-mp",

@@ -107,22 +107,28 @@ class Learner(object):
             all_masks = torch.cat([agent.rollouts.masks[step] for agent in team])
 
             mask = dm.calculate_mask(all_obs) # mask: [96,5]，通信范围内为true，否则为false，与后面的mpnn的判断逻辑恰好相反
-            # 第一步时进行初始化
-            if step == 0:
-                # 第一步需要对两个last以及卡尔曼参数进行初始化
-                dm.initialize_last(team, mask)
-                dm.initialize_kalman(team)
-                
-            else: # 后面的步骤进行提取融合
+            
+            # 第一步或每50步时进行初始化
+            if  step % 50 == 0:
+                # 需要对两个last以及卡尔曼参数进行初始化
+                dm.initialize_last(step, team, mask)
+                dm.initialize_kalman(step, team)
+
+            else: # 其他步骤进行提取融合
                 # new_value: [96,14]，new_mask: [96,5]
                 new_value, new_mask = dm.infer_and_fuse(all_obs, mask, team, step)
-                # 重新设置agent.rollouts.obs[0]
+                # 重新设置agent.rollouts.obs[step]
                 for i,agent in enumerate(team):
                     agent.rollouts.obs[step].copy_(new_value[self.args.num_processes*i:self.args.num_processes*(i+1), :])
             
             new_value = torch.cat([agent.rollouts.obs[step] for agent in team])
             new_mask = torch.cat([agent.rollouts.last_mask[step] for agent in team])
             
+            # indices = [0, 32, 64]
+            # for idx in indices:
+            #     if idx < all_obs.size(0):  # 检查索引是否在有效范围内
+            #         print(f"all_obs[{idx}]:", all_obs[idx][:10])
+
             props = policy.act(new_value, all_hidden, all_masks, new_mask, deterministic=False) # a single forward pass 
 
             # split all outputs

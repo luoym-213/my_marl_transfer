@@ -129,6 +129,12 @@ class MPNN(nn.Module):
     def _fwd(self, inp, obs_mask=None):
         # inp should be (batch_size,input_size)
         # inp - {iden, vel(2), pos(2), entities(...)}
+        # if inp.size(0) > 64:  # 只在训练模式下打印（训练时batch size较大）
+        #     indices = [0, 32, 64]
+        #     for idx in indices:
+        #         if idx < inp.size(0):
+        #             print(f"inp[{idx}]:", inp[idx][:10])
+        
         agent_inp = inp[:,:self.input_size]
         mask, mask_agents = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted         
 
@@ -147,7 +153,10 @@ class MPNN(nn.Module):
             # compute entity mask
             mask_weight_entity = obs_mask[:,:self.num_entities]
             mask_entity = (mask_weight_entity == 0)
-            #print("mask_entity: ", mask_entity)
+            mask_entity = mask_entity.contiguous().view(self.num_agents, mask_entity.shape[0]//self.num_agents, self.num_agents).permute(1,0,2)
+            test_entity_mask = self.calculate_mask_entity(landmark_inp)
+            print("mask_entity: ", mask_entity[0])
+            print("test_entity_mask: ", test_entity_mask[0])
             he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim) # [num_agents*numprocesses, num_entities, 128]
             # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
             entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
