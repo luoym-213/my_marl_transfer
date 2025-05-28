@@ -155,11 +155,14 @@ class Learner(object):
         return np.stack([x for v in return_vals for x in v]).reshape(-1,3)
 
     def wrap_horizon(self):
+        dm = self.dm
         for team, policy in zip(self.teams_list,self.policies_list):
             last_obs = torch.cat([agent.rollouts.obs[-1] for agent in team])
             last_hidden = torch.cat([agent.rollouts.recurrent_hidden_states[-1] for agent in team])
             last_masks = torch.cat([agent.rollouts.masks[-1] for agent in team])
-            obs_mask = torch.cat([agent.rollouts.last_mask[-1] for agent in team]) # 提取最后的一个观测遮罩
+
+            mask = dm.calculate_mask(last_obs)
+            last_obs, obs_mask = dm.infer_and_fuse(last_obs, mask, team, self.args.num_steps)
             
             with torch.no_grad():
                 next_value = policy.get_value(last_obs, last_hidden, last_masks, obs_mask)

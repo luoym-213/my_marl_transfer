@@ -31,14 +31,13 @@ def train(args, return_early=False):
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
-                #print("step: ", step)
+                # print("step: ", step)
                 actions_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             obs, reward, done, info = envs.step(agent_actions)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
-            #print("step: ", step)
             #print("masks: ", masks)
             final_rewards *= masks
             #print("rewards: ", reward)
