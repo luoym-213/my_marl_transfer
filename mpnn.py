@@ -155,8 +155,8 @@ class MPNN(nn.Module):
             mask_entity = (mask_weight_entity == 0)
             mask_entity = mask_entity.contiguous().view(self.num_agents, mask_entity.shape[0]//self.num_agents, self.num_agents).permute(1,0,2)
             test_entity_mask = self.calculate_mask_entity(landmark_inp)
-            print("mask_entity: ", mask_entity[0])
-            print("test_entity_mask: ", test_entity_mask[0])
+            # print("mask_entity: ", mask_entity[0])
+            # print("test_entity_mask: ", test_entity_mask[0])
             he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim) # [num_agents*numprocesses, num_entities, 128]
             # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
             entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)

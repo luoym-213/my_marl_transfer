@@ -248,7 +248,7 @@ class DIAF(nn.Module):
 
         # 情况3：lm!=0, mask==0
         # a. lm <= 5 -> rv=lv, rm=lm+1
-        cond3a = cond3 & (lm <= 5)
+        cond3a = cond3 & (lm <= 10)
         # print("rv[cond3a][0]:", rv[cond3a][0])
         # print("lv[cond3a][0]:", lv[cond3a][0])
         rv[cond3a] = lv[cond3a]
@@ -257,7 +257,7 @@ class DIAF(nn.Module):
         rP[cond3a] = lP[cond3a]
 
         # b. lm > 5 -> rv=lv, rm=0
-        cond3b = cond3 & (lm > 5)
+        cond3b = cond3 & (lm > 10)
         rv[cond3b] = lv[cond3b]
         rm[cond3b] = 0
         rvel[cond1].zero_()
