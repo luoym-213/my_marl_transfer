@@ -24,7 +24,8 @@ class Neo(object):
   def initialize_obs(self, obs):
     # this function is called at the start of episode
     self.rollouts.obs[0].copy_(obs)
-
+    self.rollouts.record_obs[0].copy_(obs)
+    
   def update_rollout(self, obs, reward, mask):
     self.rollouts.insert(obs, self.states, self.action, self.action_log_prob, self.value, reward, mask)
 
