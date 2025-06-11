@@ -15,10 +15,13 @@ class MultiAgentEnv(gym.Env):
     def __init__(self, world, reset_callback=None, reward_callback=None,
                  observation_callback=None, info_callback=None,
                  done_callback=None, discrete_action=False, shared_viewer=True,
-                 cam_range=1
+                 cam_range=1, mask_obs_dist=None
                  ):
 
         self.world = world
+        # Set observation range if provided
+        if mask_obs_dist is not None:
+            self.world.mask_obs_dist = mask_obs_dist
         self.agents = self.world.policy_agents
         # set required vectorized gym env property
         self.n = len(world.policy_agents)
@@ -208,20 +211,6 @@ class MultiAgentEnv(gym.Env):
     def render(self, mode='human', attn=None):
         # attn: matrix of size (num_agents, num_agents) 
 
-        # if mode == 'human':
-        #     alphabet = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        #     message = ''
-        #     for agent in self.world.agents:
-        #         for other in self.world.agents:
-        #             if other is agent:
-        #                 continue
-        #             if np.all(other.state.c == 0):
-        #                 word = '_'
-        #             else:
-        #                 word = alphabet[np.argmax(other.state.c)]
-        #             message += (other.name + ' to ' + agent.name + ': ' + word + '   ')
-        #     print(message)
-
         for i in range(len(self.viewers)):
             # create viewers (if necessary)
             if self.viewers[i] is None:
@@ -237,7 +226,18 @@ class MultiAgentEnv(gym.Env):
             from multiagent import rendering
             self.render_geoms = []
             self.render_geoms_xform = []
+            
             for entity in self.world.entities:
+                # Add observation range circle for agents
+                if 'agent' in entity.name and hasattr(self.world, 'mask_obs_dist'):
+                    obs_range = rendering.make_circle(self.world.mask_obs_dist, filled=True)
+                    obs_range_xform = rendering.Transform()
+                    obs_range.set_color(0.5, 1.0, 0.5, alpha=0.1)
+                    obs_range.add_attr(obs_range_xform)
+                    self.render_geoms.append(obs_range)
+                    self.render_geoms_xform.append(obs_range_xform)
+                
+                # Add agent/landmark circle
                 geom = rendering.make_circle(entity.size)
                 xform = rendering.Transform()
                 if 'agent' in entity.name:
@@ -273,19 +273,32 @@ class MultiAgentEnv(gym.Env):
         if attn is not None:
             self._add_lines(attn)
 
+        # update geometry positions
+        geom_idx = 0
+        for entity in self.world.entities:
+            # Update observation range circle position for agents
+            if 'agent' in entity.name and hasattr(self.world, 'mask_obs_dist'):
+                self.render_geoms_xform[geom_idx].set_translation(*entity.state.p_pos)
+                geom_idx += 1
+            
+            # Update agent/landmark position
+            self.render_geoms_xform[geom_idx].set_translation(*entity.state.p_pos)
+            geom_idx += 1
+
         results = []
         for i in range(len(self.viewers)):
-            from multiagent import rendering
-            # update bounds to center around agent
-            cam_range = self.cam_range
             if self.shared_viewer:
+                cam_range = self.cam_range
+                if self.discrete_action_space:
+                    cam_range = cam_range * 1.0
                 pos = np.zeros(self.world.dim_p)
+                self.viewers[i].set_bounds(pos[0]-cam_range,pos[0]+cam_range,pos[1]-cam_range,pos[1]+cam_range)
             else:
+                cam_range = self.cam_range
+                if self.discrete_action_space:
+                    cam_range = cam_range * 1.0
                 pos = self.agents[i].state.p_pos
-            self.viewers[i].set_bounds(pos[0]-cam_range,pos[0]+cam_range,pos[1]-cam_range,pos[1]+cam_range)
-            # update geometry positions
-            for e, entity in enumerate(self.world.entities):
-                self.render_geoms_xform[e].set_translation(*entity.state.p_pos)
+                self.viewers[i].set_bounds(pos[0]-cam_range,pos[0]+cam_range,pos[1]-cam_range,pos[1]+cam_range)
             # render to display or array
             results.append(self.viewers[i].render(return_rgb_array = mode=='rgb_array'))
 
