@@ -32,6 +32,7 @@ def get_args():
     parser.add_argument('--dist-threshold', type=float, default=0.1, help='distance within landmark is considered covered (for simple_spread)')
     parser.add_argument('--render', action='store_true')
     parser.add_argument('--record-video', action='store_true', default=False, help='record evaluation video')
+    parser.add_argument('--gif-save-path', type=str, default='gifs', help='directory to save GIF files (default: gifs)')
     
     # PPO
     parser.add_argument('--algo', default='ppo', help='algorithm to use: a2c | ppo | acktr')
@@ -78,6 +79,7 @@ def get_args():
     args.log_dir = args.log_dir + '_' + args.save_dir
     args.save_dir = '../marlsave/save_new/'+args.save_dir
     args.log_dir = args.save_dir + '/' + args.log_dir
+    args.gif_save_path = args.save_dir + '/' + args.gif_save_path
 
     if args.continue_training:
         assert args.load_dir is not None and os.path.exists(args.load_dir), \
