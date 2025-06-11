@@ -19,7 +19,7 @@ def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identit
     return _thunk
 
 
-def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size):
+def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None):
     scenario = scenarios.load(env_id+".py").Scenario(num_agents=num_agents, dist_threshold=dist_threshold,
                                                      arena_size=arena_size, identity_size=identity_size)
     world = scenario.make_world()
@@ -31,7 +31,8 @@ def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity
                         info_callback=scenario.info if hasattr(scenario, 'info') else None,
                         discrete_action=True,
                         done_callback=scenario.done,
-                        cam_range=arena_size
+                        cam_range=arena_size,
+                        mask_obs_dist=mask_obs_dist
                         )
     return env
 

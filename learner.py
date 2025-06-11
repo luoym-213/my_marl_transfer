@@ -9,7 +9,8 @@ from diaf import DIAF
 def setup_master(args, env=None, return_env=False):
     if env is None:
         env = make_multiagent_env(args.env_name, num_agents=args.num_agents, dist_threshold=args.dist_threshold, 
-                                  arena_size=args.arena_size, identity_size=args.identity_size)
+                                  arena_size=args.arena_size, identity_size=args.identity_size,
+                                  mask_obs_dist=args.mask_obs_dist if hasattr(args, 'mask_obs_dist') else None)
     policy1 = None
     policy2 = None
     team1 = []
