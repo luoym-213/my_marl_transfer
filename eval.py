@@ -97,8 +97,6 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             obs, reward, done, info = env.step(actions)
             obs = normalize_obs(obs, obs_mean, obs_std)
             episode_rewards += np.array(reward)
-
-            step += 1
             
             # Render for GIF saving (if needed)
             if should_save_gif:
