@@ -22,6 +22,9 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     
     if env is None or master is None: # if any one of them is None, generate both of them
         master, env = setup_master(args, return_env=True)
+        # Set observation range for visualization
+        if hasattr(args, 'mask_obs_dist'):
+            env.world.mask_obs_dist = args.mask_obs_dist
 
     if seed is None: # ensure env eval seed is different from training seed
         seed = np.random.randint(0,100000)
