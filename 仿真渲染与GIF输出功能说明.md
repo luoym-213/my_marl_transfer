@@ -59,6 +59,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
 
     for t in range(num_eval_episodes):
         obs = env.reset()
+        step = 0
         obs = normalize_obs(obs, obs_mean, obs_std)
         done = [False]*env.n
         episode_rewards = np.full(env.n, 0.0)
@@ -92,12 +93,11 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         while not np.all(done):
             actions = []
             with torch.no_grad():
-                actions = master.eval_act(obs, recurrent_hidden_states, mask)
+                actions = master.eval_act(obs, recurrent_hidden_states, mask, step)
             episode_steps += 1
             obs, reward, done, info = env.step(actions)
             obs = normalize_obs(obs, obs_mean, obs_std)
             episode_rewards += np.array(reward)
-
             step += 1
             
             # Render for GIF saving (if needed)

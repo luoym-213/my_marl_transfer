@@ -86,7 +86,7 @@ def train(args, return_early=False):
             print('===========================================================================================')
             _, eval_perstep_rewards, final_min_dists, num_success, eval_episode_len = evaluate(args, None, master.all_policies,
                                                                                                ob_rms=ob_rms, env=eval_env,
-                                                                                               master=eval_master)
+                                                                                               master=eval_master, render=args.render)
             print('Evaluation {:d} | Mean per-step reward {:.2f}'.format(j//args.eval_interval, eval_perstep_rewards.mean()))
             print('Num success {:d}/{:d} | Episode Length {:.2f}'.format(num_success, args.num_eval_episodes, eval_episode_len))
             if final_min_dists:

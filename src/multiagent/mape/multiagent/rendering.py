@@ -98,13 +98,7 @@ class Viewer(object):
         if return_rgb_array:
             buffer = pyglet.image.get_buffer_manager().get_color_buffer()
             image_data = buffer.get_image_data()
-            arr = np.fromstring(image_data.data, dtype=np.uint8, sep='')
-            # In https://github.com/openai/gym-http-api/issues/2, we
-            # discovered that someone using Xmonad on Arch was having
-            # a window of size 598 x 398, though a 600 x 400 window
-            # was requested. (Guess Xmonad was preserving a pixel for
-            # the boundary.) So we use the buffer height/width rather
-            # than the requested one.
+            arr = np.fromstring(image_data.get_data('RGBA', buffer.width * 4), dtype=np.uint8)
             arr = arr.reshape(buffer.height, buffer.width, 4)
             arr = arr[::-1,:,0:3]
         self.window.flip()
