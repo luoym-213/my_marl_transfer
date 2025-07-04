@@ -52,6 +52,10 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     final_min_dists = []
     num_success = 0
     episode_length = 0
+    
+    # 新增变量，用于计算成功回合的平均步数
+    successful_steps_total = 0
+    successful_episodes_count = 0
 
     # Create evaluation-specific folder if record_video is enabled
     eval_folder = None
@@ -122,6 +126,11 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         per_step_rewards[t] = episode_rewards/episode_steps
         num_success += info['n'][0]['is_success']
         episode_length = (episode_length*t + info['n'][0]['world_steps'])/(t+1)
+        
+        # 更新成功回合的统计数据
+        if info['n'][0]['is_success']:
+            successful_steps_total += info['n'][0]['world_steps']
+            successful_episodes_count += 1
 
         # for simple spread env only
         if args.env_name == 'simple_spread':
@@ -146,8 +155,13 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                 print(f"Saved GIF: {gif_path}")
             except Exception as e:
                 print(f"Error saving GIF {gif_path}: {e}")
-                
-    return all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length
+    
+    # 计算成功回合的平均步数
+    successful_average_length = 0
+    if successful_episodes_count > 0:
+        successful_average_length = successful_steps_total / successful_episodes_count
+
+    return all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count
 
 
 if __name__ == '__main__':
@@ -155,9 +169,11 @@ if __name__ == '__main__':
     checkpoint = torch.load(args.load_dir, map_location=lambda storage, loc: storage)
     policies_list = checkpoint['models']
     ob_rms = checkpoint['ob_rms']
-    all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length = evaluate(args, args.seed, 
+    all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count = evaluate(args, args.seed, 
                     policies_list, ob_rms, args.render, render_attn=args.masking)
     print("Average Per Step Reward {}\nNum Success {}/{} | Av. Episode Length {:.2f})"
             .format(per_step_rewards.mean(0),num_success,args.num_eval_episodes,episode_length))
+    print("Successful Episodes Average Length: {:.2f} ({}/{} episodes)"
+            .format(successful_average_length, successful_episodes_count, args.num_eval_episodes))
     if final_min_dists:
         print("Final Min Dists {}".format(np.stack(final_min_dists).mean(0)))
