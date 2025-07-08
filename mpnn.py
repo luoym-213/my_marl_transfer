@@ -68,7 +68,9 @@ class MPNN(nn.Module):
         num_actions = action_space.n
         self.dist = Categorical(self.h_dim,num_actions)
 
-        self.is_recurrent = False
+        # 添加GRU层
+        self.gru = nn.GRUCell(self.h_dim, self.h_dim)
+        self.is_recurrent = True
 
         if norm_in:
             self.in_fn = nn.BatchNorm1d(self.input_size)
@@ -153,6 +155,25 @@ class MPNN(nn.Module):
 
         h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
         
+        # 通过GRU层处理
+        batch_size_per_agent = h.size(0)
+        num_agents = h.size(1)
+        
+        # 如果没有提供隐藏状态，则初始化为零
+        if not hasattr(self, 'hidden_state') or self.hidden_state is None or self.hidden_state.size(0) != batch_size_per_agent or self.hidden_state.size(1) != num_agents:
+            self.hidden_state = torch.zeros(batch_size_per_agent, num_agents, self.h_dim, device=h.device)
+        
+        # 将h和hidden_state展平以适应GRUCell的输入 (batch_size * num_agents, hidden_dim)
+        h_flat = h.contiguous().view(-1, self.h_dim)
+        hidden_state_flat = self.hidden_state.contiguous().view(-1, self.h_dim)
+        
+        # 使用GRU处理输入
+        new_hidden_state_flat = self.gru(h_flat, hidden_state_flat)
+        
+        # 将新的隐藏状态重新塑形回 (batch_size_per_agent, num_agents, hidden_dim)
+        self.hidden_state = new_hidden_state_flat.view(batch_size_per_agent, num_agents, self.h_dim)
+        h = self.hidden_state # 使用GRU的输出作为新的特征表示
+
         for k in range(self.K):
             m, attn = self.messages(h, mask=mask, return_attn=True) # should be <batch_size/N,N,self.embed_dim>
             h = self.update(torch.cat((h,m),2)) # should be <batch_size/N,N,self.h_dim>
@@ -163,7 +184,13 @@ class MPNN(nn.Module):
         return h # should be <batch_size, self.h_dim> again
 
     def forward(self, inp, state, mask=None):
-        raise NotImplementedError
+        # 保存当前的隐藏状态
+        if state is not None:
+            self.hidden_state = state
+            
+        x = self._fwd(inp)
+        # 返回更新后的隐藏状态
+        return x, self.hidden_state.clone()
 
     def _value(self, x):
         return self.value_head(x)
@@ -172,6 +199,10 @@ class MPNN(nn.Module):
         return self.policy_head(x)
 
     def act(self, inp, state, mask=None, deterministic=False):
+        # 保存当前的隐藏状态
+        if state is not None:
+            self.hidden_state = state
+        
         x = self._fwd(inp)
         value = self._value(x)
         dist = self.dist(self._policy(x))
@@ -180,20 +211,32 @@ class MPNN(nn.Module):
         else:
             action = dist.sample()
         action_log_probs = dist.log_probs(action).view(-1,1)
-        return value,action,action_log_probs,state
+        
+        # 返回更新后的隐藏状态
+        return value, action, action_log_probs, self.hidden_state.clone()
 
     def evaluate_actions(self, inp, state, mask, action):
+        # 保存当前的隐藏状态
+        if state is not None:
+            self.hidden_state = state
+            
         x = self._fwd(inp)
         value = self._value(x)
         dist = self.dist(self._policy(x))
         action_log_probs = dist.log_probs(action)
         dist_entropy = dist.entropy().mean()
-        return value,action_log_probs,dist_entropy,state
+        
+        # 返回更新后的隐藏状态
+        return value, action_log_probs, dist_entropy, self.hidden_state.clone()
 
     def get_value(self, inp, state, mask):
+        # 保存当前的隐藏状态
+        if state is not None:
+            self.hidden_state = state
+            
         x = self._fwd(inp)
         value = self._value(x)
-        return value
+        return value, self.hidden_state.clone()
 
 
 class MultiHeadAttention(nn.Module):
