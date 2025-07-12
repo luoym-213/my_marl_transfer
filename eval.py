@@ -66,8 +66,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
 
     for t in range(num_eval_episodes):
         obs = env.reset()
-        # 初始化recurrent_hidden_states为[num_agents, recurrent_hidden_state_size]大小的数组
-        recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size)      
+        # 修复：使用args.device确保设备一致性
+        recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size, device=args.device)
         obs = normalize_obs(obs, obs_mean, obs_std)
         done = [False]*env.n
         episode_rewards = np.full(env.n, 0.0)
