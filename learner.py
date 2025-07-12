@@ -147,6 +147,10 @@ class Learner(object):
     def after_update(self):
         for agent in self.all_agents:
             agent.after_update()
+    
+    def initial_hidden_states(self, step):
+        for agent in self.all_agents:
+            agent.initial_hidden_states(step)
 
     def update_rollout(self, obs, reward, masks):
         obs_t = torch.from_numpy(obs).float().to(self.device)
@@ -175,12 +179,15 @@ class Learner(object):
             all_obs.append(obs2)
 
         actions = []
+        states = []
         for team,policy,obs in zip(self.teams_list,self.policies_list,all_obs):
             if len(obs)!=0:
-                _,action,_,_ = policy.act(torch.cat(obs).to(self.device),None,None,deterministic=True)
+                _,action,_,new_state = policy.act(torch.cat(obs).to(self.device),recurrent_hidden_states,None,deterministic=True)
                 actions.append(action.squeeze(1).cpu().numpy())
+                # 修改：保持隐藏状态为张量，而不是转换为NumPy数组
+                states.append(new_state)
 
-        return np.hstack(actions)
+        return np.hstack(actions), torch.cat(states) if states else recurrent_hidden_states
 
     def set_eval_mode(self):
         for agent in self.all_agents:

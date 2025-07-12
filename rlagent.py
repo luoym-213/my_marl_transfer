@@ -11,7 +11,7 @@ class Neo(object):
     self.action_space = action_space
     self.actor_critic = policy
     self.rollouts = RolloutStorage(args.num_steps, args.num_processes, self.obs_shape, self.action_space, 
-                                   recurrent_hidden_state_size=1)
+                                   recurrent_hidden_state_size=args.recurrent_hidden_state_size)
     self.args = args
     self.trainer = PPO(self.actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                        args.entropy_coef, lr=args.lr,max_grad_norm=args.max_grad_norm)
@@ -36,6 +36,9 @@ class Neo(object):
 
   def after_update(self):
     self.rollouts.after_update()
+
+  def initial_hidden_states(self, step):
+    self.rollouts.recurrent_hidden_states[step].zero_()
 
   def update(self):
     return self.trainer.update(self.rollouts)

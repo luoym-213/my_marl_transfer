@@ -66,6 +66,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
 
     for t in range(num_eval_episodes):
         obs = env.reset()
+        # 初始化recurrent_hidden_states为[num_agents, recurrent_hidden_state_size]大小的数组
+        recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size)      
         obs = normalize_obs(obs, obs_mean, obs_std)
         done = [False]*env.n
         episode_rewards = np.full(env.n, 0.0)
@@ -99,7 +101,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         while not np.all(done):
             actions = []
             with torch.no_grad():
-                actions = master.eval_act(obs, recurrent_hidden_states, mask)
+                actions, recurrent_hidden_states = master.eval_act(obs, recurrent_hidden_states, mask)
             episode_steps += 1
             obs, reward, done, info = env.step(actions)
             obs = normalize_obs(obs, obs_mean, obs_std)

@@ -31,6 +31,9 @@ def train(args, return_early=False):
     start = datetime.datetime.now()
     for j in range(args.num_updates):
         for step in range(args.num_steps):
+            # 如果是第50步，需要重新设置hidden state
+            if step%50 == 0:
+                master.initial_hidden_states(step)
             with torch.no_grad():
                 # print("step: ", step)
                 actions_list = master.act(step)
@@ -84,7 +87,7 @@ def train(args, return_early=False):
         if args.eval_interval is not None and j%args.eval_interval==0:
             ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)
             print('===========================================================================================')
-            _, eval_perstep_rewards, final_min_dists, num_success, eval_episode_len = evaluate(args, None, master.all_policies,
+            _, eval_perstep_rewards, final_min_dists, num_success, eval_episode_len, _, _ = evaluate(args, None, master.all_policies,
                                                                                                ob_rms=ob_rms, env=eval_env,
                                                                                                master=eval_master, render=args.render)
             print('Evaluation {:d} | Mean per-step reward {:.2f}'.format(j//args.eval_interval, eval_perstep_rewards.mean()))

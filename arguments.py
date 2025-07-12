@@ -45,7 +45,8 @@ def get_args():
     parser.add_argument('--ppo-epoch', type=int, default=4, help='number of ppo epochs (default: 4)')
     parser.add_argument('--num-mini-batch', type=int, default=32, help='number of batches for ppo (default: 32)')
     parser.add_argument('--clip-param', type=float, default=0.2, help='ppo clip parameter (default: 0.2)')
-    
+    parser.add_argument('--recurrent-hidden-state-size', type=int, default=128, help='number of batches for ppo (default: 32)')
+
     # logging
     parser.add_argument('--save-dir', default='tmp', help='directory to save models (default: tmp)')
     parser.add_argument('--log-dir', default='logs', help='directory to save logs')

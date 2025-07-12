@@ -128,9 +128,10 @@ class MPNN(nn.Module):
         mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
         return mask 
 
-    def _fwd(self, inp):
+    def _fwd(self, inp, state=None):
         # inp should be (batch_size,input_size)
         # inp - {iden, vel(2), pos(2), entities(...)}
+        # state should be (batch_size, hidden_size)
         agent_inp = inp[:,:self.input_size]
         mask, mask_agents = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted         
 
@@ -153,26 +154,13 @@ class MPNN(nn.Module):
             entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
             h = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
 
-        h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
-        
-        # 通过GRU层处理
-        batch_size_per_agent = h.size(0)
-        num_agents = h.size(1)
-        
-        # 如果没有提供隐藏状态，则初始化为零
-        if not hasattr(self, 'hidden_state') or self.hidden_state is None or self.hidden_state.size(0) != batch_size_per_agent or self.hidden_state.size(1) != num_agents:
-            self.hidden_state = torch.zeros(batch_size_per_agent, num_agents, self.h_dim, device=h.device)
-        
-        # 将h和hidden_state展平以适应GRUCell的输入 (batch_size * num_agents, hidden_dim)
-        h_flat = h.contiguous().view(-1, self.h_dim)
-        hidden_state_flat = self.hidden_state.contiguous().view(-1, self.h_dim)
+        # h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
         
         # 使用GRU处理输入
-        new_hidden_state_flat = self.gru(h_flat, hidden_state_flat)
+        new_state = self.gru(h, state)
         
         # 将新的隐藏状态重新塑形回 (batch_size_per_agent, num_agents, hidden_dim)
-        self.hidden_state = new_hidden_state_flat.view(batch_size_per_agent, num_agents, self.h_dim)
-        h = self.hidden_state # 使用GRU的输出作为新的特征表示
+        h = new_state.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
 
         for k in range(self.K):
             m, attn = self.messages(h, mask=mask, return_attn=True) # should be <batch_size/N,N,self.embed_dim>
@@ -181,7 +169,7 @@ class MPNN(nn.Module):
         
         self.attn_mat = attn.squeeze().detach().cpu().numpy()
         # print("h shape: ", h.shape)
-        return h # should be <batch_size, self.h_dim> again
+        return h, new_state # should be <batch_size, self.h_dim> again
 
     def forward(self, inp, state, mask=None):
         # 保存当前的隐藏状态
@@ -199,11 +187,12 @@ class MPNN(nn.Module):
         return self.policy_head(x)
 
     def act(self, inp, state, mask=None, deterministic=False):
-        # 保存当前的隐藏状态
-        if state is not None:
-            self.hidden_state = state
-        
-        x = self._fwd(inp)
+        """
+        inp: [batch_size, dim_o]
+        state: [batch_size, dim_h]
+        mask: [batch_size, 1], mask for actions
+        """
+        x, new_state = self._fwd(inp, state)
         value = self._value(x)
         dist = self.dist(self._policy(x))
         if deterministic:
@@ -213,30 +202,23 @@ class MPNN(nn.Module):
         action_log_probs = dist.log_probs(action).view(-1,1)
         
         # 返回更新后的隐藏状态
-        return value, action, action_log_probs, self.hidden_state.clone()
+        return value, action, action_log_probs, new_state
 
-    def evaluate_actions(self, inp, state, mask, action):
-        # 保存当前的隐藏状态
-        if state is not None:
-            self.hidden_state = state
-            
-        x = self._fwd(inp)
-        value = self._value(x)
+    def evaluate_actions(self, inp, state, mask, action): 
+        x, new_state = self._fwd(inp, state)  # 修正：传递state参数
+        value = self._value(x) # [num_mini_batch, 1]
         dist = self.dist(self._policy(x))
         action_log_probs = dist.log_probs(action)
-        dist_entropy = dist.entropy().mean()
+        dist_entropy = dist.entropy().mean() # [num_mini_batch, 1] -> 1 scalar
         
         # 返回更新后的隐藏状态
-        return value, action_log_probs, dist_entropy, self.hidden_state.clone()
+        return value, action_log_probs, dist_entropy, new_state  # 修正：返回new_state而不是self.hidden_state.clone()
 
     def get_value(self, inp, state, mask):
-        # 保存当前的隐藏状态
-        if state is not None:
-            self.hidden_state = state
             
-        x = self._fwd(inp)
+        x, new_state = self._fwd(inp, state)
         value = self._value(x)
-        return value, self.hidden_state.clone()
+        return value
 
 
 class MultiHeadAttention(nn.Module):
