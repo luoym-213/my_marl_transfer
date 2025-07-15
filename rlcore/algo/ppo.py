@@ -129,8 +129,9 @@ class JointPPO():
         for e in range(self.ppo_epoch):
             if self.actor_critic.is_recurrent:
                 # raise ('sampler not implemented for recurrent policies')
-                seq_length = 30
-                data_generator = recurrent_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
+                seq_length = 50
+                #data_generator = recurrent_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
+                data_generator = recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
             else:
                 data_generator = magent_feed_forward_generator(rollouts_list, advantages_list, self.num_mini_batch)
             
@@ -323,4 +324,104 @@ def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_bat
         adv_targ = _flatten_helper(T, N, adv_targ.transpose(0, 1))
         
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch, \
-              masks_batch, old_action_log_probs_batch, adv_targ     
+              masks_batch, old_action_log_probs_batch, adv_targ  
+
+def recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, num_mini_batch):
+    """
+    简化版：最小化打乱，但保证基本的随机性
+    - 一次性打乱 : 在每个epoch开始时，将所有episode打乱一次
+    - 顺序分配 : 然后按顺序将打乱后的episode分配给各个batch
+    - 批次内有序 : 每个batch内的episode是连续的
+    """
+    num_steps, num_processes = rollouts_list[0].rewards.size()[0:2]
+    num_agents = len(rollouts_list)
+    episode_length = 50
+    num_episodes = num_steps // episode_length
+    
+    # 生成所有episode的索引
+    all_episodes = []
+    for agent_idx in range(num_agents):
+        for process_idx in range(num_processes):
+            for episode_idx in range(num_episodes):
+                all_episodes.append((agent_idx, process_idx, episode_idx))
+    
+    # 只在epoch开始时打乱一次，然后顺序分配给各个batch，[3,7,1,9,2,8,4,6,0,5]
+    shuffled_episodes = torch.randperm(len(all_episodes)) 
+    
+    # 计算每个batch的大小
+    total_episodes = len(all_episodes)
+    episodes_per_batch = total_episodes // num_mini_batch
+    
+    for batch_idx in range(num_mini_batch):
+        start_idx = batch_idx * episodes_per_batch
+        end_idx = start_idx + episodes_per_batch
+        
+        # 最后一个batch包含剩余的所有episode
+        if batch_idx == num_mini_batch - 1:
+            end_idx = total_episodes
+        
+        batch_episode_indices = shuffled_episodes[start_idx:end_idx]
+        current_batch_size = end_idx - start_idx
+        
+        obs_batch = []
+        recurrent_hidden_states_batch = []
+        actions_batch = []
+        value_preds_batch = []
+        return_batch = []
+        masks_batch = []
+        old_action_log_probs_batch = []
+        adv_targ = []
+        
+        # 按照打乱后的顺序收集数据
+        for idx in batch_episode_indices:
+            agent_idx, process_idx, episode_idx = all_episodes[idx]
+            
+            rollout = rollouts_list[agent_idx]
+            advantages = advantages_list[agent_idx]
+            
+            # 从episode起点开始
+            start_step = episode_idx * episode_length
+            end_step = start_step + episode_length
+            
+            # 收集序列数据
+            obs_seq = rollout.obs[start_step:end_step, process_idx]
+            recurrent_hidden_states_seq = rollout.recurrent_hidden_states[start_step:start_step+1, process_idx]
+            actions_seq = rollout.actions[start_step:end_step, process_idx]
+            value_preds_seq = rollout.value_preds[start_step:end_step, process_idx]
+            return_seq = rollout.returns[start_step:end_step, process_idx]
+            masks_seq = rollout.masks[start_step:end_step, process_idx]
+            action_log_probs_seq = rollout.action_log_probs[start_step:end_step, process_idx]
+            adv_seq = advantages[start_step:end_step, process_idx]
+            
+            # 添加到batch
+            obs_batch.append(obs_seq)
+            recurrent_hidden_states_batch.append(recurrent_hidden_states_seq)
+            actions_batch.append(actions_seq)
+            value_preds_batch.append(value_preds_seq)
+            return_batch.append(return_seq)
+            masks_batch.append(masks_seq)
+            old_action_log_probs_batch.append(action_log_probs_seq)
+            adv_targ.append(adv_seq)
+        
+        # 转换为张量
+        obs_batch = torch.stack(obs_batch)
+        recurrent_hidden_states_batch = torch.stack(recurrent_hidden_states_batch).view(current_batch_size, -1)
+        actions_batch = torch.stack(actions_batch)
+        value_preds_batch = torch.stack(value_preds_batch)
+        return_batch = torch.stack(return_batch)
+        masks_batch = torch.stack(masks_batch)
+        old_action_log_probs_batch = torch.stack(old_action_log_probs_batch)
+        adv_targ = torch.stack(adv_targ)
+        
+        # 展平时序维度和批次维度
+        T, N = episode_length, current_batch_size
+        obs_batch = _flatten_helper(T, N, obs_batch.transpose(0, 1))
+        actions_batch = _flatten_helper(T, N, actions_batch.transpose(0, 1))
+        value_preds_batch = _flatten_helper(T, N, value_preds_batch.transpose(0, 1))
+        return_batch = _flatten_helper(T, N, return_batch.transpose(0, 1))
+        masks_batch = _flatten_helper(T, N, masks_batch.transpose(0, 1))
+        old_action_log_probs_batch = _flatten_helper(T, N, old_action_log_probs_batch.transpose(0, 1))
+        adv_targ = _flatten_helper(T, N, adv_targ.transpose(0, 1))
+        
+        yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch, \
+              masks_batch, old_action_log_probs_batch, adv_targ
