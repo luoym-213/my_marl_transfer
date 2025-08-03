@@ -132,9 +132,8 @@ class JointPPO():
         for e in range(self.ppo_epoch):
             if self.actor_critic.is_recurrent:
                 # raise ('sampler not implemented for recurrent policies')
-                seq_length = 50
-                #data_generator = recurrent_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
-                data_generator = recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
+                data_generator = recurrent_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch, seq_length = 30)
+                #data_generator = recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
             else:
                 data_generator = magent_feed_forward_generator(rollouts_list, advantages_list, self.num_mini_batch)
             
@@ -189,7 +188,8 @@ class JointPPO():
                     values_list = []
                     action_log_probs_list = []
                     dist_entropy_sum = 0 # 初始化熵的总和
-                    current_states = torch.zeros(N, combined_hidden_states.shape[2], device=combined_hidden_states.device) #[batchsize, hidden_size]
+                    # current_states = torch.zeros(N, combined_hidden_states.shape[2], device=combined_hidden_states.device) #[batchsize, hidden_size]
+                    current_states = combined_hidden_states[0] # 取第一个时间步的隐藏状态作为初始状态
                     
                     # 逐时间步处理
                     for t in range(T):
@@ -283,7 +283,16 @@ def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_bat
         seq_length: 每个序列的长度，默认为 30，必须小于 50
     
     Returns:
-        生成器，每次迭代返回一个 mini-batch 的数据
+        生成器，每次迭代返回一个 mini-batch 的数据    
+
+    - agent的索引需要一致，也就是每个agent的rollouts和advantages需要一一对应
+    - 所有的索引值是二元组 (process_idx, episode_idx)
+    - 一共 num_mini_batch 个batch
+    - 每个batch包含 num_processes * num_episodes * episodes_length / num_mini_batch / seq_length 个序列
+    - 比如，num_processes=32，num_episodes=3，episodes_length=50，num_mini_batch=16，seq_length=30， 则共10个序列
+    - 随机选取序列起点: 在每个batch开始时，随机抽取process_idx和episode_idx，再在内随机选择起始点
+    - 批次内有序 : 每个batch内的episode是连续的，但是保持，agent0,agent1,agent2,...的顺序
+    - 最后输出的batch形状为 [num_agents, seq_per_batch, seq_length, features]
     """
     # 确保序列长度小于 episode 长度
     assert seq_length < 50, "序列长度必须小于 episode 长度 (50)"
@@ -295,11 +304,11 @@ def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_bat
     num_episodes = num_steps // episode_length  # 每个 rollout 中的 episode 数量
     
     # 计算每个 mini-batch 的大小
-    # 总样本数 = 代理数 × 进程数 × episode 数
-    total_samples = num_agents * num_processes * num_episodes
-    samples_per_batch = total_samples // num_mini_batch
+    # 总样本数 = 进程数 × num_steps // seq_length
+    total_seq = num_processes * num_episodes * episode_length // seq_length
+    seq_per_batch = total_seq // num_mini_batch
     
-    # 为每个样本生成随机的起始点
+    # 遍历所有的batch
     for _ in range(num_mini_batch):
         obs_batch = []
         recurrent_hidden_states_batch = []
@@ -309,64 +318,50 @@ def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_bat
         masks_batch = []
         old_action_log_probs_batch = []
         adv_targ = []
+
+        # 一次性生成seq_per_batch个随机进程和episode索引以及起始点
+        process_indices = torch.randint(0, num_processes, (seq_per_batch,))
+        episode_indices = torch.randint(0, num_episodes, (seq_per_batch,))
+        start_indices = torch.randint(0, episode_length - seq_length, (seq_per_batch,))
+        # 计算全局索引
+        start_indices = episode_indices * episode_length + start_indices
+        # 合并成索引对列表
+        indices_list = list(zip(process_indices.tolist(), start_indices.tolist()))
         
-        # 为每个 batch 采样
-        for _ in range(samples_per_batch):
-            # 随机选择一个代理
-            agent_idx = torch.randint(0, num_agents, (1,)).item()
-            rollout = rollouts_list[agent_idx]
-            advantages = advantages_list[agent_idx]
+        # 为每个 batch 采样 seq_per_batch 个序列
+                  
+        for rollout, advantages in zip(rollouts_list, advantages_list):
+            for process_idx, start_idx in indices_list:
+                # 收集序列数据
+                obs_seq = rollout.obs[start_idx:start_idx+seq_length, process_idx]
+                # 对于循环网络，我们只需要序列的初始隐藏状态
+                recurrent_hidden_states_seq = rollout.recurrent_hidden_states[start_idx:start_idx+seq_length, process_idx]
+                actions_seq = rollout.actions[start_idx:start_idx+seq_length, process_idx]
+                value_preds_seq = rollout.value_preds[start_idx:start_idx+seq_length, process_idx]
+                return_seq = rollout.returns[start_idx:start_idx+seq_length, process_idx]
+                masks_seq = rollout.masks[start_idx:start_idx+seq_length, process_idx]
+                action_log_probs_seq = rollout.action_log_probs[start_idx:start_idx+seq_length, process_idx]
+                adv_seq = advantages[start_idx:start_idx+seq_length, process_idx]
             
-            # 随机选择一个进程
-            process_idx = torch.randint(0, num_processes, (1,)).item()
-            
-            # 随机选择一个 episode
-            episode_idx = torch.randint(0, num_episodes, (1,)).item()
-            
-            # 随机选择起始点（确保在 episode 内）
-            start_idx = torch.randint(0, episode_length - seq_length, (1,)).item()
-            start_idx += episode_idx * episode_length  # 调整为全局索引
-            
-            # 收集序列数据
-            obs_seq = rollout.obs[start_idx:start_idx+seq_length, process_idx]
-            # 对于循环网络，我们只需要序列的初始隐藏状态
-            recurrent_hidden_states_seq = rollout.recurrent_hidden_states[start_idx:start_idx+1, process_idx]
-            actions_seq = rollout.actions[start_idx:start_idx+seq_length, process_idx]
-            value_preds_seq = rollout.value_preds[start_idx:start_idx+seq_length, process_idx]
-            return_seq = rollout.returns[start_idx:start_idx+seq_length, process_idx]
-            masks_seq = rollout.masks[start_idx:start_idx+seq_length, process_idx]
-            action_log_probs_seq = rollout.action_log_probs[start_idx:start_idx+seq_length, process_idx]
-            adv_seq = advantages[start_idx:start_idx+seq_length, process_idx]
-            
-            # 添加到 batch
-            obs_batch.append(obs_seq)
-            recurrent_hidden_states_batch.append(recurrent_hidden_states_seq)
-            actions_batch.append(actions_seq)
-            value_preds_batch.append(value_preds_seq)
-            return_batch.append(return_seq)
-            masks_batch.append(masks_seq)
-            old_action_log_probs_batch.append(action_log_probs_seq)
-            adv_targ.append(adv_seq)
+                # 添加到 batch
+                obs_batch.append(obs_seq)
+                recurrent_hidden_states_batch.append(recurrent_hidden_states_seq)
+                actions_batch.append(actions_seq)
+                value_preds_batch.append(value_preds_seq)
+                return_batch.append(return_seq)
+                masks_batch.append(masks_seq)
+                old_action_log_probs_batch.append(action_log_probs_seq)
+                adv_targ.append(adv_seq)
         
-        # 将列表转换为张量
-        obs_batch = torch.stack(obs_batch)
-        recurrent_hidden_states_batch = torch.stack(recurrent_hidden_states_batch).view(samples_per_batch, -1)
-        actions_batch = torch.stack(actions_batch)
-        value_preds_batch = torch.stack(value_preds_batch)
-        return_batch = torch.stack(return_batch)
-        masks_batch = torch.stack(masks_batch)
-        old_action_log_probs_batch = torch.stack(old_action_log_probs_batch)
-        adv_targ = torch.stack(adv_targ)
-        
-        # 展平时序维度和批次维度【T*N, tensor】
-        T, N = seq_length, samples_per_batch
-        obs_batch = _flatten_helper(T, N, obs_batch.transpose(0, 1))
-        actions_batch = _flatten_helper(T, N, actions_batch.transpose(0, 1))
-        value_preds_batch = _flatten_helper(T, N, value_preds_batch.transpose(0, 1))
-        return_batch = _flatten_helper(T, N, return_batch.transpose(0, 1))
-        masks_batch = _flatten_helper(T, N, masks_batch.transpose(0, 1))
-        old_action_log_probs_batch = _flatten_helper(T, N, old_action_log_probs_batch.transpose(0, 1))
-        adv_targ = _flatten_helper(T, N, adv_targ.transpose(0, 1))
+        # 转换为张量并重塑维度为 [num_agents, seq_per_batch, seq_length, features]
+        obs_batch = torch.stack(obs_batch).view(num_agents, seq_per_batch, seq_length, -1)
+        recurrent_hidden_states_batch = torch.stack(recurrent_hidden_states_batch).view(num_agents, seq_per_batch, seq_length, -1)
+        actions_batch = torch.stack(actions_batch).view(num_agents, seq_per_batch, seq_length, -1)
+        value_preds_batch = torch.stack(value_preds_batch).view(num_agents, seq_per_batch, seq_length, -1)
+        return_batch = torch.stack(return_batch).view(num_agents, seq_per_batch, seq_length, -1)
+        masks_batch = torch.stack(masks_batch).view(num_agents, seq_per_batch, seq_length, -1)
+        old_action_log_probs_batch = torch.stack(old_action_log_probs_batch).view(num_agents, seq_per_batch, seq_length, -1)
+        adv_targ = torch.stack(adv_targ).view(num_agents, seq_per_batch, seq_length, -1)
         
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch, \
               masks_batch, old_action_log_probs_batch, adv_targ  
