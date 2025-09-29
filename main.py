@@ -16,13 +16,16 @@ np.set_printoptions(suppress=True, precision=4)
 
 def train(args, return_early=False):
     writer = SummaryWriter(args.log_dir)    
-    envs = utils.make_parallel_envs(args) 
-    master = setup_master(args)
+    envs = utils.make_parallel_envs(args) # make parallel envs
+    master = setup_master(args) # setup learner ，no env
     # used during evaluation only
-    eval_master, eval_env = setup_master(args, return_env=True) 
-    obs = envs.reset() # shape - num_processes x num_agents x obs_dim
+    eval_master, eval_env = setup_master(args, return_env=True)  # setup evaluate learner with SINGLE env
+    obs, state = envs.reset() # shape - num_processes x num_agents x obs_dim
+
     print("obs shape: ", obs.shape)
+    print("state shape: ", state.shape)
     master.initialize_obs(obs)
+    master.initialize_state(state)
     n = len(master.all_agents)
     episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
     final_rewards = torch.zeros([args.num_processes, n], device=args.device)
@@ -38,14 +41,15 @@ def train(args, return_early=False):
                 # print("step: ", step)
                 actions_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
-            obs, reward, done, info = envs.step(agent_actions)
+            obs, reward, done, info, state = envs.step(agent_actions)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
-            #print("step: ", step)
+            print("step: ", step)
             #print("masks: ", masks)
             final_rewards *= masks
             #print("rewards: ", reward)
+            print("state.shape:", state.shape)
             final_rewards += (1 - masks) * episode_rewards
             #print("final_rewards2: ", final_rewards)
             episode_rewards *= masks

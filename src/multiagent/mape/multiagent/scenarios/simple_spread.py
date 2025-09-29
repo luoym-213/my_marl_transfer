@@ -101,6 +101,12 @@ class Scenario(BaseScenario):
         condition1 = world.steps >= world.max_steps_episode
         self.is_success = np.all(self.min_dists < world.dist_thres)
         return condition1 or self.is_success
+    
+    def state(self, world):
+        agents_vel = [agent.state.p_vel for agent in world.agents]
+        agents_pos = [agent.state.p_pos for agent in world.agents]
+        landmark_pos = [entity.state.p_pos for entity in world.landmarks]
+        return np.concatenate(agents_vel + agents_pos + landmark_pos)
 
     def info(self, agent, world):
         info = {'is_success': self.is_success, 'world_steps': world.steps,

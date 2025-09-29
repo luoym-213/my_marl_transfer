@@ -14,7 +14,7 @@ class MultiAgentEnv(gym.Env):
 
     def __init__(self, world, reset_callback=None, reward_callback=None,
                  observation_callback=None, info_callback=None,
-                 done_callback=None, discrete_action=False, shared_viewer=True,
+                 done_callback=None, state_callback=None, discrete_action=False, shared_viewer=True,
                  cam_range=1, mask_obs_dist=None
                  ):
 
@@ -29,6 +29,7 @@ class MultiAgentEnv(gym.Env):
         self.reset_callback = reset_callback
         self.reward_callback = reward_callback
         self.observation_callback = observation_callback
+        self.state_callback = state_callback
         self.info_callback = info_callback
         self.done_callback = done_callback
         # environment parameters
@@ -108,11 +109,12 @@ class MultiAgentEnv(gym.Env):
             done_n.append(self._get_done(agent))
             info_n['n'].append(self._get_info(agent))
 
+        state = self._get_state(self.world)
         # all agents get total reward in cooperative case
         reward = np.sum(reward_n)
         if self.shared_reward:
             reward_n = [reward] * self.n
-        return obs_n, reward_n, done_n, info_n
+        return obs_n, reward_n, done_n, info_n, state
 
     def reset(self):
         # reset world
@@ -124,7 +126,8 @@ class MultiAgentEnv(gym.Env):
         self.agents = self.world.policy_agents
         for agent in self.agents:
             obs_n.append(self._get_obs(agent))
-        return obs_n
+        state = self._get_state(self.world)
+        return obs_n, state
 
     # get info used for benchmarking
     def _get_info(self, agent):
@@ -137,6 +140,12 @@ class MultiAgentEnv(gym.Env):
         if self.observation_callback is None:
             return np.zeros(0)
         return self.observation_callback(agent, self.world)
+    
+    # get state for environment
+    def _get_state(self, world):
+        if self.state_callback is None:
+            return np.zeros(0)
+        return self.state_callback(world)
 
     # get dones for a particular agent
     # unused right now -- agents are allowed to go beyond the viewing screen

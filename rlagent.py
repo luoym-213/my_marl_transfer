@@ -11,7 +11,7 @@ class Neo(object):
     self.action_space = action_space
     self.actor_critic = policy
     self.rollouts = RolloutStorage(args.num_steps, args.num_processes, self.obs_shape, self.action_space, 
-                                   recurrent_hidden_state_size=args.recurrent_hidden_state_size)
+                                   args.num_agents, recurrent_hidden_state_size=args.recurrent_hidden_state_size)
     self.args = args
     self.trainer = PPO(self.actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                        args.entropy_coef, lr=args.lr,max_grad_norm=args.max_grad_norm)
@@ -22,6 +22,10 @@ class Neo(object):
   def initialize_obs(self, obs):
     # this function is called at the start of episode
     self.rollouts.obs[0].copy_(obs)
+
+  def initialize_state(self, state):
+    # this function is called at the start of episode
+    self.rollouts.state[0].copy_(state)
 
   def update_rollout(self, obs, reward, mask):
     self.rollouts.insert(obs, self.states, self.action, self.action_log_prob, self.value, reward, mask)

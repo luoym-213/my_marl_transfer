@@ -98,6 +98,12 @@ class Learner(object):
         for i, agent in enumerate(self.all_agents):
             agent.initialize_obs(torch.from_numpy(obs[:,i,:]).float().to(self.device))
             agent.rollouts.to(self.device)
+    
+    def initialize_state(self, state):
+        # obs - num_processes x num_agents x obs_dim
+        for i, agent in enumerate(self.all_agents):
+            agent.initialize_state(torch.from_numpy(state).float().to(self.device))
+            agent.rollouts.to(self.device)
 
     def act(self, step):
         actions_list = []

@@ -29,6 +29,7 @@ def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity
                         reward_callback=scenario.reward, 
                         observation_callback=scenario.observation,
                         info_callback=scenario.info if hasattr(scenario, 'info') else None,
+                        state_callback=scenario.state,
                         discrete_action=True,
                         done_callback=scenario.done,
                         cam_range=arena_size,
