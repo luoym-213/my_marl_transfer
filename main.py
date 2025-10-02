@@ -31,9 +31,6 @@ def train(args, return_early=False):
     start = datetime.datetime.now()
     for j in range(args.num_updates):
         for step in range(args.num_steps):
-            # 如果是第50步，需要重新设置hidden state
-            if step%50 == 0:
-                master.initial_hidden_states(step)
             with torch.no_grad():
                 # print("step: ", step)
                 actions_list = master.act(step)
@@ -42,14 +39,9 @@ def train(args, return_early=False):
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
-            #print("step: ", step)
-            #print("masks: ", masks)
             final_rewards *= masks
-            #print("rewards: ", reward)
             final_rewards += (1 - masks) * episode_rewards
-            #print("final_rewards2: ", final_rewards)
             episode_rewards *= masks
-            #print("episode_rewards: ", episode_rewards)
 
             master.update_rollout(obs, reward, masks)
           
