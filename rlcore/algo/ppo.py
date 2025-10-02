@@ -458,3 +458,71 @@ def recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, num_m
        
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch, \
               masks_batch, old_action_log_probs_batch, adv_targ
+
+def recurrent_generator(rollouts_list, advantages_list, num_mini_batch, seq_len):
+    """
+    rolloutlist: buffer with fields [obs, actions, value_preds, returns, masks, action_log_probs, hidden_states]
+    shape: [T+1, N, ...]
+    advantages: [T, N]
+    num_mini_batch: number of mini batches per update
+    seq_len: length of sequence per sample (e.g. 16)
+    output: [num_agents, batchsize, seq_len, dim]
+    """
+    T, N = rollouts_list[0].rewards.size()[0:2]   # T=128, N=num_processes
+    batch_size = N * T # total number of samples = 128*32
+    # 每个process有 floor(T/seq_len) 段序列
+    num_sequences = batch_size // seq_len # 128*32/16 = 256
+    assert num_sequences >= num_mini_batch, "mini batch size too large"
+
+    # 生成所有序列的起点索引
+    indices = torch.randperm(num_sequences) # 打乱顺序 [3,7,1,9,2,8,4,6,0,5...] 共256个
+
+    mini_batch_size = num_sequences // num_mini_batch # 每个batch包含的序列数，共256/32=8个
+
+    for start in range(0, num_sequences, mini_batch_size): # 32个batch
+        sampled_indices = indices[start:start+mini_batch_size] # 每个batch的序列起点索引，共8个
+
+        agent_obs_batch, agent_actions_batch, agent_value_preds_batch = [], [], []
+        agent_return_batch, agent_masks_batch, agent_old_action_log_probs_batch = [], [], []
+        agent_adv_batch, agent_hidden_states_batch = [], []
+
+        for agent_id, (rollouts, advantages) in enumerate(zip(rollouts_list, advantages_list)):
+
+            obs_batch, actions_batch, value_preds_batch = [], [], []
+            return_batch, masks_batch, old_action_log_probs_batch = [], [], []
+            adv_batch, hidden_states_batch = [], []
+
+            for idx in sampled_indices:
+                process_id = idx // (T // seq_len)
+                start_step = (idx % (T // seq_len)) * seq_len
+                end_step = start_step + seq_len
+
+                obs_batch.append(rollouts.obs[start_step:end_step, process_id]) # [seq_len, obs_dim]
+                actions_batch.append(rollouts.actions[start_step:end_step, process_id]) # [seq_len, action_dim]
+                value_preds_batch.append(rollouts.value_preds[start_step:end_step, process_id])
+                return_batch.append(rollouts.returns[start_step:end_step, process_id])
+                masks_batch.append(rollouts.masks[start_step:end_step, process_id])
+                old_action_log_probs_batch.append(rollouts.action_log_probs[start_step:end_step, process_id])
+                adv_batch.append(advantages[start_step:end_step, process_id])
+
+                # 初始 hidden state 取序列开头的 h0
+                hidden_states_batch.append(rollouts.recurrent_hidden_states[start_step, process_id]) # [hidden_size]
+
+            agent_obs_batch.append(torch.stack(obs_batch, dim=0)) # [batchsize, seq_len, obs_dim]
+            agent_actions_batch.append(torch.stack(actions_batch, dim=0))
+            agent_value_preds_batch.append(torch.stack(value_preds_batch, dim=0))
+            agent_return_batch.append(torch.stack(return_batch, dim=0))
+            agent_masks_batch.append(torch.stack(masks_batch, dim=0))
+            agent_old_action_log_probs_batch.append(torch.stack(old_action_log_probs_batch, dim=0))
+            agent_adv_batch.append(torch.stack(adv_batch, dim=0))
+            agent_hidden_states_batch.append(torch.stack(hidden_states_batch, dim=0)) # [batchsize, hidden_size]
+
+        # output: [num_agents, batchsize, seq_len, dim]
+        yield (torch.stack(agent_obs_batch, dim=0),
+               torch.stack(agent_hidden_states_batch, dim=0), # [agent, batchsize, hidden_size]
+               torch.stack(agent_actions_batch, dim=0),
+               torch.stack(agent_value_preds_batch, dim=0),
+               torch.stack(agent_return_batch, dim=0),
+               torch.stack(agent_masks_batch, dim=0),
+               torch.stack(agent_old_action_log_probs_batch, dim=0),
+               torch.stack(agent_adv_batch, dim=0))

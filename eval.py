@@ -65,7 +65,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         print(f"GIF files will be saved to: {eval_folder}")
 
     for t in range(num_eval_episodes):
-        obs = env.reset()
+        obs, state = env.reset()
         # 修复：使用args.device确保设备一致性
         recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size, device=args.device)
         obs = normalize_obs(obs, obs_mean, obs_std)
@@ -103,7 +103,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             with torch.no_grad():
                 actions, recurrent_hidden_states = master.eval_act(obs, recurrent_hidden_states, mask)
             episode_steps += 1
-            obs, reward, done, info = env.step(actions)
+            obs, reward, done, info, state = env.step(actions)
             obs = normalize_obs(obs, obs_mean, obs_std)
             episode_rewards += np.array(reward)
             
