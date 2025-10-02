@@ -132,7 +132,7 @@ class JointPPO():
         for e in range(self.ppo_epoch):
             if self.actor_critic.is_recurrent:
                 # raise ('sampler not implemented for recurrent policies')
-                data_generator = recurrent_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch, seq_length = 30)
+                data_generator = recurrent_generator(rollouts_list, advantages_list, self.num_mini_batch, seq_len = 16)
                 #data_generator = recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
             else:
                 data_generator = magent_feed_forward_generator(rollouts_list, advantages_list, self.num_mini_batch)
@@ -147,7 +147,7 @@ class JointPPO():
                 # 合并多个batch
                 # reshape and concat along second dimension (episodes_per_batch * parallel_batch_size), (num_agent, batch, num_steps, dim) 
                 combined_obs = torch.cat([sample[0] for sample in batch_group], dim=1)  # concat on dim=1
-                combined_hidden_states = torch.cat([sample[1] for sample in batch_group], dim=1)
+                combined_hidden_states = torch.cat([sample[1] for sample in batch_group], dim=1) # [agent, batch, hidden_size]
                 combined_actions = torch.cat([sample[2] for sample in batch_group], dim=1)
                 combined_value_preds = torch.cat([sample[3] for sample in batch_group], dim=1)
                 combined_returns = torch.cat([sample[4] for sample in batch_group], dim=1)
@@ -157,7 +157,7 @@ class JointPPO():
 
                 # 转换成形状(num_steps, num_agent * batch, dim)
                 combined_obs = combined_obs.permute(2, 0, 1, 3).reshape(-1, combined_obs.size(0) * combined_obs.size(1), combined_obs.size(3))
-                combined_hidden_states = combined_hidden_states.permute(2, 0, 1, 3).reshape(-1, combined_hidden_states.size(0) * combined_hidden_states.size(1), combined_hidden_states.size(3))
+                combined_hidden_states = combined_hidden_states.reshape(combined_hidden_states.size(0) * combined_hidden_states.size(1), -1) # [agent * batch, hidden_size]
                 combined_actions = combined_actions.permute(2, 0, 1, 3).reshape(-1, combined_actions.size(0) * combined_actions.size(1), combined_actions.size(3))
                 combined_value_preds = combined_value_preds.permute(2, 0, 1, 3).reshape(-1, combined_value_preds.size(0) * combined_value_preds.size(1), combined_value_preds.size(3))
                 combined_returns = combined_returns.permute(2, 0, 1, 3).reshape(-1, combined_returns.size(0) * combined_returns.size(1), combined_returns.size(3))
@@ -181,19 +181,19 @@ class JointPPO():
 
                 # 一次性处理合并后的大batch
                 if self.actor_critic.is_recurrent:
-
-                    T, N = combined_obs.shape[0], combined_obs.shape[1]  # 50, numagent * episodes_per_batch * parallel_batch_size
+                    T, N = combined_obs.shape[0], combined_obs.shape[1]  # , numagent * episodes_per_batch * parallel_batch_size
 
                     # 初始化            
                     values_list = []
                     action_log_probs_list = []
                     dist_entropy_sum = 0 # 初始化熵的总和
                     # current_states = torch.zeros(N, combined_hidden_states.shape[2], device=combined_hidden_states.device) #[batchsize, hidden_size]
-                    current_states = combined_hidden_states[0] # 取第一个时间步的隐藏状态作为初始状态
+                    current_states = combined_hidden_states # 取第一个时间步的隐藏状态作为初始状态
                     
                     # 逐时间步处理
                     for t in range(T):
                         #print("current_states: ", current_states[0:3])
+                        current_states = current_states * combined_masks[t]  # 根据mask更新hidden state
                         values_t, action_log_probs_t, dist_entropy_t, current_states = self.actor_critic.evaluate_actions(
                             combined_obs[t],
                             current_states,
@@ -280,7 +280,7 @@ def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_bat
         rollouts_list: 代理的经验池列表，长度为 num_agents，每个元素是一个 RolloutStorage 对象
         advantages_list: 优势函数列表，与 rollouts_list 对应
         num_mini_batch: mini-batch 的数量
-        seq_length: 每个序列的长度，默认为 30，必须小于 50
+        seq_length: 每个子序列的长度，默认设置为16
     
     Returns:
         生成器，每次迭代返回一个 mini-batch 的数据    

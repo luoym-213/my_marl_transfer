@@ -28,6 +28,8 @@ class Neo(object):
     self.rollouts.state[0].copy_(state)
 
   def update_rollout(self, obs, reward, mask):
+    # 根据mask更新self.states，mask.shape: [num_processes, 1], self.states.shape: [num_processes, hidden_size], 如果mask = 0, 则将hidden state置0
+    self.states = self.states * mask
     self.rollouts.insert(obs, self.states, self.action, self.action_log_prob, self.value, reward, mask)
 
   def act(self, step, deterministic=False):

@@ -43,11 +43,8 @@ def train(args, return_early=False):
             episode_rewards += reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
             final_rewards *= masks
-            print("state.shape:", state.shape)
             final_rewards += (1 - masks) * episode_rewards
-            #print("final_rewards2: ", final_rewards)
             episode_rewards *= masks
-            #print("episode_rewards: ", episode_rewards)
 
             master.update_rollout(obs, reward, masks, state)
           
