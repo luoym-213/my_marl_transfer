@@ -12,14 +12,16 @@ class RolloutStorage(object):
         self.recurrent_hidden_states = torch.zeros(num_steps + 1, num_processes, recurrent_hidden_state_size)
         self.rewards = torch.zeros(num_steps, num_processes, 1)
         self.value_preds = torch.zeros(num_steps + 1, num_processes, 1)
-        self.tasks = torch.zeros(num_steps + 1, num_processes, 2)   # [explore, gather]
-        self.state = torch.zeros(num_steps + 1, num_processes, num_agent*6)
+        self.tasks = torch.zeros(num_steps, num_processes, 2)   # [explore, gather]
+        self.env_states = torch.zeros(num_steps + 1, num_processes, num_agent*6)
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
         self.action_log_probs = torch.zeros(num_steps, num_processes, 1)
         self.actions = torch.zeros(num_steps, num_processes, 1)
         self.actions = self.actions.long()
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
         self.num_steps = num_steps
+        self.tgnet_input = torch.zeros(num_steps, num_processes, recurrent_hidden_state_size) # [x_diff, y_diff, dist, one_hot]
+
         self.step = 0
 
     def to(self, device):
@@ -31,8 +33,11 @@ class RolloutStorage(object):
         self.action_log_probs = self.action_log_probs.to(device)
         self.actions = self.actions.to(device)
         self.masks = self.masks.to(device)
+        self.env_states = self.env_states.to(device)
+        self.tasks = self.tasks.to(device)
+        self.tgnet_input = self.tgnet_input.to(device)
 
-    def insert(self, obs, recurrent_hidden_states, actions, action_log_probs, value_preds, rewards, masks):
+    def insert(self, obs, recurrent_hidden_states, actions, action_log_probs, value_preds, rewards, masks, env_states, cta_tasks, tgnet_input):
         self.obs[self.step + 1].copy_(obs)
         self.recurrent_hidden_states[self.step + 1].copy_(recurrent_hidden_states)
         self.actions[self.step].copy_(actions)
@@ -40,6 +45,9 @@ class RolloutStorage(object):
         self.value_preds[self.step].copy_(value_preds)
         self.rewards[self.step].copy_(rewards)
         self.masks[self.step + 1].copy_(masks)
+        self.env_states[self.step + 1].copy_(env_states)
+        self.tasks[self.step].copy_(cta_tasks)
+        self.tgnet_input[self.step].copy_(tgnet_input)  # placeholder, later will be replaced by actual tgnet input
 
         self.step = (self.step + 1) % self.num_steps
 
@@ -47,6 +55,7 @@ class RolloutStorage(object):
         self.obs[0].copy_(self.obs[-1])
         self.recurrent_hidden_states[0].copy_(self.recurrent_hidden_states[-1])
         self.masks[0].copy_(self.masks[-1])
+        self.env_states[0].copy_(self.env_states[-1])
 
     def compute_returns(self, next_value, use_gae, gamma, tau):
         if use_gae:

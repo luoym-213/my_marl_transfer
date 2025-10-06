@@ -4,7 +4,7 @@ import numpy as np
 from rlcore.distributions import Categorical
 import torch.nn.functional as F
 import math
-
+from scipy.optimize import linear_sum_assignment  # 匈牙利算法
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -16,7 +16,7 @@ def weights_init(m):
 
 class MPNN(nn.Module):
     def __init__(self, action_space, num_agents, num_entities, input_size=16, hidden_dim=128, embed_dim=None,
-                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None, entity_mp=False):
+                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None, entity_mp=False, is_recurrent=True):
         super().__init__()
 
         self.h_dim = hidden_dim
@@ -26,12 +26,16 @@ class MPNN(nn.Module):
         self.K = 3 # message passing rounds
         self.embed_dim = self.h_dim if embed_dim is None else embed_dim
         self.n_heads = n_heads
+        self.is_recurrent = is_recurrent
         self.mask_dist = mask_dist
         self.mask_obs_dist = mask_obs_dist
         self.input_size = input_size
         self.entity_mp = entity_mp
         # this index must be from the beginning of observation vector
         self.pos_index = pos_index
+        # task generation parameters
+        self.task_dim = 2
+        self.h_dim2 = self.h_dim // 2 # 64
 
         self.encoder = nn.Sequential(nn.Linear(self.input_size,self.h_dim),
                                      self.nonlin(inplace=True))
@@ -69,8 +73,28 @@ class MPNN(nn.Module):
         self.dist = Categorical(self.h_dim,num_actions)
 
         # 添加GRU层
-        self.gru = nn.GRUCell(self.h_dim, self.h_dim)
-        self.is_recurrent = True
+        self.gru = nn.GRUCell(self.h_dim, self.h_dim) 
+
+        # TaskGeneration module
+        self.task = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),self.nonlin(inplace=True), # 128 -> 128
+            nn.Linear(self.h_dim, self.h_dim2),self.nonlin(inplace=True), # 128 -> 64
+            nn.Linear(self.h_dim2, self.task_dim)    # 64 -> task_dim
+        )
+
+        self.task_encoder = nn.Sequential(nn.Linear(self.task_dim, self.h_dim2),self.nonlin(inplace=True)) # task_dim -> 64
+
+        # 拼接融合层
+        self.fusion = nn.Sequential(
+            nn.Linear(self.h_dim + self.h_dim2, self.h_dim),
+            self.nonlin(inplace=True)
+        )
+
+        # Centralized Critic
+        self.critic_value_head = nn.Sequential(nn.Linear(self.num_agents * 6 + self.task_dim * self.num_agents, self.h_dim * 2), # env_state + task
+                                    self.nonlin(inplace=True),
+                                    nn.Linear(self.h_dim * 2, self.h_dim * 2),
+                                    self.nonlin(inplace=True),
+                                    nn.Linear(self.h_dim * 2, 1))
 
         if norm_in:
             self.in_fn = nn.BatchNorm1d(self.input_size)
@@ -170,6 +194,23 @@ class MPNN(nn.Module):
         self.attn_mat = attn.squeeze().detach().cpu().numpy()
         # print("h shape: ", h.shape)
         return h, new_state # should be <batch_size, self.h_dim> again
+    
+    def taskG(self,h):
+        # 智能体的任务生成器
+        h_task_logit = self.task(h) # should be <batch_size, task_dim>
+        h_task = F.one_hot(torch.argmax(h_task_logit,dim=1),num_classes=self.task_dim).float() # should be <batch_size, task_dim>
+
+        return h_task_logit, h_task
+    
+    def _task_fwd(self, h, h_task):
+        # 将来自cta或者智能体的任务生成编码，并与上层观测向量合成编码
+        h_task_enc = self.task_encoder(h_task) # should be <batch_size, 64>
+
+        # combine h and h_task_enc to [batch_size, self.h_dim + 64] and then to self.h_dim
+        h = self.fusion(torch.cat((h, h_task_enc), dim=1)) # should be <batch_size, self.h_dim>
+        
+        return h
+
 
     def forward(self, inp, state, mask=None):
         # 保存当前的隐藏状态
@@ -185,15 +226,99 @@ class MPNN(nn.Module):
 
     def _policy(self, x):
         return self.policy_head(x)
+    
+    def CTA(self, env_state):
+        # env_state should be (<batch_size, env_dim>)
+        # batch_size = env_state.size(0) = num_agents * num_processes
+        
+        # 任务生成模块,匈牙利算法
+        batch_size = env_state.size(0) // self.num_agents
+        agents_pos = env_state[:batch_size, self.num_agents * 2:self.num_agents * 4].view(batch_size, self.num_agents, 2) # [batch_size, 3, 2]
+        landmarks_pos = env_state[:batch_size, self.num_agents * 4:].view(batch_size, self.num_agents, 2) # [batch_size, 3, 2]
 
-    def act(self, inp, state, mask=None, deterministic=False):
+        ## 构造代价矩阵
+        cost_matrix = torch.cdist(agents_pos, landmarks_pos, p=2) # [batch_size, 3, 3]
+
+        # 逐批次应用匈牙利算法
+        assignments = []
+        dists_list = []
+        
+        for b in range(batch_size):
+            # 对每个批次分别计算
+            cost_b = cost_matrix[b].cpu().numpy()  # [3, 3]
+            row_ind, col_ind = linear_sum_assignment(cost_b)
+
+            dists_b = torch.tensor(cost_b[row_ind, col_ind], device=env_state.device)
+            
+            assignments.append(col_ind)
+            dists_list.append(dists_b)
+        
+        # 合并所有批次的距离 [batch_size, num_agents]
+        dists = torch.stack(dists_list, dim=0)  # [batch_size, 3]
+        
+        # 生成二分类 onehot 编码 [batch_size, num_agents, task_dim]
+        task = torch.zeros((batch_size, self.num_agents, self.task_dim), 
+                        dtype=torch.float32, device=env_state.device)
+
+        # 使用张量操作：创建掩码并使用scatter
+        close_mask = (dists < self.mask_obs_dist).unsqueeze(-1)  # [batch_size, num_agents, 1]
+        
+        # 对于距离近的，设置第1列为1；距离远的，设置第0列为1
+        task[:, :, 1] = close_mask.squeeze(-1).float()      # 距离近：任务类型1
+        task[:, :, 0] = (~close_mask.squeeze(-1)).float()   # 距离远：任务类型0
+        
+        task = task.transpose(0, 1).contiguous().view(batch_size * self.num_agents, self.task_dim)
+
+        return task
+
+        
+
+
+        # 先随机生成数据
+        batch_size = env_state.size(0)
+        # 为每个智能体随机生成一个任务索引（0或1，对应task_dim=2）
+        task_indices = torch.randint(0, self.task_dim, (batch_size, 1)).to(env_state.device)
+        # 转换为one-hot编码
+        task_onehot = F.one_hot(task_indices, num_classes=self.task_dim).float()  # [batch_size, 1, task_dim]
+        # 重新塑形为拼接格式
+        task = task_onehot.view(batch_size, self.task_dim)  # [batch_size, task_dim]
+
+        return task
+
+    def critic_value(self, env_state, task, mask=None):
+        # env_state should be (<batch_size, env_dim>)
+        # task should be (<batch_size, task_dim>)
+        # mask should be (<batch_size, 1>)
+
+        # expand task to global_task
+        batch_size = task.size(0)
+        num_processes = batch_size // self.num_agents
+        task_global = task.view(self.num_agents, num_processes, self.task_dim).transpose(0, 1).contiguous().view(num_processes, self.num_agents * self.task_dim)
+        task = task_global.repeat_interleave(self.num_agents, dim=0) # should be <batch_size, task_dim * num_agents>
+
+        x = torch.cat((env_state, task), dim=1) # should be <batch_size, env_dim + task_dim>
+        x = self.critic_value_head(x) # should be <batch_size, 1>
+        return x
+
+
+    def act(self, inp, state, env_state, mask=None, deterministic=False):
         """
         inp: [batch_size, dim_o]
         state: [batch_size, dim_h]
+        env_state: [batch_size, env_dim]
         mask: [batch_size, 1], mask for actions
         """
         x, new_state = self._fwd(inp, state)
-        value = self._value(x)
+        # 这里需要把x存入buffer中，看是return比较好这里可以直接存
+        tgnet_input = x  # 取前task_dim维度作为tgnet的输入 <batch_size, dim_h>
+
+        # 训练阶段使用cta的任务
+        cta_task = self.CTA(env_state) # should be <batch_size, task_dim>
+        x = self._task_fwd(x, cta_task)  # 拼接任务向量
+
+        # value 不再使用sigle agent的输出头，使用中心的critic
+        # value = self._value(x)
+        value = self.critic_value(env_state, cta_task, mask)
         dist = self.dist(self._policy(x))
         if deterministic:
             action = dist.mode()
@@ -202,11 +327,14 @@ class MPNN(nn.Module):
         action_log_probs = dist.log_probs(action).view(-1,1)
         
         # 返回更新后的隐藏状态
-        return value, action, action_log_probs, new_state
+        return value, action, action_log_probs, new_state, cta_task, tgnet_input
 
-    def evaluate_actions(self, inp, state, mask, action): 
+    def evaluate_actions(self, inp, state, mask, action, env_state, task=None): 
         x, new_state = self._fwd(inp, state)  # 修正：传递state参数
-        value = self._value(x) # [num_mini_batch, 1]
+        x = self._task_fwd(x, task)
+
+        # value = self._value(x) # [num_mini_batch, 1]
+        value = self.critic_value(env_state, task, mask)
         dist = self.dist(self._policy(x))
         action_log_probs = dist.log_probs(action)
         dist_entropy = dist.entropy().mean() # [num_mini_batch, 1] -> 1 scalar
@@ -214,10 +342,14 @@ class MPNN(nn.Module):
         # 返回更新后的隐藏状态
         return value, action_log_probs, dist_entropy, new_state  # 修正：返回new_state而不是self.hidden_state.clone()
 
-    def get_value(self, inp, state, mask):
+    def get_value(self, inp, state, mask, env_state):
             
         x, new_state = self._fwd(inp, state)
-        value = self._value(x)
+        # 训练阶段使用cta的任务
+        cta_task = self.CTA(env_state) # should be <batch_size, task_dim>
+        x = self._task_fwd(x, cta_task)  # 添加任务生成模块
+        # value = self._value(x)
+        value = self.critic_value(env_state, cta_task, mask)
         return value
 
 

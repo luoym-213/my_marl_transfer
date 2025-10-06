@@ -15,6 +15,12 @@ class Neo(object):
     self.args = args
     self.trainer = PPO(self.actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                        args.entropy_coef, lr=args.lr,max_grad_norm=args.max_grad_norm)
+    
+    self.cta_task = None
+    self.tgnet_input = None
+    self.action = None
+    self.action_log_prob = None
+    self.value = None
 
   def load_model(self, policy_state):
       self.actor_critic.load_state_dict(policy_state)
@@ -23,14 +29,14 @@ class Neo(object):
     # this function is called at the start of episode
     self.rollouts.obs[0].copy_(obs)
 
-  def initialize_state(self, state):
+  def initialize_env_state(self, env_state):
     # this function is called at the start of episode
-    self.rollouts.state[0].copy_(state)
+    self.rollouts.env_states[0].copy_(env_state)
 
-  def update_rollout(self, obs, reward, mask):
+  def update_rollout(self, obs, reward, mask, env_state):
     # 根据mask更新self.states，mask.shape: [num_processes, 1], self.states.shape: [num_processes, hidden_size], 如果mask = 0, 则将hidden state置0
     self.states = self.states * mask
-    self.rollouts.insert(obs, self.states, self.action, self.action_log_prob, self.value, reward, mask)
+    self.rollouts.insert(obs, self.states, self.action, self.action_log_prob, self.value, reward, mask, env_state, self.cta_task, self.tgnet_input)
 
   def act(self, step, deterministic=False):
     self.value, self.action, self.action_log_prob, self.states = self.actor_critic.act(self.rollouts.obs[step],

@@ -116,6 +116,7 @@ class JointPPO():
         self.use_clipped_value_loss = use_clipped_value_loss
 
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
+        self.optimizer_tgnet = optim.Adam(actor_critic.task.parameters(), lr=lr)
 
     def update(self, rollouts_list):
         # rollouts_list - list of rollouts of agents which share self.actor_critic policy
@@ -154,6 +155,8 @@ class JointPPO():
                 combined_masks = torch.cat([sample[5] for sample in batch_group], dim=1)
                 combined_old_log_probs = torch.cat([sample[6] for sample in batch_group], dim=1)
                 combined_advantages = torch.cat([sample[7] for sample in batch_group], dim=1)
+                combined_env_states = torch.cat([sample[8] for sample in batch_group], dim=1)
+                combined_tasks = torch.cat([sample[9] for sample in batch_group], dim=1)
 
                 # 转换成形状(num_steps, num_agent * batch, dim)
                 combined_obs = combined_obs.permute(2, 0, 1, 3).reshape(-1, combined_obs.size(0) * combined_obs.size(1), combined_obs.size(3))
@@ -164,8 +167,10 @@ class JointPPO():
                 combined_masks = combined_masks.permute(2, 0, 1, 3).reshape(-1, combined_masks.size(0) * combined_masks.size(1), combined_masks.size(3))
                 combined_old_log_probs = combined_old_log_probs.permute(2, 0, 1, 3).reshape(-1, combined_old_log_probs.size(0) * combined_old_log_probs.size(1), combined_old_log_probs.size(3))
                 combined_advantages = combined_advantages.permute(2, 0, 1, 3).reshape(-1, combined_advantages.size(0) * combined_advantages.size(1), combined_advantages.size(3))
-                
-                
+                combined_env_states = combined_env_states.permute(2, 0, 1, 3).reshape(-1, combined_env_states.size(0) * combined_env_states.size(1), combined_env_states.size(3))
+                combined_tasks = combined_tasks.permute(2, 0, 1, 3).reshape(-1, combined_tasks.size(0) * combined_tasks.size(1), combined_tasks.size(3))
+
+
                 ## 检测代码开始
                 # print("pre_0;", batch_group[0][0][0, 0, 0, :])
                 # print("pre_1:", batch_group[1][0][0, 0, 0, :])
@@ -198,7 +203,9 @@ class JointPPO():
                             combined_obs[t],
                             current_states,
                             combined_masks[t],
-                            combined_actions[t]
+                            combined_actions[t],
+                            combined_env_states[t],
+                            combined_tasks[t]
                         )
                         # values_t:[N, 1], action_log_probs_t:[N, 1], dist_entropy_t:[N, 1]
 
@@ -251,6 +258,44 @@ class JointPPO():
 
         return value_loss_epoch, action_loss_epoch, dist_entropy_epoch        
 
+    def taskG_update(self, rollouts_list):
+        total_loss = 0.0
+        total_correct = 0
+        total_samples = 0
+
+        for e in range(self.ppo_epoch):
+            # 使用所有rollouts的数据来训练任务生成器
+            e_data_generator = tgnet_feed_forward_generator(rollouts_list, self.num_mini_batch)
+
+            for sample in e_data_generator:
+                tasks_batch, tgnet_input_batch = sample
+
+                # forward
+                task_logits, _ = self.actor_critic.taskG(tgnet_input_batch)
+
+                # loss
+                task_loss = F.cross_entropy(task_logits, tasks_batch.argmax(dim=1))
+
+                # backward
+                self.optimizer_tgnet.zero_grad()
+                task_loss.backward()
+                nn.utils.clip_grad_norm_(self.actor_critic.task.parameters(), self.max_grad_norm)
+                self.optimizer_tgnet.step()
+
+                # 计算预测正确数量
+                preds = torch.argmax(task_logits, dim=1)
+                targets = tasks_batch.argmax(dim=1)
+                correct = (preds == targets).sum().item()
+                total_correct += correct
+                total_samples += targets.size(0)
+
+                total_loss += task_loss.item()
+
+        avg_loss = total_loss / (self.ppo_epoch * self.num_mini_batch)
+        accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+
+        return avg_loss, accuracy
+            
 
 def magent_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     num_steps, num_processes = rollouts_list[0].rewards.size()[0:2]
@@ -459,6 +504,17 @@ def recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, num_m
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch, \
               masks_batch, old_action_log_probs_batch, adv_targ
 
+def tgnet_feed_forward_generator(rollouts_list, num_mini_batch):
+    num_steps, num_processes = rollouts_list[0].rewards.size()[0:2]
+    batch_size = num_processes * num_steps
+    mini_batch_size = int((batch_size/num_mini_batch)) # size of minibatch for each agent
+    sampler = BatchSampler(SubsetRandomSampler(range(batch_size)), mini_batch_size, drop_last=False)
+    for indices in sampler:
+        tasks_batch = torch.cat([rollout.tasks.view(-1, rollout.tasks.size(-1))[indices] for rollout in rollouts_list],0)
+        tgnet_input_batch = torch.cat([rollout.tgnet_input.view(-1, rollout.tgnet_input.size(-1))[indices] for rollout in rollouts_list],0)
+
+        yield tasks_batch, tgnet_input_batch
+
 def recurrent_generator(rollouts_list, advantages_list, num_mini_batch, seq_len):
     """
     rolloutlist: buffer with fields [obs, actions, value_preds, returns, masks, action_log_probs, hidden_states]
@@ -484,13 +540,13 @@ def recurrent_generator(rollouts_list, advantages_list, num_mini_batch, seq_len)
 
         agent_obs_batch, agent_actions_batch, agent_value_preds_batch = [], [], []
         agent_return_batch, agent_masks_batch, agent_old_action_log_probs_batch = [], [], []
-        agent_adv_batch, agent_hidden_states_batch = [], []
+        agent_adv_batch, agent_hidden_states_batch, agent_env_states_batch, agent_tasks_batch = [], [], [],  []
 
         for agent_id, (rollouts, advantages) in enumerate(zip(rollouts_list, advantages_list)):
 
             obs_batch, actions_batch, value_preds_batch = [], [], []
             return_batch, masks_batch, old_action_log_probs_batch = [], [], []
-            adv_batch, hidden_states_batch = [], []
+            adv_batch, hidden_states_batch, env_states_batch, tasks_batch = [], [], [],  []
 
             for idx in sampled_indices:
                 process_id = idx // (T // seq_len)
@@ -504,6 +560,8 @@ def recurrent_generator(rollouts_list, advantages_list, num_mini_batch, seq_len)
                 masks_batch.append(rollouts.masks[start_step:end_step, process_id])
                 old_action_log_probs_batch.append(rollouts.action_log_probs[start_step:end_step, process_id])
                 adv_batch.append(advantages[start_step:end_step, process_id])
+                env_states_batch.append(rollouts.env_states[start_step:end_step, process_id])
+                tasks_batch.append(rollouts.tasks[start_step:end_step, process_id])
 
                 # 初始 hidden state 取序列开头的 h0
                 hidden_states_batch.append(rollouts.recurrent_hidden_states[start_step, process_id]) # [hidden_size]
@@ -516,6 +574,8 @@ def recurrent_generator(rollouts_list, advantages_list, num_mini_batch, seq_len)
             agent_old_action_log_probs_batch.append(torch.stack(old_action_log_probs_batch, dim=0))
             agent_adv_batch.append(torch.stack(adv_batch, dim=0))
             agent_hidden_states_batch.append(torch.stack(hidden_states_batch, dim=0)) # [batchsize, hidden_size]
+            agent_env_states_batch.append(torch.stack(env_states_batch, dim=0))
+            agent_tasks_batch.append(torch.stack(tasks_batch, dim=0))
 
         # output: [num_agents, batchsize, seq_len, dim]
         yield (torch.stack(agent_obs_batch, dim=0),
@@ -525,4 +585,6 @@ def recurrent_generator(rollouts_list, advantages_list, num_mini_batch, seq_len)
                torch.stack(agent_return_batch, dim=0),
                torch.stack(agent_masks_batch, dim=0),
                torch.stack(agent_old_action_log_probs_batch, dim=0),
-               torch.stack(agent_adv_batch, dim=0))
+               torch.stack(agent_adv_batch, dim=0),
+               torch.stack(agent_env_states_batch, dim=0),
+               torch.stack(agent_tasks_batch, dim=0))
