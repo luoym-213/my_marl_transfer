@@ -68,8 +68,9 @@ class Scenario(BaseScenario):
         dist = np.sqrt(np.sum(np.square(delta_pos)))
         dist_min = agent1.size + agent2.size
         return True if dist < dist_min else False
-
+    
     def reward(self, agent, world):
+        # 只需要计算一次，将所有的最短距离转换成负值存放在self.rewards，再根据函数参数的agent.iden返回对应奖励
         if agent.iden == 0: # compute this only once when called with the first agent
             # each column represents distance of all agents from the respective landmark
             world.dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in world.landmarks]
@@ -77,10 +78,10 @@ class Scenario(BaseScenario):
             # optimal 1:1 agent-landmark pairing (bipartite matching algorithm)
             self.min_dists = self._bipartite_min_dists(world.dists) 
             # the reward is normalized by the number of agents
-            joint_reward = np.clip(-np.mean(self.min_dists), -15, 15) 
+            joint_reward = np.clip(-self.min_dists, -15, 15) 
             self.rewards = np.full(self.num_agents, joint_reward)
             world.min_dists = self.min_dists
-        return self.rewards.mean()
+        return self.rewards[agent.iden]
 
     def _bipartite_min_dists(self, dists):
         ri, ci = linear_sum_assignment(dists)

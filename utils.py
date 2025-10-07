@@ -11,9 +11,9 @@ def normalize_obs(obs, mean, std):
         return obs
 
 
-def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identity_size):
+def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None):
     def _thunk():
-        env = make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size)
+        env = make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist)
         env.seed(seed + rank) # seed not implemented
         return env
     return _thunk
@@ -41,7 +41,7 @@ def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity
 def make_parallel_envs(args):
     # make parallel environments
     envs = [make_env(args.env_name, args.seed, i, args.num_agents,
-                     args.dist_threshold, args.arena_size, args.identity_size) for i in range(args.num_processes)]
+                     args.dist_threshold, args.arena_size, args.identity_size, args.mask_obs_dist) for i in range(args.num_processes)]
     if args.num_processes > 1:
         envs = gym_vecenv.SubprocVecEnv(envs)
     else:

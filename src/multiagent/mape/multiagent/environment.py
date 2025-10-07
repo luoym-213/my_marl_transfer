@@ -4,6 +4,8 @@ from gym.envs.registration import EnvSpec
 import numpy as np
 from multiagent.multi_discrete import MultiDiscrete
 from gym.utils import seeding
+from multiagent.global_info_map import GlobalInfoMap
+
 
 # environment for all agents in the multiagent world
 # currently code assumes that no agents will be created/destroyed at runtime!
@@ -15,7 +17,7 @@ class MultiAgentEnv(gym.Env):
     def __init__(self, world, reset_callback=None, reward_callback=None,
                  observation_callback=None, info_callback=None,
                  done_callback=None, state_callback=None, discrete_action=False, shared_viewer=True,
-                 cam_range=1, mask_obs_dist=None
+                 cam_range=1, enable_exploration_reward=True, mask_obs_dist=None
                  ):
 
         self.world = world
@@ -85,6 +87,17 @@ class MultiAgentEnv(gym.Env):
             self.viewers = [None] * self.n
         self._reset_render()
 
+        # 初始化全局信息地图
+        self.enable_exploration_reward = enable_exploration_reward
+        if self.enable_exploration_reward:
+            self.world_size = 2
+            self.cell_size = 0.05
+            self.global_info_map = GlobalInfoMap(world_size=self.world_size, cell_size=self.cell_size)
+        else:
+            self.global_info_map = None
+
+
+
     @property
     def episode_limit(self):
         return self.world.max_steps_episode
@@ -103,6 +116,15 @@ class MultiAgentEnv(gym.Env):
             self._set_action(action_n[i], agent, self.action_space[i])
         # advance world state
         self.world.step()
+
+        # 计算探索奖励 (在位置更新后)，并更新全局信息图，放在0维
+        exploration_rewards = self._compute_exploration_rewards()
+
+        # 碰撞惩罚、边界惩罚
+        common_penaltie = self._compute_penaltie()
+
+        all_explor_rewards = exploration_rewards + common_penaltie
+
         for agent in self.agents:
             obs_n.append(self._get_obs(agent))
             reward_n.append(self._get_reward(agent))
@@ -110,15 +132,31 @@ class MultiAgentEnv(gym.Env):
             info_n['n'].append(self._get_info(agent))
 
         state = self._get_state(self.world)
-        # all agents get total reward in cooperative case
-        reward = np.sum(reward_n)
-        if self.shared_reward:
-            reward_n = [reward] * self.n
-        return obs_n, reward_n, done_n, info_n, state
+
+        # # all agents get total reward in cooperative case
+        # reward = np.sum(reward_n)
+        # if self.shared_reward:
+        #     reward_n = [reward] * self.n
+
+        all_gather_reward =  np.array(reward_n) + common_penaltie
+
+        final_reward = np.concatenate([all_explor_rewards, all_gather_reward], axis=0)
+
+        return obs_n, final_reward, done_n, info_n, state
 
     def reset(self):
         # reset world
         self.reset_callback(self.world)
+
+        # 重置global_info_map
+        # 根据智能体初始位置，预先更新地图
+        if self.enable_exploration_reward:
+            self.global_info_map.reset()
+
+            for agent in self.world.policy_agents:
+                fov_mask = self.global_info_map.get_fov_mask(agent.state.p_pos, self.world.mask_obs_dist)
+                self.global_info_map.update_explored_area(fov_mask)
+
         # reset renderer
         self._reset_render()
         # record observations for each agent
@@ -129,6 +167,91 @@ class MultiAgentEnv(gym.Env):
         state = self._get_state(self.world)
         return obs_n, state
 
+    def _compute_exploration_rewards(self):
+        """
+        计算每个智能体的探索奖励
+        
+        返回:
+            numpy array of shape (num_agents,) 包含每个智能体的探索奖励
+        """
+        if not self.enable_exploration_reward:
+            return np.zeros(len(self.agents))
+        
+        num_agents = len(self.agents)
+        rewards_explore = np.zeros(num_agents)
+        
+        # 1. 获取当前地图状态的副本 (更新前)
+        grid_before_update = self.global_info_map.grid.copy()
+        
+        # 2. 准备累积本步所有新探索的区域
+        newly_explored_this_step_mask = np.zeros_like(
+            grid_before_update, dtype=bool
+        )
+        
+        # 3. 获取所有智能体的位置
+        agent_positions = np.array([agent.state.p_pos for agent in self.agents])
+        
+        # 4. 遍历每个智能体，计算其个体贡献
+        for i in range(num_agents):
+            agent_pos = agent_positions[i]
+            
+            # a. 计算该智能体的观测区域 (Field of View)
+            fov_mask = self.global_info_map.get_fov_mask(agent_pos, self.world.mask_obs_dist)
+            
+            # b. 计算边际信息增益
+            # 边际贡献 = 智能体的FoV 与 (旧地图中的未知区域) 的交集
+            unknown_mask_before = (grid_before_update == 0)
+            marginal_contribution_mask = fov_mask & unknown_mask_before
+            
+            # c. 计算个体奖励 (新发现的栅格数量)
+            rewards_explore[i] = np.sum(marginal_contribution_mask)
+            
+            # d. 累积本步所有新探索的区域
+            newly_explored_this_step_mask |= marginal_contribution_mask
+        
+        # 5. 一次性更新全局地图
+        self.global_info_map.update_explored_area(newly_explored_this_step_mask)
+        
+        return rewards_explore
+    
+    def _compute_penaltie(self):
+        num_agents = len(self.agents)
+        penalties = np.zeros(num_agents)
+        
+        # 超参数
+        SAFE_DISTANCE = 0.4  # 安全距离
+        COLLISION_COEF = -50.0  # 碰撞惩罚系数
+        BOUNDARY_PENALTY = -2.0  # 边界惩罚
+        
+        # 获取所有智能体的位置
+        agent_positions = np.array([agent.state.p_pos for agent in self.agents])
+        
+        # 1. 计算碰撞惩罚
+        for i in range(num_agents):
+            for j in range(i + 1, num_agents):
+                # 计算智能体i和j之间的距离
+                dist = np.linalg.norm(agent_positions[i] - agent_positions[j])
+                
+                # 如果距离小于安全距离，施加碰撞惩罚
+                if dist < SAFE_DISTANCE:
+                    collision_penalty = COLLISION_COEF * ((1 - dist / SAFE_DISTANCE) ** 2)
+                    penalties[i] += collision_penalty
+                    penalties[j] += collision_penalty
+        
+        # 2. 计算边界惩罚
+        # 边界范围是 [-world_size/2, world_size/2]
+        boundary = self.world_size / 2.0  # 默认是 2.0/2.0 = 1.0
+        
+        for i in range(num_agents):
+            x, y = agent_positions[i]
+            
+            # 检查是否触碰到边界
+            if abs(x) >= boundary or abs(y) >= boundary:
+                penalties[i] += BOUNDARY_PENALTY
+        
+        return penalties
+    
+    
     # get info used for benchmarking
     def _get_info(self, agent):
         if self.info_callback is None:

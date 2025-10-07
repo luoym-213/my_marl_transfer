@@ -101,9 +101,12 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         while not np.all(done):
             actions = []
             with torch.no_grad():
-                actions, recurrent_hidden_states = master.eval_act(obs, recurrent_hidden_states, env_states, mask)
+                actions, recurrent_hidden_states, cta_tasks = master.eval_act(obs, recurrent_hidden_states, env_states, mask)
             episode_steps += 1
             obs, reward, done, info, env_states = env.step(actions)
+            # 将reward转换成torch张量
+            reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
+            reward = master.eval_reward_choose(reward, cta_tasks)
             obs = normalize_obs(obs, obs_mean, obs_std)
             episode_rewards += np.array(reward)
             

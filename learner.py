@@ -129,6 +129,20 @@ class Learner(object):
                 actions_list.append(all_action[i].cpu().numpy())
 
         return actions_list
+    
+    def reward_choose(self, all_rewards):
+        task_list = []
+        for team in self.teams_list:
+            n = len(team)
+            for i in range(n):
+                task_list.append(team[i].cta_task)
+            task_list = torch.cat(task_list, 1) # [32,6]
+            B,N = task_list.shape
+            task_reshape = task_list.view(B, n, 2).transpose(1,2).reshape(B,N)
+            masked = all_rewards * task_reshape  # [B, n*2]
+            agent_reward = masked.view(B, 2, n).sum(dim=1)  # [B, n]
+            return agent_reward
+
 
     def update(self):
         return_vals = []
@@ -192,6 +206,7 @@ class Learner(object):
 
         actions = []
         states = []
+        cta_tasks = []
         # 这里需要对env_states进行处理，因为它是(env_state_dim)的形状，需要复制成(num_agent, env_state_dim)
         env_states = torch.from_numpy(np.tile(env_states, (len(obs), 1))).float().to(self.device)
         for team,policy,obs in zip(self.teams_list,self.policies_list,all_obs):
@@ -200,8 +215,16 @@ class Learner(object):
                 actions.append(action.squeeze(1).cpu().numpy())
                 # 修改：保持隐藏状态为张量，而不是转换为NumPy数组
                 states.append(new_state)
+                cta_tasks.append(cta_task)
 
-        return np.hstack(actions), torch.cat(states) if states else recurrent_hidden_states
+        return np.hstack(actions), torch.cat(states) if states else recurrent_hidden_states, torch.cat(cta_tasks)
+
+    def eval_reward_choose(self, all_rewards, task):
+        n,dim = task.shape
+        task_reshape = task.transpose(0,1).reshape(n*dim)
+        masked = all_rewards * task_reshape
+        agent_reward = masked.view(dim, n).sum(dim=0)
+        return agent_reward
 
     def set_eval_mode(self):
         for agent in self.all_agents:

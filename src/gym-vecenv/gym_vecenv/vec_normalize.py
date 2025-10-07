@@ -52,14 +52,15 @@ class MultiAgentVecNormalize(VecEnvWrapper):
     """
     def __init__(self, venv, ob=True, ret=True, clipob=10., cliprew=10., gamma=0.99, epsilon=1e-8):
         VecEnvWrapper.__init__(self, venv)
+        self.n = len(self.observation_space)
         self.ob_rms = [RunningMeanStd(shape=x.shape) for x in self.observation_space] if ob else None
-        self.ret_rms = RunningMeanStd(shape=(len(self.observation_space),)) if ret else None
+        self.ret_rms = RunningMeanStd(shape=(self.n * 2,)) if ret else None
         self.clipob = clipob
         self.cliprew = cliprew
-        self.ret = np.zeros((self.num_envs,len(self.observation_space)))
+        self.ret = np.zeros((self.num_envs, self.n * 2))
         self.gamma = gamma
         self.epsilon = epsilon
-        self.n = len(self.observation_space)
+        
 
     def step_wait(self):
         """
@@ -69,8 +70,11 @@ class MultiAgentVecNormalize(VecEnvWrapper):
         where 'news' is a boolean vector indicating whether each element is new.
         """
         obs, rews, news, infos, sta = self.venv.step_wait()
+        # 更新累计折扣回报
         self.ret = self.ret * self.gamma + rews
+        # 归一化观测
         obs = self._obfilt(obs)
+        # 归一化奖励
         if self.ret_rms:
             self.ret_rms.update(self.ret)
             rews = np.clip(rews / np.sqrt(self.ret_rms.var + self.epsilon), -self.cliprew, self.cliprew)
