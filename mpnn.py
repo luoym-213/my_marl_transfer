@@ -90,11 +90,24 @@ class MPNN(nn.Module):
         )
 
         # Centralized Critic
-        self.critic_value_head = nn.Sequential(nn.Linear(self.num_agents * 6 + self.task_dim * self.num_agents, self.h_dim * 2), # env_state + task
-                                    self.nonlin(inplace=True),
-                                    nn.Linear(self.h_dim * 2, self.h_dim * 2),
-                                    self.nonlin(inplace=True),
-                                    nn.Linear(self.h_dim * 2, 1))
+        self.critic_shared = nn.Sequential(
+            nn.Linear(self.num_agents * 6 + self.task_dim * self.num_agents, self.h_dim * 2),
+            self.nonlin(inplace=True),
+            nn.Linear(self.h_dim * 2, self.h_dim * 2),
+            self.nonlin(inplace=True)
+        )
+
+        # 为每个智能体创建独立的输出头
+        self.critic_heads = nn.ModuleList([
+            nn.Linear(self.h_dim * 2, 1) 
+            for _ in range(self.num_agents)
+        ])
+
+        # self.critic_value_head = nn.Sequential(nn.Linear(self.num_agents * 6 + self.task_dim * self.num_agents, self.h_dim * 2), # env_state + task
+        #                             self.nonlin(inplace=True),
+        #                             nn.Linear(self.h_dim * 2, self.h_dim * 2),
+        #                             self.nonlin(inplace=True),
+        #                             nn.Linear(self.h_dim * 2, 1))
 
         if norm_in:
             self.in_fn = nn.BatchNorm1d(self.input_size)
@@ -271,20 +284,6 @@ class MPNN(nn.Module):
 
         return task
 
-        
-
-
-        # 先随机生成数据
-        batch_size = env_state.size(0)
-        # 为每个智能体随机生成一个任务索引（0或1，对应task_dim=2）
-        task_indices = torch.randint(0, self.task_dim, (batch_size, 1)).to(env_state.device)
-        # 转换为one-hot编码
-        task_onehot = F.one_hot(task_indices, num_classes=self.task_dim).float()  # [batch_size, 1, task_dim]
-        # 重新塑形为拼接格式
-        task = task_onehot.view(batch_size, self.task_dim)  # [batch_size, task_dim]
-
-        return task
-
     def critic_value(self, env_state, task, mask=None):
         # env_state should be (<batch_size, env_dim>)
         # task should be (<batch_size, task_dim>)
@@ -297,7 +296,16 @@ class MPNN(nn.Module):
         task = task_global.repeat_interleave(self.num_agents, dim=0) # should be <batch_size, task_dim * num_agents>
 
         x = torch.cat((env_state, task), dim=1) # should be <batch_size, env_dim + task_dim>
-        x = self.critic_value_head(x) # should be <batch_size, 1>
+        # 通过共享主干
+        share_features = self.critic_shared(x) # should be <batch_size, h_dim * 2>
+        # 逐个计算后拼接
+        values = []
+        for i in range(self.num_agents):
+            share_feature_i = share_features[i*num_processes:(i+1)*num_processes]
+            value_i = self.critic_heads[i](share_feature_i)
+            values.append(value_i)
+
+        x = torch.cat(values, dim=0)
         return x
 
 
@@ -319,6 +327,7 @@ class MPNN(nn.Module):
         # value 不再使用sigle agent的输出头，使用中心的critic
         # value = self._value(x)
         value = self.critic_value(env_state, cta_task, mask)
+
         dist = self.dist(self._policy(x))
         if deterministic:
             action = dist.mode()
