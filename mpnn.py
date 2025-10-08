@@ -158,12 +158,17 @@ class MPNN(nn.Module):
         return mask,mask_agents             
 
     def calculate_mask_entity(self, inp):
-        # inp: landmark's positon, [num_processes * num_agents, num_agents]
+        # inp: landmark's positon, [num_processes * num_agents, num_agents*2]
         bsz = inp.size(0)//self.num_agents  # num_processes
-        dists = torch.norm(inp.contiguous().view(bsz * self.num_agents, self.num_agents, 2), p=2, dim=2) # [bsz*num_agents, num_agents]
-        restrict = dists > self.mask_obs_dist # [bsz*num_agents, num_agents]
-        mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
-        return mask 
+        dists = torch.norm(inp.contiguous().view(bsz * self.num_agents, self.num_agents, 2), p=2, dim=2) # [bsz*num_agents, dis_landmark]
+        #restrict = dists > self.mask_obs_dist # [bsz*num_agents, dis_landmark]
+        dists_reshape = dists.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
+
+        # 全通信下只需计算每个地标距离智能体的最小距离
+        min_dists = dists_reshape.min(dim=1, keepdim=True)[0]  # [bsz, 1, num_landmarks]
+        #mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
+        mask_global = (min_dists > self.mask_obs_dist).expand(bsz, self.num_agents, self.num_agents)
+        return mask_global
 
     def _fwd(self, inp, state=None):
         # inp should be (batch_size,input_size)
