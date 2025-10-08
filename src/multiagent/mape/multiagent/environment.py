@@ -111,6 +111,14 @@ class MultiAgentEnv(gym.Env):
         done_n = []
         info_n = {'n': []}
         self.agents = self.world.policy_agents
+        last_reward_n = []
+
+        # 计算step前的距离奖励，即上一步智能体距离目标点的距离，以便后续计算差分奖励
+        for agent in self.agents:
+            last_reward_n.append(self._get_reward(agent))
+
+        state = self._get_state(self.world)
+
         # set action for each agent
         for i, agent in enumerate(self.agents):
             self._set_action(action_n[i], agent, self.action_space[i])
@@ -138,7 +146,10 @@ class MultiAgentEnv(gym.Env):
         # if self.shared_reward:
         #     reward_n = [reward] * self.n
 
-        all_gather_reward =  np.array(reward_n) + common_penaltie
+        # 差分奖励
+        reward_n = np.array(reward_n) - np.array(last_reward_n)
+
+        all_gather_reward =  reward_n + common_penaltie
 
         final_reward = np.concatenate([all_explor_rewards, all_gather_reward], axis=0)
 
