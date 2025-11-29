@@ -1,1 +1,1 @@
-from .ppo import PPO, JointPPO
+from .ppo import PPO, JointPPO, IPPO

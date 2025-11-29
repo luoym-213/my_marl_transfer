@@ -20,12 +20,14 @@ def train(args, return_early=False):
     master = setup_master(args) # setup learner ，no env
     # used during evaluation only
     eval_master, eval_env = setup_master(args, return_env=True)  # setup evaluate learner with SINGLE env
-    obs, env_state = envs.reset() # shape - num_processes x num_agents x obs_dim
+    obs, env_state, reset_info = envs.reset() # shape - num_processes x num_agents x obs_dim
 
     print("obs shape: ", obs.shape)
     print("state shape: ", env_state.shape)
     master.initialize_obs(obs)
     master.initialize_env_state(env_state)
+    master.envs_info = reset_info
+
     n = len(master.all_agents)
     episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
     final_rewards = torch.zeros([args.num_processes, n], device=args.device)
@@ -36,11 +38,15 @@ def train(args, return_early=False):
         for step in range(args.num_steps):
             with torch.no_grad():
                 #print("step: ", step)
-                actions_list = master.act(step)
+                actions_list, goals_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
-            obs, reward, done, info, env_state = envs.step(agent_actions)
+            agent_goals = np.transpose(np.array(goals_list),(1,0,2))
+            # 这里需要给agent_actions和agent_goals包装一下，变成字典形式传入env.step()
+            # 需要变成num_processes个环境的列表，每个元素是一个字典，包含两个键值对: 'agents_actions', 'agents_goals'
+            step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i]} for i in range(args.num_processes)]
+            obs, reward, done, info, env_state = envs.step(step_data)
+            master.envs_info = info
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
-            reward = master.reward_choose(reward)
             episode_rewards += reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
             final_rewards *= masks
@@ -48,15 +54,12 @@ def train(args, return_early=False):
             episode_rewards *= masks
 
             master.update_rollout(obs, reward, masks, env_state)
-          
+
         master.wrap_horizon()
-        return_vals, task_vals = master.update()
+        return_vals = master.update()
         value_loss = return_vals[:, 0]
         action_loss = return_vals[:, 1]
         dist_entropy = return_vals[:, 2]
-        task_loss = task_vals[0]
-        task_acc = task_vals[1]
-        
         master.after_update()
 
         if j%args.save_interval == 0 and not args.test:
@@ -73,8 +76,8 @@ def train(args, return_early=False):
             seconds = (end-start).total_seconds()
             mean_reward = final_rewards.mean(dim=0).cpu().numpy()
             print("Updates {} | Num timesteps {} | Time {} | FPS {}\nMean reward {}\nEntropy {:.4f} Value loss {:.4f} Policy loss {:.4f}\n" \
-            "Task loss {:.4f} Task acc {:.4f}\n".format(j, total_num_steps, str(end-start), int(total_num_steps / seconds), 
-                  mean_reward, dist_entropy[0], value_loss[0], action_loss[0], task_loss, task_acc))
+            .format(j, total_num_steps, str(end-start), int(total_num_steps / seconds), 
+                  mean_reward, dist_entropy[0], value_loss[0], action_loss[0]))
             if not args.test:
                 for idx in range(n):
                     writer.add_scalar('agent'+str(idx)+'/training_reward', mean_reward[idx], j)
@@ -82,8 +85,6 @@ def train(args, return_early=False):
                 writer.add_scalar('all/value_loss', value_loss[0], j)
                 writer.add_scalar('all/action_loss', action_loss[0], j)
                 writer.add_scalar('all/dist_entropy', dist_entropy[0], j)
-                writer.add_scalar('all/task_loss', task_loss, j)
-                writer.add_scalar('all/task_acc', task_acc, j)
 
         if args.eval_interval is not None and j%args.eval_interval==0:
             ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)

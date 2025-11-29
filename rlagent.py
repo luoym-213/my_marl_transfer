@@ -21,6 +21,7 @@ class Neo(object):
     self.action = None
     self.action_log_prob = None
     self.value = None
+    self.goal = None
 
   def load_model(self, policy_state):
       self.actor_critic.load_state_dict(policy_state)
@@ -34,9 +35,7 @@ class Neo(object):
     self.rollouts.env_states[0].copy_(env_state)
 
   def update_rollout(self, obs, reward, mask, env_state):
-    # 根据mask更新self.states，mask.shape: [num_processes, 1], self.states.shape: [num_processes, hidden_size], 如果mask = 0, 则将hidden state置0
-    self.states = self.states * mask
-    self.rollouts.insert(obs, self.states, self.action, self.action_log_prob, self.value, reward, mask, env_state, self.cta_task, self.tgnet_input)
+    self.rollouts.insert(obs, self.action, self.action_log_prob, self.value, reward, mask, env_state, self.goal)
 
   def act(self, step, deterministic=False):
     self.value, self.action, self.action_log_prob, self.states = self.actor_critic.act(self.rollouts.obs[step],

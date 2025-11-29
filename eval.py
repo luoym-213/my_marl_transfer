@@ -65,7 +65,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         print(f"GIF files will be saved to: {eval_folder}")
 
     for t in range(num_eval_episodes):
-        obs, env_states = env.reset()
+        obs, env_states, info = env.reset()
+        master.envs_info = info
         # 修复：使用args.device确保设备一致性
         recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size, device=args.device)
         obs = normalize_obs(obs, obs_mean, obs_std)
@@ -97,17 +98,22 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             if attn is not None and len(attn.shape)==3:
                 attn = attn.max(0)
             env.render(mode='human', attn=attn)
-            
+        
+        goals = None  # Initialize goals to None at the start of each episode
         while not np.all(done):
             actions = []
             with torch.no_grad():
-                actions, recurrent_hidden_states, cta_tasks = master.eval_act(obs, recurrent_hidden_states, env_states, mask)
+                actions, goals = master.eval_act(obs, env_states, goals)
             episode_steps += 1
-            obs, reward, done, info, env_states = env.step(actions)
+            step_data = {'agents_actions': actions, 'agents_goals': goals} 
+            # 检查goals属性，是tensor还是numpy数组，确保传入env.step()的是numpy数组
+            if isinstance(step_data['agents_goals'], torch.Tensor):
+                step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
+            obs, reward, done, info, env_states = env.step(step_data)
             # 将reward转换成torch张量
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
-            reward = master.eval_reward_choose(reward, cta_tasks)
             obs = normalize_obs(obs, obs_mean, obs_std)
+            master.envs_info = info
             episode_rewards += np.array(reward)
             
             # Render for GIF saving (if needed)

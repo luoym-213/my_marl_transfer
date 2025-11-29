@@ -54,10 +54,10 @@ class MultiAgentVecNormalize(VecEnvWrapper):
         VecEnvWrapper.__init__(self, venv)
         self.n = len(self.observation_space)
         self.ob_rms = [RunningMeanStd(shape=x.shape) for x in self.observation_space] if ob else None
-        self.ret_rms = RunningMeanStd(shape=(self.n * 2,)) if ret else None
+        self.ret_rms = RunningMeanStd(shape=(self.n,)) if ret else None
         self.clipob = clipob
         self.cliprew = cliprew
-        self.ret = np.zeros((self.num_envs, self.n * 2))
+        self.ret = np.zeros((self.num_envs, self.n))
         self.gamma = gamma
         self.epsilon = epsilon
         
@@ -97,5 +97,5 @@ class MultiAgentVecNormalize(VecEnvWrapper):
         """
         Reset all environments
         """
-        obs, sta = self.venv.reset()
-        return self._obfilt(obs), sta
+        obs, sta, reset_info = self.venv.reset()
+        return self._obfilt(obs), sta, reset_info

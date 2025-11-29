@@ -2,6 +2,7 @@ import numpy as np
 from multiprocessing import Process, Pipe
 from .vec_env import VecEnv, CloudpickleWrapper
 
+# 每个子环境的独立进程，负责接收指令，执行环境操作，并返回结果。
 def worker(remote, parent_remote, env_fn_wrapper):
     parent_remote.close()
     env = env_fn_wrapper.x()
@@ -10,11 +11,11 @@ def worker(remote, parent_remote, env_fn_wrapper):
         if cmd == 'step':
             ob, reward, done, info, sta = env.step(data)
             if np.any(done):
-                ob, sta = env.reset()
+                ob, sta, info = env.reset()
             remote.send((ob, reward, done, info, sta))
         elif cmd == 'reset':
-            ob, sta = env.reset()
-            remote.send((ob, sta))
+            ob, sta, reset_info = env.reset()
+            remote.send((ob, sta, reset_info))
         elif cmd == 'reset_task':
             ob = env.reset_task()
             remote.send(ob)
@@ -33,6 +34,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
             raise NotImplementedError
 
 
+# 主进程端容器，用于一次性控制多个 worker，实现并行环境执行
 class SubprocVecEnv(VecEnv):
     def __init__(self, env_fns, spaces=None):
         """
@@ -80,12 +82,12 @@ class SubprocVecEnv(VecEnv):
         for remote in self.remotes:
             remote.send(('reset', None))
         results = [remote.recv() for remote in self.remotes]
-        obs, sta = zip(*results)
+        obs, sta, reset_info = zip(*results)
         obs = np.stack(obs)
         sta = np.stack(sta)
         # ret = np.stack([remote.recv() for remote in self.remotes])
         self._update_num_agents()
-        return obs, sta
+        return obs, sta, reset_info
 
     def reset_task(self):
         for remote in self.remotes:

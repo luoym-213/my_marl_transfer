@@ -70,23 +70,10 @@ class Scenario(BaseScenario):
         return True if dist < dist_min else False
     
     def reward(self, agent, world):
-        # 只需要计算一次，将所有的最短距离转换成负值存放在self.rewards，再根据函数参数的agent.iden返回对应奖励
-        if agent.iden == 0: # compute this only once when called with the first agent
-            # each column represents distance of all agents from the respective landmark
-            world.dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in world.landmarks]
-                                   for a in world.agents])
-            # optimal 1:1 agent-landmark pairing (bipartite matching algorithm)
-            self.min_dists = self._bipartite_min_dists(world.dists) 
-            # the reward is normalized by the number of agents
-            joint_reward = np.clip(-self.min_dists, -15, 15) 
-            self.rewards = np.full(self.num_agents, joint_reward)
-            world.min_dists = self.min_dists
-        return self.rewards[agent.iden]
-
-    def _bipartite_min_dists(self, dists):
-        ri, ci = linear_sum_assignment(dists)
-        min_dists = dists[ri, ci]
-        return min_dists
+        # 直接计算每个智能体距离自己目标点的距离奖励
+        reward = -np.linalg.norm(agent.state.p_pos - agent.state.g_pos)
+        reward = np.clip(reward, -15, 15)
+        return reward
 
     def observation(self, agent, world):
         # positions of all entities in this agent's reference frame, because no other way to bring the landmark information
@@ -99,9 +86,22 @@ class Scenario(BaseScenario):
         return default_obs
 
     def done(self, agent, world):
+         # 计算所有智能体到所有landmark的距离
+        dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in world.landmarks]for a in world.agents])
+        # 匈牙利算法分配
+        self.min_dists = self._bipartite_min_dists(dists)
+        # 判断是否成功
+        self.is_success = np.all(self.min_dists < world.dist_thres)
+
         condition1 = world.steps >= world.max_steps_episode
         self.is_success = np.all(self.min_dists < world.dist_thres)
+        world.min_dists = self.min_dists
         return condition1 or self.is_success
+    
+    def _bipartite_min_dists(self, dists):
+        ri, ci = linear_sum_assignment(dists)
+        min_dists = dists[ri, ci]
+        return min_dists
     
     def state(self, world):
         agents_vel = [agent.state.p_vel for agent in world.agents]

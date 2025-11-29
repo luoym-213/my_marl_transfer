@@ -5,6 +5,8 @@ import numpy as np
 from multiagent.multi_discrete import MultiDiscrete
 from gym.utils import seeding
 from multiagent.global_info_map import GlobalInfoMap
+from multiagent.global_belief_map import GlobalBeliefMap
+
 
 
 # environment for all agents in the multiagent world
@@ -87,14 +89,16 @@ class MultiAgentEnv(gym.Env):
             self.viewers = [None] * self.n
         self._reset_render()
 
-        # 初始化全局信息地图
+        # 初始化全局信念地图
         self.enable_exploration_reward = enable_exploration_reward
         if self.enable_exploration_reward:
             self.world_size = 2
-            self.cell_size = 0.05
-            self.global_info_map = GlobalInfoMap(world_size=self.world_size, cell_size=self.cell_size)
+            self.cell_size = 0.02
+            # 收集landmark位置
+            landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
+            self.global_belief_map = GlobalBeliefMap(world_size=self.world_size, cell_size=self.cell_size, landmark_positions=landmark_positions, landmark_radius=0.05)
         else:
-            self.global_info_map = None
+            self.global_belief_map = None
 
 
 
@@ -105,40 +109,63 @@ class MultiAgentEnv(gym.Env):
     def seed(self, seed=None):
         np.random.seed(seed)
 
-    def step(self, action_n):
+    def step(self, data, goal_n=None):
         obs_n = []
         reward_n = []
         done_n = []
-        info_n = {'n': []}
+        info_n = {'n': [], 'map': [], 'world_steps': self.world.steps}
         self.agents = self.world.policy_agents
         last_reward_n = []
+        current_reward_n = []
+        last_goal_n = []
+        action_n = data['agents_actions']
+        goal_n = data['agents_goals']
 
-        # 计算step前的距离奖励，即上一步智能体距离目标点的距离，以便后续计算差分奖励
-        for agent in self.agents:
-            last_reward_n.append(self._get_reward(agent))
-
+        # 获取step前全局状态，智能体速度、位置，landmark位置
         state = self._get_state(self.world)
 
-        # set action for each agent
+        # set action and goal for each agent
         for i, agent in enumerate(self.agents):
+            ## 设置agent.action,留给world.step()使用
             self._set_action(action_n[i], agent, self.action_space[i])
+            ## 设置agent.state.g_pos, 供reward计算使用
+            self._set_goal(goal_n[i], agent)
+        
+        # 计算step前的距离奖励，即上一步智能体距离目标点的距离，以便后续计算差分奖励
+        for agent in self.agents:
+            last_reward_n.append(self._get_goal_reward(agent))
+
         # advance world state
         self.world.step()
 
-        # 计算探索奖励 (在位置更新后)，并更新全局信息图，放在0维
-        exploration_rewards = self._compute_exploration_rewards()
+        # 收集当前智能体位置
+        agents_pos = np.array([a.state.p_pos for a in self.agents])
+
+        # 根据获取的全局状态更新全局信息图
+        if self.enable_exploration_reward:
+            self.global_belief_map.update_beliefs(agents_pos, self.world.mask_obs_dist)
+
+        # 获取step更新后的voronoi加权质心以及目标位置
+        centroids = self.global_belief_map.compute_entropy_weighted_centroids(agents_pos) if self.enable_exploration_reward else None
+        target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
+
+        # 添加world_steps到info_n中
+        info_n['world_steps'] = self.world.steps
+
+        # 将centroids和target_positions添加到info_n中
+        info_n['map'].append(centroids)
+        info_n['map'].append(target_positions)
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
 
-        all_explor_rewards = exploration_rewards + common_penaltie
-
         for agent in self.agents:
             obs_n.append(self._get_obs(agent))
-            reward_n.append(self._get_reward(agent))
+            reward_n.append(self._get_goal_reward(agent))
             done_n.append(self._get_done(agent))
             info_n['n'].append(self._get_info(agent))
 
+        # 获取全局状态，智能体速度、位置，landmark位置
         state = self._get_state(self.world)
 
         # # all agents get total reward in cooperative case
@@ -149,81 +176,40 @@ class MultiAgentEnv(gym.Env):
         # 差分奖励
         reward_n = np.array(reward_n) - np.array(last_reward_n)
 
-        all_gather_reward =  reward_n + common_penaltie
+        # 势能奖励+碰撞惩罚
+        all_reward =  reward_n + common_penaltie
 
-        final_reward = np.concatenate([all_explor_rewards, all_gather_reward], axis=0)
-
-        return obs_n, final_reward, done_n, info_n, state
+        return obs_n, all_reward, done_n, info_n, state
 
     def reset(self):
         # reset world
         self.reset_callback(self.world)
 
-        # 重置global_info_map
+        # 重置global_belief_map
         # 根据智能体初始位置，预先更新地图
         if self.enable_exploration_reward:
-            self.global_info_map.reset()
-
-            for agent in self.world.policy_agents:
-                fov_mask = self.global_info_map.get_fov_mask(agent.state.p_pos, self.world.mask_obs_dist)
-                self.global_info_map.update_explored_area(fov_mask)
+            self.global_belief_map.reset()
+            self.global_belief_map.update_beliefs(np.array([a.state.p_pos for a in self.world.policy_agents]), self.world.mask_obs_dist)
 
         # reset renderer
         self._reset_render()
         # record observations for each agent
         obs_n = []
+        reset_info = {'map': [], 'world_steps': self.world.steps} # 用于存储reset时的信息
         self.agents = self.world.policy_agents
         for agent in self.agents:
             obs_n.append(self._get_obs(agent))
         state = self._get_state(self.world)
-        return obs_n, state
 
-    def _compute_exploration_rewards(self):
-        """
-        计算每个智能体的探索奖励
-        
-        返回:
-            numpy array of shape (num_agents,) 包含每个智能体的探索奖励
-        """
-        if not self.enable_exploration_reward:
-            return np.zeros(len(self.agents))
-        
-        num_agents = len(self.agents)
-        rewards_explore = np.zeros(num_agents)
-        
-        # 1. 获取当前地图状态的副本 (更新前)
-        grid_before_update = self.global_info_map.grid.copy()
-        
-        # 2. 准备累积本步所有新探索的区域
-        newly_explored_this_step_mask = np.zeros_like(
-            grid_before_update, dtype=bool
-        )
-        
-        # 3. 获取所有智能体的位置
+        # 获取当前智能体的位置，[num_agents, 2]
         agent_positions = np.array([agent.state.p_pos for agent in self.agents])
-        
-        # 4. 遍历每个智能体，计算其个体贡献
-        for i in range(num_agents):
-            agent_pos = agent_positions[i]
-            
-            # a. 计算该智能体的观测区域 (Field of View)
-            fov_mask = self.global_info_map.get_fov_mask(agent_pos, self.world.mask_obs_dist)
-            
-            # b. 计算边际信息增益
-            # 边际贡献 = 智能体的FoV 与 (旧地图中的未知区域) 的交集
-            unknown_mask_before = (grid_before_update == 0)
-            marginal_contribution_mask = fov_mask & unknown_mask_before
-            
-            # c. 计算个体奖励 (新发现的栅格数量)
-            rewards_explore[i] = np.sum(marginal_contribution_mask)
-            
-            # d. 累积本步所有新探索的区域
-            newly_explored_this_step_mask |= marginal_contribution_mask
-        
-        # 5. 一次性更新全局地图
-        self.global_info_map.update_explored_area(newly_explored_this_step_mask)
-        
-        return rewards_explore
+        # 获取reset后的voronoi加权质心以及目标位置
+        centroids = self.global_belief_map.compute_entropy_weighted_centroids(agent_positions) if self.enable_exploration_reward else None
+        target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
+        reset_info['map'].append(centroids)
+        reset_info['map'].append(target_positions)
+
+        return obs_n, state, reset_info
     
     def _compute_penaltie(self):
         num_agents = len(self.agents)
@@ -293,6 +279,11 @@ class MultiAgentEnv(gym.Env):
         if self.reward_callback is None:
             return 0.0
         return self.reward_callback(agent, self.world)
+    
+    def _get_goal_reward(self, agent):
+        if self.reward_callback is None:
+            return 0.0
+        return self.reward_callback(agent, self.world)
 
     # set env action for a particular agent
     def _set_action(self, action, agent, action_space, time=None):
@@ -344,6 +335,10 @@ class MultiAgentEnv(gym.Env):
             action = action[1:]
         # make sure we used all elements of action
         assert len(action) == 0
+    
+    # set env goal for a particular agent
+    def _set_goal(self, goal, agent):
+        agent.state.g_pos = goal
 
     # reset rendering assets
     def _reset_render(self):

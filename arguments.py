@@ -26,6 +26,7 @@ def get_args():
     parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
     parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')
     parser.add_argument('--arena-size', type=int, default=1, help='size of arena')
+    parser.add_argument('--high-level-interval', type=int, default=5, help='number of steps between high-level decisions')
 
     # evaluation
     parser.add_argument('--num-eval-episodes', type=int, default=30, help='number of episodes to evaluate with')

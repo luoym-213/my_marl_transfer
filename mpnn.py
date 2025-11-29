@@ -23,13 +23,14 @@ class MPNN(nn.Module):
         self.nonlin = nonlin
         self.num_agents = num_agents # number of agents
         self.num_entities = num_entities # number of entities
+        self.low_level_input = 2 + 2*num_agents # low level input size: agent pos + all agents pos
         self.K = 3 # message passing rounds
         self.embed_dim = self.h_dim if embed_dim is None else embed_dim
         self.n_heads = n_heads
         self.is_recurrent = is_recurrent
         self.mask_dist = mask_dist
         self.mask_obs_dist = mask_obs_dist
-        self.input_size = input_size
+        self.input_size = input_size # 这里是agengt自身速度位置（4）
         self.entity_mp = entity_mp
         # this index must be from the beginning of observation vector
         self.pos_index = pos_index
@@ -59,6 +60,9 @@ class MPNN(nn.Module):
 
         self.agent_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
                                           self.nonlin(inplace=True))
+
+        self.low_agent_encoder = nn.Sequential(nn.Linear(self.low_level_input, self.h_dim),
+                                              self.nonlin(inplace=True))
 
         if self.entity_mp:
             self.entity_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
@@ -229,7 +233,6 @@ class MPNN(nn.Module):
         
         return h
 
-
     def forward(self, inp, state, mask=None):
         # 保存当前的隐藏状态
         if state is not None:
@@ -239,10 +242,10 @@ class MPNN(nn.Module):
         # 返回更新后的隐藏状态
         return x, self.hidden_state.clone()
 
-    def _value(self, x):
-        return self.value_head(x)
+    def _low_value(self, x):
+        return self.value_head(x) # h_dim -> h_dim -> 1
 
-    def _policy(self, x):
+    def _low_policy(self, x): # h_dim -> h_dim
         return self.policy_head(x)
     
     def CTA(self, env_state):
@@ -289,6 +292,114 @@ class MPNN(nn.Module):
 
         return task
 
+    def high_level_act(self, search_map, detected_map, env_state):
+        # search_map: (<agent_dim*2>) 熵加权质点图,[(mx1, my1), (mx2, my2), ...]
+        # detected_map: (<detected_dim*2>) 已发现目标位置图，数量可能不同
+        # env_state: (<env_dim>)
+
+        # 提取智能体当前位置, [num_agents, 2]
+        agents_pos = env_state[self.num_agents * 2:self.num_agents * 4].view(self.num_agents, 2) 
+
+        # 已发现目标点数量
+        num_detected = detected_map.size(0)
+        # 初始化目标分配（默认使用搜索点）
+        goals = search_map.clone()  # [num_agents, 2]
+        # 如果有已发现的目标点
+        if num_detected > 0:
+            # 计算智能体到所有已发现目标点的距离矩阵
+            cost_matrix = torch.cdist(agents_pos, detected_map.float(), p=2)  # [num_agents, num_detected]
+            
+            # 使用匈牙利算法进行最优分配
+            cost_np = cost_matrix.cpu().numpy()
+            
+            # 如果目标点数量 >= 智能体数量，直接分配
+            if num_detected >= self.num_agents:
+                row_ind, col_ind = linear_sum_assignment(cost_np)
+                # 所有智能体都分配到目标点
+                for agent_idx, target_idx in zip(row_ind, col_ind):
+                    goals[agent_idx] = detected_map[target_idx]
+            else:
+                # 如果目标点数量 < 智能体数量
+                # 只分配部分智能体到目标点，其余使用搜索点
+                row_ind, col_ind = linear_sum_assignment(cost_np)
+                for agent_idx, target_idx in zip(row_ind, col_ind):
+                    goals[agent_idx] = detected_map[target_idx]
+                # 未分配的智能体保持使用原搜索点（已经在初始化时设置）
+
+        # # 拼接所有批次的目标 [batch_size, num_agents, 2] -> [batch_size * num_agents, 2]
+        # all_goals = torch.stack(all_goals, dim=0)  # [batch_size, num_agents, 2]
+        # all_goals = all_goals.transpose(0, 1).contiguous().view(batch_size * self.num_agents, 2)
+
+        return goals
+    
+    def data_processing_low_level(self, inp, goals):
+        # inp: [num_agents*batch_size, dim_o]
+        # goals: [num_agents*batch_size, 2], assigned goals for agents
+
+        batch_size = inp.size(0)
+
+        # 提取速度 [batch_size, 2]
+        velocities = inp[:, 0:2]
+
+        # 提取自身位置 [batch_size, 2]
+        self_pos = inp[:, 2:4]
+
+        # 计算与目标的相对位置 [batch_size, 2]
+        relative_goal_pos = goals - self_pos
+
+        # 提取其他智能体的绝对位置
+        # 从 inp 中提取：跳过速度(2)、自身位置(2)、landmarks(num_agents*2)
+        other_agents_start_idx = 4 + self.num_agents * 2
+        other_agents_pos = inp[:, other_agents_start_idx:other_agents_start_idx + (self.num_agents - 1) * 2]
+
+        # 将其他智能体位置重塑为 [batch_size, num_agents-1, 2]
+        other_agents_pos = other_agents_pos.view(batch_size, self.num_agents - 1, 2)
+
+        # 计算与其他智能体的相对位置
+        # 扩展 self_pos 以便广播: [batch_size, 1, 2]
+        self_pos_expanded = self_pos.unsqueeze(1)
+
+        # 相对位置 [batch_size, num_agents-1, 2]
+        relative_other_agents_pos = other_agents_pos - self_pos_expanded
+
+        # 展平其他智能体的相对位置 [batch_size, (num_agents-1)*2]
+        relative_other_agents_pos = relative_other_agents_pos.view(batch_size, -1)
+
+        # 拼接新的观测向量
+        # [batch_size, 2 + 2 + (num_agents-1)*2]
+        new_inp = torch.cat([
+            velocities,                    # 速度 (2)
+            relative_goal_pos,             # 与目标的相对位置 (2)
+            relative_other_agents_pos      # 与其他智能体的相对位置 ((num_agents-1)*2)
+        ], dim=1)
+
+        return new_inp
+
+    def low_level_act(self, inp, goals, deterministic=False):
+        """
+        inp: [num_agents*batch_size, dim_o]
+        state: [num_agents*batch_size, dim_h]
+        goals: [num_agents*batch_size, 2], assigned goals for agents
+        mask: [batch_size, 1], mask for actions
+        
+        """
+        # 处理观测和目标，得到新的输入
+        new_inp = self.data_processing_low_level(inp, goals)  
+
+        # 前向传播
+        x = self.low_agent_encoder(new_inp)  # should be [batch_size, h_dim]
+        value = self._low_value(x)  # should be [batch_size, 1]
+
+        # 采样动作
+        dist = self.dist(self._low_policy(x))
+        if deterministic:
+            action = dist.mode()
+        else:
+            action = dist.sample()
+        action_log_probs = dist.log_probs(action).view(-1,1)
+
+        return value, action, action_log_probs
+
     def critic_value(self, env_state, task, mask=None):
         # env_state should be (<batch_size, env_dim>)
         # task should be (<batch_size, task_dim>)
@@ -312,7 +423,6 @@ class MPNN(nn.Module):
 
         x = torch.cat(values, dim=0)
         return x
-
 
     def act(self, inp, state, env_state, mask=None, deterministic=False):
         """
@@ -355,6 +465,16 @@ class MPNN(nn.Module):
         
         # 返回更新后的隐藏状态
         return value, action_log_probs, dist_entropy, new_state  # 修正：返回new_state而不是self.hidden_state.clone()
+    
+    def evaluate_low_actions(self, inp, goals, action):
+        new_inp = self.data_processing_low_level(inp, goals)
+        x = self.low_agent_encoder(new_inp)
+        value = self._low_value(x)
+        dist = self.dist(self._low_policy(x))
+        action_log_probs = dist.log_probs(action)
+        dist_entropy = dist.entropy().mean()
+        
+        return value, action_log_probs, dist_entropy
 
     def get_value(self, inp, state, mask, env_state):
             
@@ -364,6 +484,12 @@ class MPNN(nn.Module):
         x = self._task_fwd(x, cta_task)  # 添加任务生成模块
         # value = self._value(x)
         value = self.critic_value(env_state, cta_task, mask)
+        return value
+    
+    def get_low_value(self, inp, goals):
+        new_inp = self.data_processing_low_level(inp, goals)
+        x = self.low_agent_encoder(new_inp)
+        value = self._low_value(x)
         return value
 
 

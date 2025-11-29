@@ -13,6 +13,7 @@ class RolloutStorage(object):
         self.rewards = torch.zeros(num_steps, num_processes, 1)
         self.value_preds = torch.zeros(num_steps + 1, num_processes, 1)
         self.tasks = torch.zeros(num_steps, num_processes, 2)   # [explore, gather]
+        self.goals = torch.zeros(num_steps, num_processes, 2)   # [x_goal, y_goal]
         self.env_states = torch.zeros(num_steps + 1, num_processes, num_agent*6)
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
         self.action_log_probs = torch.zeros(num_steps, num_processes, 1)
@@ -34,20 +35,17 @@ class RolloutStorage(object):
         self.actions = self.actions.to(device)
         self.masks = self.masks.to(device)
         self.env_states = self.env_states.to(device)
-        self.tasks = self.tasks.to(device)
-        self.tgnet_input = self.tgnet_input.to(device)
+        self.goals = self.goals.to(device)
 
-    def insert(self, obs, recurrent_hidden_states, actions, action_log_probs, value_preds, rewards, masks, env_states, cta_tasks, tgnet_input):
+    def insert(self, obs, actions, action_log_probs, value_preds, rewards, masks, env_states, goals):
         self.obs[self.step + 1].copy_(obs)
-        self.recurrent_hidden_states[self.step + 1].copy_(recurrent_hidden_states)
         self.actions[self.step].copy_(actions)
         self.action_log_probs[self.step].copy_(action_log_probs)
         self.value_preds[self.step].copy_(value_preds)
         self.rewards[self.step].copy_(rewards)
         self.masks[self.step + 1].copy_(masks)
         self.env_states[self.step + 1].copy_(env_states)
-        self.tasks[self.step].copy_(cta_tasks)
-        self.tgnet_input[self.step].copy_(tgnet_input)  # placeholder, later will be replaced by actual tgnet input
+        self.goals[self.step].copy_(goals)
 
         self.step = (self.step + 1) % self.num_steps
 
