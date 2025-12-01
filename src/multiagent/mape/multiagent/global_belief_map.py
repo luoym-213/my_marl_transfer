@@ -17,6 +17,7 @@ class GlobalBeliefMap:
         self.initial_belief = initial_belief
         self.sensor_fidelity = sensor_fidelity  # p_s
         self.landmark_positions = landmark_positions if landmark_positions is not None else []
+        self.landmark_radius = landmark_radius
 
         # 计算地图维度: 2 / 0.02 = 100
         self.map_dim = int(world_size / cell_size)
@@ -44,11 +45,18 @@ class GlobalBeliefMap:
         
         self.cell_world_x = self.world_min + (grid_x + 0.5) * self.cell_size
         self.cell_world_y = self.world_min + (grid_y + 0.5) * self.cell_size
-        
-    def reset(self):
+
+    def reset(self, landmark_positions=None):
         """重置地图，将所有栅格的信念恢复为初始值"""
         self.belief_grid.fill(self.initial_belief)
-        
+
+        if landmark_positions is not None:
+            self.landmark_positions = landmark_positions
+            self.landmark_map = np.zeros((self.map_dim, self.map_dim), dtype=bool)
+            for lx, ly in self.landmark_positions:
+                dist_sq = (self.cell_world_x - lx)**2 + (self.cell_world_y - ly)**2
+                self.landmark_map |= (dist_sq <= self.landmark_radius**2)
+
     def world_to_grid(self, world_pos):
         """将世界坐标转换为栅格索引"""
         x, y = world_pos

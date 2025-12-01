@@ -184,11 +184,11 @@ class MultiAgentEnv(gym.Env):
     def reset(self):
         # reset world
         self.reset_callback(self.world)
-
+        landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
         # 重置global_belief_map
         # 根据智能体初始位置，预先更新地图
         if self.enable_exploration_reward:
-            self.global_belief_map.reset()
+            self.global_belief_map.reset(landmark_positions)
             self.global_belief_map.update_beliefs(np.array([a.state.p_pos for a in self.world.policy_agents]), self.world.mask_obs_dist)
 
         # reset renderer
