@@ -346,21 +346,21 @@ class MultiAgentEnv(gym.Env):
         self.render_geoms_xform = None
 
     # render environment
-    def render(self, mode='human', attn=None):
-        # attn: matrix of size (num_agents, num_agents) 
+    def render(self, mode='human', attn=None, goals=None, show_voronoi=False, info=None, show_uncertainty=True):
+        # attn: matrix of size (num_agents, num_agents)
+        # goals: array of shape (num_agents, 2) - goal positions for each agent
+        # show_voronoi: bool - whether to show voronoi centroids
+        # show_uncertainty: bool - whether to show uncertainty heatmap
+        # info: dict - contains voronoi centroids information
 
         for i in range(len(self.viewers)):
             # create viewers (if necessary)
             if self.viewers[i] is None:
-                # import rendering only if we need it (and don't import for headless machines)
-                # from gym.envs.classic_control import rendering
                 from multiagent import rendering
                 self.viewers[i] = rendering.Viewer(700,700)
 
         # create rendering geometry
         if self.render_geoms is None:
-            # import rendering only if we need it (and don't import for headless machines)
-            # from gym.envs.classic_control import rendering
             from multiagent import rendering
             self.render_geoms = []
             self.render_geoms_xform = []
@@ -408,6 +408,156 @@ class MultiAgentEnv(gym.Env):
                 for geom in self.render_geoms:
                     viewer.add_geom(geom)
         
+        # 🔧 在每次渲染前，移除viewer中所有临时几何体
+        temp_geoms_start_idx = len(self.render_geoms)
+        
+        # 从viewer中移除旧的临时几何体
+        for viewer in self.viewers:
+            viewer.geoms = viewer.geoms[:self.render_count]
+        
+        # 🎨 绘制不确定性热力图（作为最底层背景）
+        if show_uncertainty and self.enable_exploration_reward and self.global_belief_map is not None:
+            from multiagent import rendering
+            
+            # 可调参数：不确定性热力图样式
+            UNCERTAINTY_ALPHA = 0.3       # 👈 修改这里：热力图透明度
+            CELL_SIZE_SCALE = 1.0         # 👈 修改这里：栅格显示比例（相对于实际cell_size）
+            
+            # 获取香农熵地图
+            entropy_map = self.global_belief_map.compute_shannon_entropy()
+            
+            # 归一化熵值到[0, 1]范围（最大熵为1.0）
+            max_entropy = 1.0
+            normalized_entropy = entropy_map / max_entropy
+            
+            # 获取地图参数
+            world_min = self.global_belief_map.world_min
+            cell_size = self.global_belief_map.cell_size
+            map_dim = self.global_belief_map.map_dim
+            
+            # 绘制每个栅格的不确定性
+            for i in range(map_dim):
+                for j in range(map_dim):
+                    uncertainty = normalized_entropy[i, j]
+                    
+                    # 跳过低不确定性的栅格（优化性能）
+                    if uncertainty < 0.05:
+                        continue
+                    
+                    # 计算栅格中心的世界坐标
+                    x = world_min + (i + 0.5) * cell_size
+                    y = world_min + (j + 0.5) * cell_size
+                    
+                    # 使用颜色映射：不确定性越高，颜色越深
+                    # 这里使用红色到黄色的渐变
+                    # 高不确定性（接近1）-> 深红色 (1, 0, 0)
+                    # 低不确定性（接近0）-> 浅黄色 (1, 1, 0)
+                    r = 1.0
+                    g = 1.0 - uncertainty  # 不确定性越高，绿色分量越少
+                    b = 0.0
+                    
+                    # 创建矩形表示栅格
+                    rect_size = cell_size * CELL_SIZE_SCALE
+                    rect = rendering.make_polygon([
+                        (x - rect_size/2, y - rect_size/2),
+                        (x + rect_size/2, y - rect_size/2),
+                        (x + rect_size/2, y + rect_size/2),
+                        (x - rect_size/2, y + rect_size/2)
+                    ])
+                    rect.set_color(r, g, b, alpha=UNCERTAINTY_ALPHA * uncertainty)
+                    self.render_geoms.append(rect)
+        
+        # 绘制Voronoi图边界线
+        if show_voronoi and info is not None:
+            from multiagent import rendering
+            
+            # 获取所有智能体的位置
+            agent_positions = np.array([agent.state.p_pos for agent in self.world.agents])
+            
+            if len(agent_positions) > 1:
+                # 可调参数：Voronoi边界线样式
+                VORONOI_LINE_WIDTH = 5
+                VORONOI_LINE_COLOR = (0.7, 0.7, 0.7)
+                VORONOI_LINE_ALPHA = 1
+                
+                # 使用GlobalBeliefMap的方法获取Voronoi边界
+                if self.enable_exploration_reward and self.global_belief_map is not None:
+                    voronoi_edges = self.global_belief_map.get_voronoi_edges(agent_positions)
+                    
+                    # 绘制Voronoi边界线
+                    for edge in voronoi_edges:
+                        start, end = edge
+                        voronoi_line = rendering.Line(
+                            start=(start[0], start[1]),
+                            end=(end[0], end[1]),
+                            linewidth=VORONOI_LINE_WIDTH
+                        )
+                        voronoi_line.set_color(*VORONOI_LINE_COLOR, alpha=VORONOI_LINE_ALPHA)
+                        self.render_geoms.append(voronoi_line)
+        
+        # 绘制目标点 (goals)
+        if goals is not None:
+            from multiagent import rendering
+            
+            # 可调参数：目标点大小和连线宽度
+            GOAL_MARKER_SIZE = 0.01
+            GOAL_LINE_WIDTH = 1
+            
+            for i, goal in enumerate(goals):
+                if goal is not None and len(goal) == 2:
+                    # 绘制目标点（小圆圈）
+                    goal_marker = rendering.make_circle(GOAL_MARKER_SIZE, filled=True)
+                    goal_marker.set_color(1.0, 0.0, 1.0, alpha=0.8)
+                    xform = rendering.Transform()
+                    xform.set_translation(goal[0], goal[1])
+                    goal_marker.add_attr(xform)
+                    self.render_geoms.append(goal_marker)
+                    
+                    # 绘制智能体到目标点的连线
+                    agent_pos = self.world.agents[i].state.p_pos
+                    goal_line = rendering.Line(
+                        start=(agent_pos[0], agent_pos[1]),
+                        end=(goal[0], goal[1]),
+                        linewidth=GOAL_LINE_WIDTH
+                    )
+                    goal_line.set_color(1.0, 0.0, 1.0, alpha=0.3)
+                    self.render_geoms.append(goal_line)
+        
+        # 绘制voronoi加权质心
+        if show_voronoi and info is not None and 'map' in info and len(info['map']) > 0:
+            from multiagent import rendering
+            
+            # 可调参数：质心大小和连线宽度
+            CENTROID_MARKER_SIZE = 0.025
+            CENTROID_LINE_WIDTH = 1
+            
+            centroids = info['map'][0]
+            if centroids is not None:
+                for i, centroid in enumerate(centroids):
+                    if centroid is not None and len(centroid) == 2:
+                        # 绘制质心（圆形标记）
+                        centroid_marker = rendering.make_circle(CENTROID_MARKER_SIZE, filled=True)
+                        centroid_marker.set_color(0.0, 1.0, 1.0, alpha=0.8)
+                        xform = rendering.Transform()
+                        xform.set_translation(centroid[0], centroid[1])
+                        centroid_marker.add_attr(xform)
+                        self.render_geoms.append(centroid_marker)
+                        
+                        # 绘制智能体到质心的连线
+                        agent_pos = self.world.agents[i].state.p_pos
+                        centroid_line = rendering.Line(
+                            start=(agent_pos[0], agent_pos[1]),
+                            end=(centroid[0], centroid[1]),
+                            linewidth=CENTROID_LINE_WIDTH
+                        )
+                        centroid_line.set_color(0.0, 1.0, 1.0, alpha=0.3)
+                        self.render_geoms.append(centroid_line)
+        
+        # 🔧 将新的临时几何体添加到viewer
+        for viewer in self.viewers:
+            for geom in self.render_geoms[temp_geoms_start_idx:]:
+                viewer.add_geom(geom)
+        
         if attn is not None:
             self._add_lines(attn)
 
@@ -439,6 +589,10 @@ class MultiAgentEnv(gym.Env):
                 self.viewers[i].set_bounds(pos[0]-cam_range,pos[0]+cam_range,pos[1]-cam_range,pos[1]+cam_range)
             # render to display or array
             results.append(self.viewers[i].render(return_rgb_array = mode=='rgb_array'))
+        
+        # 🔧 清理临时几何体
+        if temp_geoms_start_idx < len(self.render_geoms):
+            self.render_geoms = self.render_geoms[:temp_geoms_start_idx]
 
         return results
 

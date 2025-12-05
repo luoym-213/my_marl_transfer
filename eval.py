@@ -83,12 +83,21 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         # Initialize frame collection for GIF
         frames = []
         
+        # Initialize goals to None at the start of each episode
+        goals = None
+        
         # Initial render for GIF saving (if needed)
         if should_save_gif:
             attn = None if not render_attn else master.team_attn
             if attn is not None and len(attn.shape)==3:
                 attn = attn.max(0)
-            render_result = env.render(mode='rgb_array', attn=attn)
+            render_result = env.render(
+                mode='rgb_array', 
+                attn=attn,
+                goals=goals,
+                show_voronoi=True,
+                show_uncertainty=True  # 👈 启用不确定性显示
+            )
             if render_result:
                 frames.append(render_result[0])
         
@@ -97,20 +106,23 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             attn = None if not render_attn else master.team_attn
             if attn is not None and len(attn.shape)==3:
                 attn = attn.max(0)
-            env.render(mode='human', attn=attn)
+            env.render(
+                mode='human', 
+                attn=attn,
+                goals=goals,
+                show_voronoi=True,
+                show_uncertainty=True  # 👈 启用不确定性显示
+            )
         
-        goals = None  # Initialize goals to None at the start of each episode
         while not np.all(done):
             actions = []
             with torch.no_grad():
                 actions, goals = master.eval_act(obs, env_states, goals)
             episode_steps += 1
             step_data = {'agents_actions': actions, 'agents_goals': goals} 
-            # 检查goals属性，是tensor还是numpy数组，确保传入env.step()的是numpy数组
             if isinstance(step_data['agents_goals'], torch.Tensor):
                 step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
             obs, reward, done, info, env_states = env.step(step_data)
-            # 将reward转换成torch张量
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             obs = normalize_obs(obs, obs_mean, obs_std)
             master.envs_info = info
@@ -121,7 +133,14 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                 attn = None if not render_attn else master.team_attn
                 if attn is not None and len(attn.shape)==3:
                     attn = attn.max(0)
-                render_result = env.render(mode='rgb_array', attn=attn)
+                render_result = env.render(
+                    mode='rgb_array', 
+                    attn=attn,
+                    goals=step_data['agents_goals'],
+                    show_voronoi=True,
+                    show_uncertainty=True,  # 👈 启用不确定性显示
+                    info=info
+                )
                 if render_result:
                     frames.append(render_result[0])
             
@@ -130,7 +149,14 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                 attn = None if not render_attn else master.team_attn
                 if attn is not None and len(attn.shape)==3:
                     attn = attn.max(0)
-                env.render(mode='human', attn=attn)
+                env.render(
+                    mode='human', 
+                    attn=attn,
+                    goals=step_data['agents_goals'],
+                    show_voronoi=True,
+                    show_uncertainty=True,  # 👈 启用不确定性显示
+                    info=info
+                )
                 if args.record_video:
                     time.sleep(0.08)
 

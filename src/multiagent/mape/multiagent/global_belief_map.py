@@ -370,4 +370,80 @@ class GlobalBeliefMap:
         }
         
         return summary
+    
+    def get_voronoi_edges(self, agent_positions):
+        """
+        获取Voronoi图的边界线段，用于可视化
+        
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+        
+        返回:
+            edges: 边界线段列表 [((x1, y1), (x2, y2)), ...]
+        """
+        if len(agent_positions) < 2:
+            return []
+        
+        from scipy.spatial import Voronoi
+        
+        agent_positions = np.array(agent_positions)
+        boundary = self.world_size / 2.0
+        
+        # 添加镜像点以获得有限的Voronoi单元
+        mirror_points = []
+        
+        # 添加四个角的镜像点
+        corners = [
+            [-boundary*3, -boundary*3],
+            [-boundary*3, boundary*3],
+            [boundary*3, -boundary*3],
+            [boundary*3, boundary*3]
+        ]
+        mirror_points.extend(corners)
+        
+        # 添加边界上的镜像点
+        for pos in agent_positions:
+            mirror_points.extend([
+                [pos[0], boundary*3],      # 上
+                [pos[0], -boundary*3],     # 下
+                [boundary*3, pos[1]],      # 右
+                [-boundary*3, pos[1]]      # 左
+            ])
+        
+        # 合并原始点和镜像点
+        all_points = np.vstack([agent_positions, mirror_points])
+        
+        try:
+            # 计算Voronoi图
+            vor = Voronoi(all_points)
+            
+            edges = []
+            
+            # 提取Voronoi边界线段
+            for ridge_points, ridge_vertices in zip(vor.ridge_points, vor.ridge_vertices):
+                # 只处理有限的边（不包含无穷远点）
+                if -1 not in ridge_vertices:
+                    # 检查是否至少有一个点是原始智能体
+                    if ridge_points[0] < len(agent_positions) or ridge_points[1] < len(agent_positions):
+                        v0 = vor.vertices[ridge_vertices[0]]
+                        v1 = vor.vertices[ridge_vertices[1]]
+                        
+                        # 裁剪到世界边界内
+                        v0_clipped = np.clip(v0, -boundary, boundary)
+                        v1_clipped = np.clip(v1, -boundary, boundary)
+                        
+                        # 检查线段是否在边界内
+                        if (abs(v0_clipped[0]) <= boundary and abs(v0_clipped[1]) <= boundary and
+                            abs(v1_clipped[0]) <= boundary and abs(v1_clipped[1]) <= boundary):
+                            
+                            edges.append((
+                                (float(v0_clipped[0]), float(v0_clipped[1])),
+                                (float(v1_clipped[0]), float(v1_clipped[1]))
+                            ))
+            
+            return edges
+            
+        except Exception as e:
+            # 如果Voronoi计算失败，返回空列表
+            return []
 
