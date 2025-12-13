@@ -34,6 +34,7 @@ class GlobalBeliefMap:
             self.landmark_map |= (dist_sq <= landmark_radius**2)
 
         self.epsilon = 1e-10
+        self.landmark_heatmap = self.get_landmarks_heatmap()
         
     def _precompute_cell_centers(self):
         """预计算每个栅格中心点的世界坐标"""
@@ -446,4 +447,277 @@ class GlobalBeliefMap:
         except Exception as e:
             # 如果Voronoi计算失败，返回空列表
             return []
+    
+    def get_voronoi_region_masks(self, agent_positions):
+        """
+        为每个智能体生成其 Voronoi 区域的二值掩码
+    
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+    
+        返回:
+            masks: 列表，每个元素是一个 (map_dim, map_dim) 的布尔数组
+                   masks[i] 表示第 i 个智能体的 Voronoi 区域掩码
+                   区域内的栅格为 True，其他为 False
+        """
+        if len(agent_positions) == 0:
+            return []
+    
+        # 计算 Voronoi 区域划分
+        voronoi_map = self.compute_voronoi_regions(agent_positions)
+    
+        if voronoi_map is None:
+            return []
+    
+        # 为每个智能体生成独立的掩码
+        masks = []
+        for agent_idx in range(len(agent_positions)):
+            mask = (voronoi_map == agent_idx)
+            masks.append(mask)
+    
+        return masks
 
+    def get_voronoi_region_mask(self, agent_positions, agent_idx):
+        """
+        获取指定智能体的 Voronoi 区域掩码
+
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            agent_idx: 智能体索引
+
+        返回:
+            mask: (map_dim, map_dim) 的布尔数组,该智能体的 Voronoi 区域内为 True
+        """
+        if agent_idx < 0 or agent_idx >= len(agent_positions):
+            return np.zeros((self.map_dim, self.map_dim), dtype=bool)
+        
+        voronoi_map = self.compute_voronoi_regions(agent_positions)
+        
+        if voronoi_map is None:
+            return np.zeros((self.map_dim, self.map_dim), dtype=bool)
+        
+        return (voronoi_map == agent_idx)
+
+    def get_distance_field(self, agent_pos, normalize=True, max_distance=None):
+        """
+        为单个智能体生成相对距离场图
+    
+        参数:
+            agent_pos: 智能体位置 (x, y)
+            normalize: 是否归一化距离场 (True: 0-1范围, False: 实际距离)
+            max_distance: 最大距离值，用于归一化。如果为None，使用地图对角线长度
+    
+        返回:
+            distance_field: (map_dim, map_dim) 的浮点数组
+                           normalize=True时: 智能体位置为1，越远越接近0
+                           normalize=False时: 实际欧氏距离
+        """
+        x, y = agent_pos
+        
+        # 计算每个栅格中心到智能体的距离
+        dist_x = self.cell_world_x - x
+        dist_y = self.cell_world_y - y
+        distance_field = np.sqrt(dist_x**2 + dist_y**2)
+        
+        if normalize:
+            # 确定最大距离用于归一化
+            if max_distance is None:
+                # 使用地图对角线长度作为最大距离
+                max_distance = np.sqrt(2) * self.world_size
+            
+            # 归一化: 距离越近值越大 (智能体位置为1，最远处为0)
+            distance_field = 1.0 - np.clip(distance_field / max_distance, 0.0, 1.0)
+        
+        return distance_field
+
+    def get_distance_fields(self, agent_positions, normalize=True, max_distance=None):
+        """
+        为所有智能体生成相对距离场图
+    
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            normalize: 是否归一化距离场 (True: 0-1范围, False: 实际距离)
+            max_distance: 最大距离值，用于归一化。如果为None，使用地图对角线长度
+    
+        返回:
+            distance_fields: 列表，每个元素是一个 (map_dim, map_dim) 的浮点数组
+                            distance_fields[i] 表示第 i 个智能体的距离场
+                            normalize=True时: 智能体位置为1，越远越接近0
+                            normalize=False时: 实际欧氏距离
+        """
+        if len(agent_positions) == 0:
+            return []
+        
+        # 确定最大距离用于归一化
+        if normalize and max_distance is None:
+            max_distance = np.sqrt(2) * self.world_size
+        
+        distance_fields = []
+        
+        for agent_pos in agent_positions:
+            distance_field = self.get_distance_field(
+                agent_pos, 
+                normalize=normalize, 
+                max_distance=max_distance
+            )
+            distance_fields.append(distance_field)
+        
+        return distance_fields
+
+    def get_relative_distance_field(self, agent_positions, agent_idx, normalize=True, max_distance=None):
+        """
+        获取指定智能体的相对距离场图
+    
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            agent_idx: 智能体索引
+            normalize: 是否归一化距离场
+            max_distance: 最大距离值，用于归一化
+    
+        返回:
+            distance_field: (map_dim, map_dim) 的浮点数组
+        """
+        if agent_idx < 0 or agent_idx >= len(agent_positions):
+            return np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
+        
+        return self.get_distance_field(
+            agent_positions[agent_idx], 
+            normalize=normalize, 
+            max_distance=max_distance
+        )
+
+    def get_distance_field_in_voronoi_region(self, agent_positions, agent_idx, 
+                                         normalize=True, max_distance=None, 
+                                         outside_value=0.0):
+        """
+        获取智能体在其Voronoi区域内的相对距离场图
+        (区域外的值设为指定值)
+    
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            agent_idx: 智能体索引
+            normalize: 是否归一化距离场
+            max_distance: 最大距离值，用于归一化
+            outside_value: Voronoi区域外的栅格值
+    
+        返回:
+            distance_field: (map_dim, map_dim) 的浮点数组
+                           区域内为距离场值，区域外为 outside_value
+        """
+        if agent_idx < 0 or agent_idx >= len(agent_positions):
+            return np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
+        
+        # 获取距离场
+        distance_field = self.get_distance_field(
+            agent_positions[agent_idx], 
+            normalize=normalize, 
+            max_distance=max_distance
+        )
+        
+        # 获取Voronoi区域掩码
+        voronoi_mask = self.get_voronoi_region_mask(agent_positions, agent_idx)
+        
+        # 区域外的值设为指定值
+        distance_field = distance_field.copy()
+        distance_field[~voronoi_mask] = outside_value
+        
+        return distance_field
+    
+    def get_agents_heatmap(self, agent_positions, radius, sigma=None, clip_outside=True):
+        """
+        生成表示所有智能体位置的组合热图
+        
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            radius: 影响半径，半径外的值为0
+            sigma: 高斯标准差，控制衰减速度。如果为None，则 sigma = radius / 3
+            clip_outside: 是否在半径外截断为0 (True: 截断, False: 不截断)
+        
+        返回:
+            heatmap: (map_dim, map_dim) 的浮点数组
+                    每个智能体中心位置为1，在半径内高斯衰减，半径外为0
+                    多个智能体的热图会叠加（取最大值）
+        """
+        if len(agent_positions) == 0:
+            return np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
+        
+        # 默认 sigma = radius / 3，这样在半径处约衰减到 0.01
+        if sigma is None:
+            sigma = radius / 3.0
+        
+        # 初始化热图
+        heatmap = np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
+        
+        for agent_pos in agent_positions:
+            x, y = agent_pos
+            
+            # 计算每个栅格中心到智能体的距离
+            dist_x = self.cell_world_x - x
+            dist_y = self.cell_world_y - y
+            distance = np.sqrt(dist_x**2 + dist_y**2)
+            
+            # 高斯函数: exp(-(d^2) / (2*sigma^2))
+            agent_heatmap = np.exp(-(distance**2) / (2 * sigma**2))
+            
+            # 截断：半径外的值设为0
+            if clip_outside:
+                agent_heatmap[distance > radius] = 0.0
+            
+            # 叠加到总热图（取最大值，避免多个智能体重叠时值过大）
+            heatmap = np.maximum(heatmap, agent_heatmap)
+        
+        return heatmap.astype(np.float32)
+    
+    def get_landmarks_heatmap(self, radius=None, sigma=None, clip_outside=True, landmark_positions=None):
+        """
+        生成表示所有 landmarks 位置的组合热图
+        
+        参数:
+            radius: 影响半径，半径外的值为0。如果为None，使用 self.landmark_radius
+            sigma: 高斯标准差，控制衰减速度。如果为None，则 sigma = radius / 3
+            clip_outside: 是否在半径外截断为0 (True: 截断, False: 不截断)
+            landmark_positions: landmarks 位置列表 [(x1, y1), (x2, y2), ...]
+                            如果为None，使用 self.landmark_positions
+        
+        返回:
+            heatmap: (map_dim, map_dim) 的浮点数组
+                    每个 landmark 中心位置为1，在半径内高斯衰减，半径外为0
+                    多个 landmarks 的热图会叠加（取最大值）
+        """
+        # 使用传入的 landmark_positions 或默认的 self.landmark_positions
+        if landmark_positions is None:
+            landmark_positions = self.landmark_positions
+        
+        if len(landmark_positions) == 0:
+            return np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
+        
+        # 使用默认的 landmark_radius 或传入的 radius
+        if radius is None:
+            radius = self.landmark_radius
+        
+        # 默认 sigma = radius / 3，这样在半径处约衰减到 0.01
+        if sigma is None:
+            sigma = radius / 3.0
+        
+        # 初始化热图
+        heatmap = np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
+        
+        for landmark_pos in landmark_positions:
+            x, y = landmark_pos
+            
+            # 计算每个栅格中心到 landmark 的距离
+            dist_x = self.cell_world_x - x
+            dist_y = self.cell_world_y - y
+            distance = np.sqrt(dist_x**2 + dist_y**2)
+            
+            # 高斯函数: exp(-(d^2) / (2*sigma^2))
+            landmark_heatmap = np.exp(-(distance**2) / (2 * sigma**2))
+            
+            # 截断：半径外的值设为0
+            if clip_outside:
+                landmark_heatmap[distance > radius] = 0.0
+            
+            # 叠加到总热图（取最大值，避免多个 landmarks 重叠时值过大）
+            heatmap = np.maximum(heatmap, landmark_heatmap)
+        
+        return heatmap.astype(np.float32)

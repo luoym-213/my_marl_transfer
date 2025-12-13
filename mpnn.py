@@ -93,26 +93,6 @@ class MPNN(nn.Module):
             self.nonlin(inplace=True)
         )
 
-        # Centralized Critic
-        self.critic_shared = nn.Sequential(
-            nn.Linear(self.num_agents * 6 + self.task_dim * self.num_agents, self.h_dim * 2),
-            self.nonlin(inplace=True),
-            nn.Linear(self.h_dim * 2, self.h_dim * 2),
-            self.nonlin(inplace=True)
-        )
-
-        # 为每个智能体创建独立的输出头
-        self.critic_heads = nn.ModuleList([
-            nn.Linear(self.h_dim * 2, 1) 
-            for _ in range(self.num_agents)
-        ])
-
-        # self.critic_value_head = nn.Sequential(nn.Linear(self.num_agents * 6 + self.task_dim * self.num_agents, self.h_dim * 2), # env_state + task
-        #                             self.nonlin(inplace=True),
-        #                             nn.Linear(self.h_dim * 2, self.h_dim * 2),
-        #                             self.nonlin(inplace=True),
-        #                             nn.Linear(self.h_dim * 2, 1))
-
         if norm_in:
             self.in_fn = nn.BatchNorm1d(self.input_size)
             self.in_fn.weight.data.fill_(1)
@@ -123,56 +103,143 @@ class MPNN(nn.Module):
 
         self.attn_mat = np.ones((num_agents, num_agents))
 
-        self.dropout_mask = None
+        self.dropout_mask = None        
 
-    def calculate_mask(self, inp):
-        # inp is batch_size x self.input_size where batch_size is num_processes*num_agents
+        # ================================ Critic Start ==================================== 
+        # ==========================================
+        # 1. 全局地图编码器 (Global Map Encoder)
+        # 输入: [B, 4, 100, 100] -> 输出: [B, 256]
+        # ==========================================
+        self.critic_map_backbone = nn.Sequential(
+            # L1: 100 -> 50
+            nn.Conv2d(4, 16, kernel_size=5, stride=2, padding=2),
+            nn.ReLU(),
+            # L2: 50 -> 25
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            # L3: 25 -> 13 (padding=1)
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.ReLU(),
+            # L4: 13 -> 6 (padding=0, 丢弃最外圈无用信息，进一步压缩)
+            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=0), 
+            nn.ReLU()
+        )
         
-        pos = inp[:, self.pos_index:self.pos_index+2]
-        bsz = inp.size(0)//self.num_agents
-        pos_obs = inp[:, self.pos_index:self.pos_index+2]
-        bsz_obs = inp.size(0)//self.num_agents
-        mask = torch.full(size=(bsz,self.num_agents,self.num_agents),fill_value=0,dtype=torch.uint8)
-        mask_agents = torch.full(size=(bsz_obs,self.num_agents,self.num_agents),fill_value=0,dtype=torch.uint8)
+        # 计算 Flatten 后的维度: 64 * 6 * 6 = 2304
+        self.critic_map_flat_dim = 64 * 6 * 6
         
-        if self.mask_dist is not None and self.mask_dist > 0: 
-            for i in range(1,self.num_agents):
-                shifted = torch.roll(pos,-bsz*i,0)
-                dists = torch.norm(pos-shifted,dim=1)
-                restrict = dists > self.mask_dist
-                for x in range(self.num_agents):
-                    mask[:,x,(x+i)%self.num_agents].copy_(restrict[bsz*x:bsz*(x+1)])
-        
-        elif self.mask_dist is not None and self.mask_dist == -10:
-           if self.dropout_mask is None or bsz!=self.dropout_mask.shape[0] or np.random.random_sample() < 0.1: # sample new dropout mask
-               temp = torch.rand(mask.size()) > 0.85
-               temp.diagonal(dim1=1,dim2=2).fill_(0)
-               self.dropout_mask = (temp+temp.transpose(1,2))!=0
-           mask.copy_(self.dropout_mask)
+        # 降维层：将展平后的图像特征压缩，方便与向量融合
+        self.critic_map_compress = nn.Sequential(
+            nn.Linear(self.critic_map_flat_dim, 256),
+            nn.ReLU()
+        )
 
-        if self.mask_obs_dist is not None and self.mask_obs_dist > 0: 
-            for j in range(1,self.num_agents):
-                shifted_obs = torch.roll(pos_obs,-bsz_obs*j,0)
-                dists_obs = torch.norm(pos_obs-shifted_obs,dim=1)
-                restrict_obs = dists_obs > self.mask_obs_dist
-                for y in range(self.num_agents):
-                    mask_agents[:,y,(y+j)%self.num_agents].copy_(restrict_obs[bsz_obs*y:bsz_obs*(y+1)])
-        mask_agents = mask_agents.masked_select(~torch.eye(self.num_agents, self.num_agents, device=mask_agents.device, dtype=torch.bool)).view(bsz_obs, self.num_agents, self.num_agents-1)
+        # ==========================================
+        # 2. 全局向量编码器 (Global Vector Encoder)
+        # 输入: [B, N_vec] -> 输出: [B, 128]
+        # ==========================================
+        # 向量维度: N个智能体(x,y) + M个宝藏(x,y)
+        self.critic_vec_input_dim = num_agents * 2 + num_agents * 2
         
-        return mask,mask_agents             
+        self.critic_vec_encoder = nn.Sequential(
+            nn.Linear(self.critic_vec_input_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 128),
+            nn.ReLU()
+        )
 
-    def calculate_mask_entity(self, inp):
-        # inp: landmark's positon, [num_processes * num_agents, num_agents*2]
-        bsz = inp.size(0)//self.num_agents  # num_processes
-        dists = torch.norm(inp.contiguous().view(bsz * self.num_agents, self.num_agents, 2), p=2, dim=2) # [bsz*num_agents, dis_landmark]
-        #restrict = dists > self.mask_obs_dist # [bsz*num_agents, dis_landmark]
-        dists_reshape = dists.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
+        # ==========================================
+        # 3. 融合与价值头 (Fusion & Value Head)
+        # 输入: 256(Map) + 128(Vec) = 384
+        # 输出: [B, num_agents]
+        # ==========================================
+        self.critic_fusion_layer = nn.Sequential(
+            nn.Linear(256 + 128, 256),
+            nn.ReLU(),
+            nn.Linear(256, 128),
+            nn.ReLU()
+        )
+        
+        # 为每个智能体创建独立的输出头
+        self.critic_value_out_heads = nn.ModuleList([
+            nn.Linear(128, 1) 
+            for _ in range(self.num_agents)
+        ])
 
-        # 全通信下只需计算每个地标距离智能体的最小距离
-        min_dists = dists_reshape.min(dim=1, keepdim=True)[0]  # [bsz, 1, num_landmarks]
-        #mask =restrict.contiguous().view(self.num_agents, bsz, self.num_agents).permute(1, 0, 2) # [bsz, self.num_agents,self.num_agents]
-        mask_global = (min_dists > self.mask_obs_dist).expand(bsz, self.num_agents, self.num_agents)
-        return mask_global
+        # ================================ Critic End ==================================== 
+
+        # ================================ Actor Start ====================================
+        # ====================================================================
+        # 1. 地图流编码器 (Map Encoder)
+        # 输入: [Batch, 4, 100, 100] -> 输出: [Batch, 64, 12, 12]
+        # ====================================================================
+        self.map_conv1 = nn.Sequential(
+            nn.Conv2d(4, 16, kernel_size=5, stride=2, padding=2), # 100 -> 50
+            nn.ReLU()
+        )
+        self.map_conv2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), # 50 -> 25
+            nn.ReLU()
+        )
+        self.map_conv3 = nn.Sequential(
+            # Padding=0 是关键，切掉边缘，从 25x25 变成 12x12
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=0), # 25 -> 12
+            nn.ReLU()
+        )
+
+        # ====================================================================
+        # 2. 向量流编码器 (Vector Encoder)
+        # 输入: [Batch, 5] -> 输出: [Batch, 64]
+        # ====================================================================
+        self.vec_mlp = nn.Sequential(
+            nn.Linear(5, 32),
+            nn.ReLU(),
+            nn.Linear(32, 64),
+            nn.ReLU()
+        )
+
+        # ====================================================================
+        # 3. 决策头 (Decision Head)
+        # 输入: h_shared [128] -> 输出: Logits [2] (Explore vs Collect)
+        # ====================================================================
+        self.decision_head = nn.Sequential(
+            nn.Linear(128, 64), # 128 = 64(Map) + 64(Vec)
+            nn.ReLU(),
+            nn.Linear(64, 2)    # 输出 Explore, Collect 的 Logits
+        )
+
+        # ====================================================================
+        # 4. 探索点生成头 (Waypoint Head - Decoder)
+        # 输入: F_spatial + h_shared -> 输出: Heatmap [1, 100, 100]
+        # ====================================================================
+        
+        # 特征融合层：将拼接后的 192 维特征降维融合
+        self.decoder_fuse = nn.Sequential(
+            nn.Conv2d(192, 64, kernel_size=1), # 192 = 64(Spatial) + 128(Broadcasted Shared)
+            nn.ReLU()
+        )
+        
+        # 上采样层 1: 12x12 -> 24x24
+        self.decoder_up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(64, 32, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        
+        # 上采样层 2: 24x24 -> 48x48
+        self.decoder_up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+            nn.Conv2d(32, 16, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+        
+        # 上采样层 3: 48x48 -> 100x100 (直接指定 size)
+        self.decoder_out = nn.Sequential(
+            nn.Upsample(size=(100, 100), mode='bilinear', align_corners=False),
+            nn.Conv2d(16, 1, kernel_size=1) # 输出单通道 Logits
+            # 注意：这里没有 Activation，因为后续要做 Softmax 和 Masking
+        )
+
 
     def _fwd(self, inp, state=None):
         # inp should be (batch_size,input_size)
@@ -216,22 +283,6 @@ class MPNN(nn.Module):
         self.attn_mat = attn.squeeze().detach().cpu().numpy()
         # print("h shape: ", h.shape)
         return h, new_state # should be <batch_size, self.h_dim> again
-    
-    def taskG(self,h):
-        # 智能体的任务生成器
-        h_task_logit = self.task(h) # should be <batch_size, task_dim>
-        h_task = F.one_hot(torch.argmax(h_task_logit,dim=1),num_classes=self.task_dim).float() # should be <batch_size, task_dim>
-
-        return h_task_logit, h_task
-    
-    def _task_fwd(self, h, h_task):
-        # 将来自cta或者智能体的任务生成编码，并与上层观测向量合成编码
-        h_task_enc = self.task_encoder(h_task) # should be <batch_size, 64>
-
-        # combine h and h_task_enc to [batch_size, self.h_dim + 64] and then to self.h_dim
-        h = self.fusion(torch.cat((h, h_task_enc), dim=1)) # should be <batch_size, self.h_dim>
-        
-        return h
 
     def forward(self, inp, state, mask=None):
         # 保存当前的隐藏状态
@@ -242,96 +293,220 @@ class MPNN(nn.Module):
         # 返回更新后的隐藏状态
         return x, self.hidden_state.clone()
 
+    def high_level_forward(self, vec_inp, map_inp):
+        """
+        map_input: [Batch, 4, 100, 100] 
+                   Channel 0: Belief Map 
+                   Channel 1: Entropy Map
+                   Channel 2: Voronoi Mask (0/1) 
+                   Channel 3: Distance Field
+        vec_input: [Batch, 5]
+        """
+        batch_size = map_inp.size(0)
+
+        # ---------------------------
+        # A. 提取特征 (Backbone)
+        # ---------------------------
+        
+        # 1. 空间特征 F_spatial: [B, 64, 12, 12]
+        f_spatial = self.map_conv1(map_inp)
+        f_spatial = self.map_conv2(f_spatial)
+        f_spatial = self.map_conv3(f_spatial)
+
+        # 2. 向量特征 f_vec: [B, 64]
+        f_vec = self.vec_mlp(vec_inp)
+
+        # ---------------------------
+        # B. 特征融合 (Masked Pooling)
+        # ---------------------------
+        
+        # 1. 取出原始 Voronoi Mask (假设是第2个通道) -> [B, 2, 100, 100]
+        voronoi_mask_raw = map_inp[:, 2:3, :, :]
+
+        # 2. 下采样 Mask 到 12x12，模式为 nearest (保持 0/1 硬边界)
+        mask_down = F.interpolate(voronoi_mask_raw, size=(12, 12), mode='nearest')
+        
+        # 3. Masked Global Average Pooling
+        # 只对 Voronoi 区域内的特征求和
+        masked_features = f_spatial * mask_down 
+        sum_features = torch.sum(masked_features, dim=(2, 3)) # [B, 64]
+        
+        # 计算区域面积 (像素数)，加 epsilon 防止除以 0
+        area = torch.sum(mask_down, dim=(2, 3)) + 1e-5 # [B, 1]
+        
+        # 得到局部区域的平均特征向量 v_map: [B, 64]
+        v_map = sum_features / area 
+
+        # 4. 生成共享向量 h_shared: [B, 128]
+        h_shared = torch.cat([v_map, f_vec], dim=1)
+
+        # ---------------------------
+        # C. 决策头 (Decision Head)
+        # ---------------------------
+        
+        # 输出 [Explore, Collect] 的 Logits: [B, 2]
+        decision_logits = self.decision_head(h_shared)
+
+        # ---------------------------
+        # D. 探索点生成头 (Waypoint Head)
+        # ---------------------------
+        
+        # 1. 广播 h_shared 到空间尺寸: [B, 128, 12, 12]
+        h_shared_expanded = h_shared.view(batch_size, 128, 1, 1).expand(-1, -1, 12, 12)
+        
+        # 2. 拼接空间特征与全局特征: [B, 192, 12, 12]
+        decoder_in = torch.cat([f_spatial, h_shared_expanded], dim=1)
+        
+        # 3. 解码生成热力图 Logits: [B, 1, 100, 100]
+        x = self.decoder_fuse(decoder_in)
+        x = self.decoder_up1(x)
+        x = self.decoder_up2(x)
+        heatmap_logits = self.decoder_out(x)
+
+        # ---------------------------
+        # E. 后处理 (Masking)
+        # ---------------------------
+        
+        # 关键步骤：再次使用原始 Voronoi Mask
+        # 将非势力范围内的 Logits 设为负无穷
+        # mask == 0 的地方填入 -1e9
+        heatmap_logits = heatmap_logits.masked_fill(voronoi_mask_raw == 0, -1e9)
+        
+        # 展平以便后续采样: [B, 10000]
+        flat_heatmap_logits = heatmap_logits.view(batch_size, -1)
+
+        return decision_logits, flat_heatmap_logits
+
+    def get_high_level_goal(self, vec_inp, map_inp, deterministic=False):
+        """
+        采样动作的辅助函数 (用于 Rollout)
+        """
+        decision_logits, heatmap_logits = self.high_level_forward(vec_inp, map_inp)
+
+        # ============================================================
+        # 基于 B_candidate 的动作掩码 (Action Masking)
+        # 向量流结构: <x_pos, y_pos, B_candidate, x_target, y_target>
+        # B_candidate 位于索引 2
+        b_candidate = vec_inp[:, 2] # Shape: [Batch]
+
+        # 为了不破坏计算图（如果是训练过程），建议 clone 一份 logits
+        # 如果只是推理 rollout，不 clone 也可以，但 clone 是好习惯
+        masked_decision_logits = decision_logits.clone()
+
+        # 找到没有候选点的样本索引 (B_candidate == 0)
+        # 注意：浮点数比较建议用 < 0.5 或者 isclose，这里假设输入是严格的 0/1
+        mask_no_candidate = (b_candidate < 0.5) 
+
+        # 将这些样本的 COLLECT 动作 (索引 1) 的 Logit 设为负无穷
+        # -1e9 在 Softmax 后会变成 0
+        masked_decision_logits[mask_no_candidate, 1] = -1e9
+
+        # ============================================================
+        # 采样动作并计算 log_probs（关键修改）
+        # ============================================================
+    
+        # 1. 决策动作
+        decision_probs = F.softmax(masked_decision_logits, dim=-1)
+        dist_mode = Categorical(decision_probs)
+    
+        if deterministic:
+            action_mode = torch.argmax(decision_probs, dim=-1)
+        else:
+            action_mode = dist_mode.sample()
+    
+        # ✅ 计算决策动作的 log_prob
+        decision_log_prob = dist_mode.log_probs(action_mode)  # [Batch]
+    
+        # 2. 导航点动作
+        heatmap_probs = F.softmax(heatmap_logits, dim=-1)
+        dist_map = Categorical(heatmap_probs)
+    
+        if deterministic:
+            flat_idx = torch.argmax(heatmap_probs, dim=-1)
+        else:
+            flat_idx = dist_map.sample()
+    
+        # ✅ 计算导航点动作的 log_prob
+        map_log_prob = dist_map.log_probs(flat_idx)  # [Batch]
+    
+        # 3. 转换坐标
+        y_coords = flat_idx // 100
+        x_coords = flat_idx % 100
+
+        # 4. 根据决策调整导航点
+        target_x = vec_inp[:, 3]
+        target_y = vec_inp[:, 4]
+        collect_mask = (action_mode == 1)
+        x_coords = torch.where(collect_mask, target_x.long(), x_coords)
+        y_coords = torch.where(collect_mask, target_y.long(), y_coords)
+        
+        return {
+            "action_mode": action_mode,              # [Batch]
+            "waypoints": [x_coords, y_coords],       # [Batch,2]
+            "decision_log_prob": decision_log_prob,  # ✅ [Batch] 标量
+            "map_log_prob": map_log_prob,            # ✅ [Batch] 标量
+        }
+    
+    def get_high_value(self, map_inp, vec_inp):
+        # map_inp: [num_processes, 4, H, W]
+        # vec_inp: [num_processes, num_agents*2 + num_landmarks*2]
+        # 返回： values: [num_processes, num_agents]
+        batch_size = map_inp.size(0)
+
+        # 全局地图编码器
+        f_map = self.critic_map_backbone(map_inp)  # [B, 64, 6, 6]
+        f_map_flat = f_map.view(batch_size, -1)  # [B, 64*6*6]
+        f_map_compress = self.critic_map_compress(f_map_flat)  # [B, 256]
+
+        # 结合全局地图特征和局部特征
+        f_vec = self.critic_vec_encoder(vec_inp)  # [B, 128]
+        f_fuse = torch.cat([f_map_compress, f_vec], dim=1)  # [B, 256 + 128]
+
+        fused = self.critic_fusion_layer(f_fuse)    # [B, 128]
+
+        # 为每个智能体计算独立的价值
+        values = []
+        for agent_idx in range(self.num_agents):
+            value = self.critic_value_out_heads[agent_idx](fused)  # [B, 1]
+            values.append(value)
+        values = torch.cat(values, dim=1)  # [B, num_agents]
+
+        return values
+
     def _low_value(self, x):
         return self.value_head(x) # h_dim -> h_dim -> 1
 
     def _low_policy(self, x): # h_dim -> h_dim
         return self.policy_head(x)
     
-    def CTA(self, env_state):
-        # env_state should be (<batch_size, env_dim>)
-        # batch_size = env_state.size(0) = num_agents * num_processes
-        
-        # 任务生成模块,匈牙利算法
-        batch_size = env_state.size(0) // self.num_agents
-        agents_pos = env_state[:batch_size, self.num_agents * 2:self.num_agents * 4].view(batch_size, self.num_agents, 2) # [batch_size, 3, 2]
-        landmarks_pos = env_state[:batch_size, self.num_agents * 4:].view(batch_size, self.num_agents, 2) # [batch_size, 3, 2]
-
-        ## 构造代价矩阵
-        cost_matrix = torch.cdist(agents_pos, landmarks_pos, p=2) # [batch_size, 3, 3]
-
-        # 逐批次应用匈牙利算法
-        assignments = []
-        dists_list = []
-        
-        for b in range(batch_size):
-            # 对每个批次分别计算
-            cost_b = cost_matrix[b].cpu().numpy()  # [3, 3]
-            row_ind, col_ind = linear_sum_assignment(cost_b)
-
-            dists_b = torch.tensor(cost_b[row_ind, col_ind], device=env_state.device)
-            
-            assignments.append(col_ind)
-            dists_list.append(dists_b)
-        
-        # 合并所有批次的距离 [batch_size, num_agents]
-        dists = torch.stack(dists_list, dim=0)  # [batch_size, 3]
-        
-        # 生成二分类 onehot 编码 [batch_size, num_agents, task_dim]
-        task = torch.zeros((batch_size, self.num_agents, self.task_dim), 
-                        dtype=torch.float32, device=env_state.device)
-
-        # 使用张量操作：创建掩码并使用scatter
-        close_mask = (dists < self.mask_obs_dist).unsqueeze(-1)  # [batch_size, num_agents, 1]
-        
-        # 对于距离近的，设置第1列为1；距离远的，设置第0列为1
-        task[:, :, 1] = close_mask.squeeze(-1).float()      # 距离近：任务类型1
-        task[:, :, 0] = (~close_mask.squeeze(-1)).float()   # 距离远：任务类型0
-        
-        task = task.transpose(0, 1).contiguous().view(batch_size * self.num_agents, self.task_dim)
-
-        return task
-
-    def high_level_act(self, search_map, detected_map, env_state):
-        # search_map: (<agent_dim*2>) 熵加权质点图,[(mx1, my1), (mx2, my2), ...]
-        # detected_map: (<detected_dim*2>) 已发现目标位置图，数量可能不同
-        # env_state: (<env_dim>)
-
+    def vec_inp_generator(self, env_state, detected_map):
+        # 生成智能体向量流，得到vec_inp [num_agents, 5]，<x_pos, y_pos, B_candidate, x_target, y_target>
+        # 使用匈牙利算法为每个智能体分配最近的已发现目标点作为目标位置，已发现目标点可能小于智能体数量
+        # 如果没分配到，默认<x_pos, y_pos, 0, 0, 0>，否则<x_pos, y_pos, 1, x_target, y_target>
         # 提取智能体当前位置, [num_agents, 2]
         agents_pos = env_state[self.num_agents * 2:self.num_agents * 4].view(self.num_agents, 2) 
 
-        # 已发现目标点数量
-        num_detected = detected_map.size(0)
-        # 初始化目标分配（默认使用搜索点）
-        goals = search_map.clone()  # [num_agents, 2]
-        # 如果有已发现的目标点
-        if num_detected > 0:
-            # 计算智能体到所有已发现目标点的距离矩阵
-            cost_matrix = torch.cdist(agents_pos, detected_map.float(), p=2)  # [num_agents, num_detected]
-            
-            # 使用匈牙利算法进行最优分配
-            cost_np = cost_matrix.cpu().numpy()
-            
-            # 如果目标点数量 >= 智能体数量，直接分配
-            if num_detected >= self.num_agents:
-                row_ind, col_ind = linear_sum_assignment(cost_np)
-                # 所有智能体都分配到目标点
-                for agent_idx, target_idx in zip(row_ind, col_ind):
-                    goals[agent_idx] = detected_map[target_idx]
-            else:
-                # 如果目标点数量 < 智能体数量
-                # 只分配部分智能体到目标点，其余使用搜索点
-                row_ind, col_ind = linear_sum_assignment(cost_np)
-                for agent_idx, target_idx in zip(row_ind, col_ind):
-                    goals[agent_idx] = detected_map[target_idx]
-                # 未分配的智能体保持使用原搜索点（已经在初始化时设置）
+        # 提取已发现目标点位置, [num_detected, 2]
+        detected_pos = detected_map.view(-1, 2)
 
-        # # 拼接所有批次的目标 [batch_size, num_agents, 2] -> [batch_size * num_agents, 2]
-        # all_goals = torch.stack(all_goals, dim=0)  # [batch_size, num_agents, 2]
-        # all_goals = all_goals.transpose(0, 1).contiguous().view(batch_size * self.num_agents, 2)
+        # 计算智能体到已发现目标点的距离
+        cost_matrix = torch.cdist(agents_pos, detected_pos, p=2)  # [num_agents, num_detected]
 
-        return goals
-    
+        # 使用匈牙利算法进行最优分配
+        cost_np = cost_matrix.cpu().numpy()
+        row_ind, col_ind = linear_sum_assignment(cost_np)
+
+        # 生成最终的向量流，首先用智能体当前位置初始化
+        vec_inp = torch.zeros((self.num_agents, 5), device=env_state.device)
+        vec_inp[:, :2] = agents_pos
+
+        # 对于被分配到目标的智能体，更新其备选点标记和目标位置
+        for agent_idx, target_idx in zip(row_ind, col_ind):
+            vec_inp[agent_idx, 2] = 1.0  # 备选点标记
+            vec_inp[agent_idx, 3:5] = detected_pos[target_idx]  # 目标位置
+
+        return vec_inp
+
     def data_processing_low_level(self, inp, goals):
         # inp: [num_agents*batch_size, dim_o]
         # goals: [num_agents*batch_size, 2], assigned goals for agents
@@ -465,6 +640,84 @@ class MPNN(nn.Module):
         
         # 返回更新后的隐藏状态
         return value, action_log_probs, dist_entropy, new_state  # 修正：返回new_state而不是self.hidden_state.clone()
+    
+
+    def evaluate_high_actions(self, env_states, map_obs, vec_obs, critic_maps, goals, tasks, agent_ids):
+        """
+        Input:
+            env_states: [batch, env_dim]
+            map_obs: [batch, 4, H, W]
+            vec_obs: [batch, 5] 
+            agent_ids: [batch, 1]
+        评估高层动作
+        Returns:
+            high_values: [batch, 1]
+            decision_log_probs: [batch, 1]
+            map_log_probs: [batch, 1]
+            decision_entropy: [batch] ← 改为每个样本的熵
+            waypoint_entropy: [batch] ← 改为每个样本的熵
+        """
+        batch_size = map_obs.size(0)
+        num_agents = self.num_agents
+
+        # =====================================================
+        # 1. Critic: 计算所有智能体的价值 [batch, num_agents]
+        # =====================================================
+        critic_vec = env_states[:, 2*num_agents:]  # 提取全局向量信息
+        all_values = self.get_high_value(critic_maps, critic_vec)  # [batch, num_agents]
+        
+        # ⭐ 根据 agent_ids 选择对应的价值
+        agent_ids_expanded = agent_ids.unsqueeze(-1)  # [batch, 1]
+        high_values = torch.gather(all_values, dim=1, index=agent_ids_expanded)  # [batch, 1]
+
+        # =====================================================
+        # 2. Actor: 前向传播获取 logits
+        # =====================================================
+        decision_logits, heatmap_logits = self.high_level_forward(vec_obs, map_obs)
+        # decision_logits: [batch, 2]
+        # heatmap_logits: [batch, 10000]
+
+        # =====================================================
+        # 3. 应用动作掩码 (Action Masking)
+        # =====================================================
+        b_candidate = vec_obs[:, 2]  # [batch]
+        masked_decision_logits = decision_logits.clone()
+        
+        # 将没有候选点的样本的 COLLECT 动作设为负无穷
+        mask_no_candidate = (b_candidate < 0.5)
+        masked_decision_logits[mask_no_candidate, 1] = -1e9
+
+        # =====================================================
+        # 4. 计算决策头的 log_probs 和 entropy
+        # =====================================================
+        decision_probs = F.softmax(masked_decision_logits, dim=-1)  # [batch, 2]
+        dist_decision = Categorical(decision_probs)
+        
+        # 计算给定动作的 log_prob
+        decision_log_probs = dist_decision.log_probs(tasks.squeeze(-1)).unsqueeze(-1)  # [batch, 1]
+        
+        # 计算每个样本的熵
+        decision_entropy = dist_decision.entropy()  # [batch]
+
+        # =====================================================
+        # 5. 计算探索头的 log_probs 和 entropy
+        # =====================================================
+        heatmap_probs = F.softmax(heatmap_logits, dim=-1)  # [batch, 10000]
+        dist_map = Categorical(heatmap_probs)
+        
+        # 将 goals [batch, 2] 转换为 flat_idx [batch]
+        goals_x = goals[:, 0].long()  # [batch]
+        goals_y = goals[:, 1].long()  # [batch]
+        flat_idx = goals_y * 100 + goals_x  # [batch]
+        
+        # 计算给定导航点的 log_prob
+        map_log_probs = dist_map.log_probs(flat_idx).unsqueeze(-1)  # [batch, 1]
+        
+        # 计算每个样本的熵
+        waypoint_entropy = dist_map.entropy()  # [batch]
+
+        return (high_values, decision_log_probs, map_log_probs, 
+                decision_entropy, waypoint_entropy)
     
     def evaluate_low_actions(self, inp, goals, action):
         new_inp = self.data_processing_low_level(inp, goals)

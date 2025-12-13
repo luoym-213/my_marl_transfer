@@ -49,17 +49,23 @@ def train(args, return_early=False):
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
+            goal_dones = torch.FloatTensor([info[i]['goal_done'] for i in range(args.num_processes)]).to(args.device)
             final_rewards *= masks
             final_rewards += (1 - masks) * episode_rewards
             episode_rewards *= masks
 
-            master.update_rollout(obs, reward, masks, env_state)
+            master.update_rollout(obs, reward, masks, env_state, goal_dones)
 
         master.wrap_horizon()
         return_vals = master.update()
-        value_loss = return_vals[:, 0]
-        action_loss = return_vals[:, 1]
-        dist_entropy = return_vals[:, 2]
+        value_low_loss = return_vals[:, 0]
+        action_low_loss = return_vals[:, 1]
+        dist_low_entropy = return_vals[:, 2]
+        value_high_loss = return_vals[:, 3]
+        decision_high_loss = return_vals[:, 4]
+        waypoint_high_loss = return_vals[:, 5]
+        decision_entropy = return_vals[:, 6]
+        waypoint_entropy = return_vals[:, 7]
         master.after_update()
 
         if j%args.save_interval == 0 and not args.test:

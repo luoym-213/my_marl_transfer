@@ -1,6 +1,6 @@
 import numpy as np
 import torch
-from rlcore.algo import IPPO,JointPPO
+from rlcore.algo import IPPO, JointPPO
 from rlagent import Neo
 from mpnn import MPNN
 from utils import make_multiagent_env
@@ -84,6 +84,9 @@ class Learner(object):
         self.trainers_list = [IPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                                        args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
                                        use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
+        self.high_trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
+                                       args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
+                                       use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
         self.device = args.device
         self.env = env
         self.envs_info = None
@@ -120,81 +123,250 @@ class Learner(object):
             all_masks = torch.cat([agent.rollouts.masks[step] for agent in team])
             all_env_state = torch.cat([agent.rollouts.env_states[step] for agent in team]) # 实际上只需要其中一个agent的环境状态就够了，即all_env_state[:num_processes]
 
-            # 默认采取之前的目标分配，[num_agents * num_processes, 2]
+            # 默认采取之前的目标分配，[num_agents * num_processes, 2]，以及任务类型[num_agents * num_processes, 1]
             # 即使step=0时，也复制goals[-1]的值，保证goal有效
             all_goals = torch.cat([agent.rollouts.goals[step-1] for agent in team])
-            # 遍历不同环境中，根据world.steps判断是否需要执行高层策略
-            for idx, (env_info, env_state) in enumerate(zip(self.envs_info, all_env_state[:len(self.envs_info)])):
-                world_steps = env_info['world_steps'] 
-                # 如果时间达到K步，执行高层策略，得到新的目标分配
-                if world_steps % self.high_level_interval == 0:
-                    # 从环境中调取当前的voronoi加权质点图,[(mx1, my1), (mx2, my2), ...]转为张量
-                    search_map = torch.from_numpy(np.array(env_info['map'][0])).float().to(self.device)
-                    # 从环境中调取当前的已发现目标位置图,[(tx1, ty1), (tx2, ty2), ...]
-                    detected_map = torch.from_numpy(np.array(env_info['map'][1])).float().to(self.device)
-                    # 高层策略两者进行对比得到新的目标分配 [num_agents, 2]
-                    env_goals = policy.high_level_act(search_map, detected_map, env_state)
-                    # 替换all_goals中对应环境的部分，分别是idx, idx + num_processes, idx + 2*num_processes, ...
-                    for agent_idx in range(len(team)):
-                        all_goals[agent_idx * len(self.envs_info) + idx] = env_goals[agent_idx]
+            all_tasks = torch.cat([agent.rollouts.tasks[step-1] for agent in team])
+            all_map_log_probs = torch.cat([agent.rollouts.map_log_probs[step-1] for agent in team])
+            all_decision_log_probs = torch.cat([agent.rollouts.decision_log_probs[step-1] for agent in team])
 
+            # 向量化优化=================
+            # 输入提取
+            ## 批量处理所有环境
+            num_processes = len(self.envs_info)
+            num_agents = len(team)
+
+            # 1. 批量构建 critic map input 和 critic vec input
+            belief_maps = torch.stack([torch.from_numpy(np.array(info['belief_map'])).float() 
+                                    for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+            entropy_maps = torch.stack([torch.from_numpy(np.array(info['entropy_map'])).float() 
+                                        for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+            heatmaps = torch.stack([torch.from_numpy(np.array(info['heatmap'])).float() 
+                                    for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+            landmark_heatmaps = torch.stack([torch.from_numpy(np.array(info['landmark_heatmap'])).float() 
+                                            for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+
+            all_critic_map_inp = torch.stack([belief_maps, entropy_maps, heatmaps, landmark_heatmaps], dim=1)  # [num_processes, 4, H, W]
+            all_critic_vec_inp = all_env_state[:len(self.envs_info),6:] # 向量流：[num_processes, num_agents*2 + num_landmarks*2]
+
+            # 2. 收集所有 goal_done 状态并构建mask
+            goal_done_list = [info['goal_done'] for info in self.envs_info]  # list of lists
+            goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)  # [num_processes, num_agents]
+
+            # 3. 批量生成 vec_inp
+            detected_maps = [torch.from_numpy(np.array(info['map'][1])).float().to(self.device) 
+                            for info in self.envs_info]
+            vec_inps = torch.stack([policy.vec_inp_generator(env_state, detected_map) 
+                                    for env_state, detected_map in zip(all_env_state[:num_processes], detected_maps)])  
+            # [num_processes, num_agents, 5]
+
+            # 4. 批量准备需要更新的智能体数据
+            if goal_done_mask.any():
+                # 获取需要更新的索引 (process_idx, agent_idx)
+                update_indices = torch.nonzero(goal_done_mask, as_tuple=False)  # [N, 2] where N is number of True values
+                
+                # 批量构建 map_inp for all agents that need update
+                agent_belief_maps = belief_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)  # [num_processes, num_agents, H, W]
+                agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)
+                
+                voronoi_masks = torch.stack([
+                    torch.stack([torch.from_numpy(np.array(info['voronoi_masks'][a])).float() 
+                                for a in range(num_agents)]) 
+                    for info in self.envs_info
+                ]).to(self.device)  # [num_processes, num_agents, H, W]
+                
+                distance_fields = torch.stack([
+                    torch.stack([torch.from_numpy(np.array(info['distance_fields'][a])).float() 
+                                for a in range(num_agents)]) 
+                    for info in self.envs_info
+                ]).to(self.device)  # [num_processes, num_agents, H, W]
+                
+                # 只选择需要更新的智能体
+                proc_indices = update_indices[:, 0]
+                agent_indices = update_indices[:, 1]
+                
+                map_inps = torch.stack([
+                    agent_belief_maps[proc_indices, agent_indices],
+                    agent_entropy_maps[proc_indices, agent_indices],
+                    voronoi_masks[proc_indices, agent_indices],
+                    distance_fields[proc_indices, agent_indices]
+                ], dim=1)  # [N, 4, H, W]
+                
+                vec_inp_agents = vec_inps[proc_indices, agent_indices]  # [N, 5]
+                
+                # 5. 批量执行高层策略
+                batch_goals = policy.get_high_level_goal(vec_inp_agents, map_inps)  # 需要实现batch版本
+                
+                # 6. 批量更新 all_goals 和 all_tasks
+                # 计算线性索引: agent_idx * num_processes + process_idx
+                linear_indices = agent_indices * num_processes + proc_indices
+                
+                all_goals[linear_indices] = batch_goals["waypoints"]  # [N, 2]
+                all_tasks[linear_indices] = batch_goals["action_modes"]  # [N, 1]
+                all_map_log_probs[linear_indices] = batch_goals["map_log_probs"]  # [N, 1]
+                all_decision_log_probs[linear_indices] = batch_goals["decision_log_probs"]  # [N, 1]
+
+                # 7. 保存全量的map_inps和vec_inps到rollouts中，以便后续计算高层value
+                all_map_inps = torch.stack([
+                    agent_belief_maps, # [num_processes, num_agents, H, W]
+                    agent_entropy_maps, # [num_processes, num_agents, H, W]
+                    voronoi_masks,      # [num_processes, num_agents, H, W]
+                    distance_fields     # [num_processes, num_agents, H, W]
+                ], dim=2)  # [num_processes, num_agents, 4, H, W]
+                all_vec_inps = vec_inps  # [num_processes, num_agents, 5]
+
+
+            all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_vec_inp) # 计算所有process的高层value： [num_processes, num_agents]
+
+            # 低层策略的处理
             # props = policy.act(all_obs, all_hidden, all_env_state, all_masks, deterministic=False) # a single forward pass
             props = policy.low_level_act(all_obs, all_goals, deterministic=False) # a single forward pass
 
             # split all outputs
             n = len(team)
-            all_goal = torch.chunk(all_goals, n)
+            all_map_inps = torch.chunk(all_map_inps, n, dim=1)  # 按智能体拆分
+            all_vec_inps = torch.chunk(all_vec_inps, n, dim=1)
+            all_goals = torch.chunk(all_goals, n)
+            all_tasks = torch.chunk(all_tasks, n)
+            all_map_log_probs = torch.chunk(all_map_log_probs, n)
+            all_decision_log_probs = torch.chunk(all_decision_log_probs, n)
+            all_high_value = torch.chunk(all_high_value, n, dim=1)
+
+
             all_value, all_action, all_action_log_prob = [torch.chunk(x, n) for x in props]
             for i in range(n):
+                # 低层策略
                 team[i].value = all_value[i]
                 team[i].action = all_action[i]
                 team[i].action_log_prob = all_action_log_prob[i]
-                team[i].goal = all_goal[i]
+
+                # 高层策略
+                team[i].map_obs = all_map_inps[i].squeeze(1)  # [num_processes, 4, H, W]
+                team[i].vec_obs = all_vec_inps[i].squeeze(1)  # [num_processes, vec_dim]
+                team[i].critic_map = all_critic_map_inp # [num_processes, 4, H, W], 智能体共享一个全局图
+                team[i].goal = all_goals[i]
+                team[i].task = all_tasks[i]
+                team[i].map_log_prob = all_map_log_probs[i]
+                team[i].decision_log_prob = all_decision_log_probs[i]
+                team[i].high_value = all_high_value[i]  # [num_processes, 1]
+
                 actions_list.append(all_action[i].cpu().numpy())
-                goals_list.append(all_goal[i].cpu().numpy())
+                goals_list.append(all_goals[i].cpu().numpy())
 
         return actions_list, goals_list
 
     def update(self):
+        return_high_vals = []
         return_vals = []
-        # use joint ppo for training each team
+        # use SMDP_ppo for training high level layer
+        for i, trainer in enumerate(self.high_trainers_list):
+            rollouts_list = [agent.rollouts for agent in self.teams_list[i]]
+            high_vals = trainer.update(rollouts_list)
+            return_high_vals.append([np.array(high_vals)]*len(rollouts_list))
+
+        # use ippo ppo for training low level layer
         for i, trainer in enumerate(self.trainers_list):
             rollouts_list = [agent.rollouts for agent in self.teams_list[i]]
             vals = trainer.update(rollouts_list)
             return_vals.append([np.array(vals)]*len(rollouts_list))
-        return np.stack([x for v in return_vals for x in v]).reshape(-1,3)
+
+        low_arr = np.stack([x for v in return_vals for x in v])     # [num_agents, 3]
+        high_arr = np.stack([x for v in return_high_vals for x in v])   # [num_agents, 5]
+
+        # === 拼接 === [num_agents, 8]
+        return np.concatenate([low_arr, high_arr], axis=1)
 
     def wrap_horizon(self):
+        # 需要根据最后一步的obs计算next_value，然后传入每个agent的rollout中，因为目的是计算GAE，而GAE的每一步return都需要用到下一步的value
+        # 因此需要计算128步的goals，也只需要新goals
         for team, policy in zip(self.teams_list,self.policies_list):
             last_obs = torch.cat([agent.rollouts.obs[-1] for agent in team])
-            last_hidden = torch.cat([agent.rollouts.recurrent_hidden_states[-1] for agent in team])
-            last_masks = torch.cat([agent.rollouts.masks[-1] for agent in team])
             last_env_state = torch.cat([agent.rollouts.env_states[-1] for agent in team])
 
             # 默认采取之前的目标分配，[num_agents * num_processes, 2]
-            # 即使step=0时，也复制goals[-1]的值，保证goal有效
-            all_goals = torch.cat([agent.rollouts.goals[-1] for agent in team])
-            # 遍历不同环境中，根据world.steps判断是否需要执行高层策略
-            for idx, (env_info, env_state) in enumerate(zip(self.envs_info, last_env_state[:len(self.envs_info)])):
-                world_steps = env_info['world_steps'] 
-                # 如果时间达到K步，执行高层策略，得到新的目标分配
-                if world_steps % self.high_level_interval == 0:
-                    # 从环境中调取当前的voronoi加权质点图,[(mx1, my1), (mx2, my2), ...]，转为张量
-                    search_map = torch.from_numpy(np.array(env_info['map'][0])).float().to(self.device)
-                    # 从环境中调取当前的已发现目标位置图,[(tx1, ty1), (tx2, ty2), ...]
-                    detected_map = torch.from_numpy(np.array(env_info['map'][1])).float().to(self.device)
-                    # 高层策略两者进行对比得到新的目标分配 [num_agents, 2]
-                    env_goals = policy.high_level_act(search_map, detected_map, env_state)
-                    # 替换all_goals中对应环境的部分，分别是idx, idx + num_processes, idx + 2*num_processes, ...
-                    for agent_idx in range(len(team)):
-                        all_goals[agent_idx * len(self.envs_info) + idx] = env_goals[agent_idx]
+            last_goals = torch.cat([agent.rollouts.goals[-1] for agent in team])
+
+
+            # 向量化优化=================
+            # 输入提取
+            ## 批量处理所有环境
+            num_processes = len(self.envs_info)
+            num_agents = len(team)
+
+            # 1. 批量构建 critic map input 和 critic vec input
+            belief_maps = torch.stack([torch.from_numpy(np.array(info['belief_map'])).float() 
+                                    for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+            entropy_maps = torch.stack([torch.from_numpy(np.array(info['entropy_map'])).float() 
+                                        for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+            heatmaps = torch.stack([torch.from_numpy(np.array(info['heatmap'])).float() 
+                                    for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+            landmark_heatmaps = torch.stack([torch.from_numpy(np.array(info['landmark_heatmap'])).float() 
+                                            for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
+
+            all_critic_map_inp = torch.stack([belief_maps, entropy_maps, heatmaps, landmark_heatmaps], dim=1)  # [num_processes, 4, H, W]
+            all_critic_vec_inp = last_env_state[:len(self.envs_info),2*num_agents:] # 向量流：[num_processes, num_agents*2 + num_landmarks*2]
+
+            # 2. 收集所有 goal_done 状态并构建mask
+            goal_done_list = [info['goal_done'] for info in self.envs_info]  # list of lists
+            goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)  # [num_processes, num_agents]
+
+            # 3. 批量生成 vec_inp
+            detected_maps = [torch.from_numpy(np.array(info['map'][1])).float().to(self.device) 
+                            for info in self.envs_info]
+            vec_inps = torch.stack([policy.vec_inp_generator(env_state, detected_map) 
+                                    for env_state, detected_map in zip(last_env_state[:num_processes], detected_maps)])  
+            # [num_processes, num_agents, 5]
+
+            # 4. 批量准备需要更新的智能体数据
+            if goal_done_mask.any():
+                # 获取需要更新的索引 (process_idx, agent_idx)
+                update_indices = torch.nonzero(goal_done_mask, as_tuple=False)  # [N, 2] where N is number of True values
+                
+                # 批量构建 map_inp for all agents that need update
+                agent_belief_maps = belief_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)  # [num_processes, num_agents, H, W]
+                agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)
+                
+                voronoi_masks = torch.stack([
+                    torch.stack([torch.from_numpy(np.array(info['voronoi_masks'][a])).float() 
+                                for a in range(num_agents)]) 
+                    for info in self.envs_info
+                ]).to(self.device)  # [num_processes, num_agents, H, W]
+                
+                distance_fields = torch.stack([
+                    torch.stack([torch.from_numpy(np.array(info['distance_fields'][a])).float() 
+                                for a in range(num_agents)]) 
+                    for info in self.envs_info
+                ]).to(self.device)  # [num_processes, num_agents, H, W]
+                
+                # 只选择需要更新的智能体
+                proc_indices = update_indices[:, 0]
+                agent_indices = update_indices[:, 1]
+                
+                map_inps = torch.stack([
+                    agent_belief_maps[proc_indices, agent_indices],
+                    agent_entropy_maps[proc_indices, agent_indices],
+                    voronoi_masks[proc_indices, agent_indices],
+                    distance_fields[proc_indices, agent_indices]
+                ], dim=1)  # [N, 4, H, W]
+                
+                vec_inp_agents = vec_inps[proc_indices, agent_indices]  # [N, 5]
+                
+                # 5. 批量执行高层策略
+                batch_goals = policy.get_high_level_goal(vec_inp_agents, map_inps)  # 需要实现batch版本
+                
+                # 6. 批量更新 all_goals 和 all_tasks
+                # 计算线性索引: agent_idx * num_processes + process_idx
+                linear_indices = agent_indices * num_processes + proc_indices
+                last_goals[linear_indices] = batch_goals["waypoints"]  # [N, 2]
             
             with torch.no_grad():
-                next_value = policy.get_low_value(last_obs, all_goals)
+                next_high_value = policy.get_high_value(all_critic_map_inp, all_critic_vec_inp) # 计算所有process的高层value： [num_processes, num_agents]
+                next_low_value = policy.get_low_value(last_obs, last_goals)
 
-            all_value = torch.chunk(next_value,len(team))
+            all_high_value = torch.chunk(next_high_value,len(team))
+            all_low_value = torch.chunk(next_low_value,len(team))
             for i in range(len(team)):
-                team[i].wrap_horizon(all_value[i])
+                team[i].wrap_horizon(all_low_value[i], all_high_value[i])
 
     def after_update(self):
         for agent in self.all_agents:
@@ -204,12 +376,12 @@ class Learner(object):
         for agent in self.all_agents:
             agent.initial_hidden_states(step)
 
-    def update_rollout(self, obs, reward, masks, env_state):
+    def update_rollout(self, obs, reward, masks, env_state, goal_dones):
         obs_t = torch.from_numpy(obs).float().to(self.device)
         env_state_t = torch.from_numpy(env_state).float().to(self.device)
         for i, agent in enumerate(self.all_agents):
             agent_obs = obs_t[:, i, :]
-            agent.update_rollout(agent_obs, reward[:,i].unsqueeze(1), masks[:,i].unsqueeze(1), env_state_t)
+            agent.update_rollout(agent_obs, reward[:,i].unsqueeze(1), masks[:,i].unsqueeze(1), env_state_t, goal_dones[:,i].unsqueeze(1))
 
     def load_models(self, policies_list):
         for agent, policy in zip(self.all_agents, policies_list):

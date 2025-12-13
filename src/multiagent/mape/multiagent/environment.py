@@ -155,6 +155,14 @@ class MultiAgentEnv(gym.Env):
         # 将centroids和target_positions添加到info_n中
         info_n['map'].append(centroids)
         info_n['map'].append(target_positions)
+        # 将高层策略需要的通道图、是否达到目标点分别加入
+        info_n['belief_map'] = self.global_belief_map.belief_grid
+        info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
+        info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos)
+        info_n['distance_fields'] = self.global_belief_map.get_distance_field(agents_pos, normalize=True)
+        info_n['goal_done'] = self._get_goal_dones(self.agents)
+        info_n['heatmap'] = self.global_belief_map.get_combined_heatmap(agents_pos,0.05)
+        info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
@@ -208,6 +216,16 @@ class MultiAgentEnv(gym.Env):
         target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
         reset_info['map'].append(centroids)
         reset_info['map'].append(target_positions)
+
+        # 将高层策略需要的通道图、是否达到目标点分别加入
+        reset_info['belief_map'] = self.global_belief_map.belief_grid
+        reset_info['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
+        reset_info['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agent_positions)
+        reset_info['distance_fields'] = self.global_belief_map.get_distance_field(agent_positions, normalize=True)
+        reset_info['heatmap'] = self.global_belief_map.get_combined_heatmap(agent_positions, 0.05)
+        reset_info['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
+        # reset下，goal_done全部为False
+        reset_info['goal_done'] = [False] * len(self.agents)
 
         return obs_n, state, reset_info
     
@@ -339,6 +357,13 @@ class MultiAgentEnv(gym.Env):
     # set env goal for a particular agent
     def _set_goal(self, goal, agent):
         agent.state.g_pos = goal
+
+    def _get_goal_dones(self, agents):
+        # check if high-level goal is achieved
+        # agent pos: agent.state.p_pos
+        # goal pos: agent.state.g_pos
+        # threshold: self.world.dist_threshold
+        return [np.linalg.norm(agent.state.p_pos - agent.state.g_pos) < self.world.dist_threshold for agent in agents]
 
     # reset rendering assets
     def _reset_render(self):

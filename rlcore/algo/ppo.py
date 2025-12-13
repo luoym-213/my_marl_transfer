@@ -183,202 +183,222 @@ class JointPPO():
                  eps=None,
                  max_grad_norm=None,
                  use_clipped_value_loss=False,
-                 parallel_batch_size=4):  # 新增参数：并行处理的batch数量
+                 parallel_batch_size=4,
+                 dense_critic=True):  # 新增参数：并行处理的batch数量
 
         self.actor_critic = actor_critic
-
         self.clip_param = clip_param
         self.ppo_epoch = ppo_epoch
         self.num_mini_batch = num_mini_batch
-
         self.parallel_batch_size = parallel_batch_size
 
         self.value_loss_coef = value_loss_coef
         self.entropy_coef = entropy_coef
-
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
-        self.optimizer_tgnet = optim.Adam(actor_critic.task.parameters(), lr=lr)
 
     def update(self, rollouts_list):
+        """
+        支持双头Actor的PPO更新:
+        - 决策头: 生成 [explore=0, collect=1]
+        - 探索头: 生成 waypoints [x, y]
+        
+        更新策略:
+        - collect模式(task=1): 只更新决策头 + Critic
+        - explore模式(task=0): 更新决策头 + 探索头 + Critic
+        """
         # rollouts_list - list of rollouts of agents which share self.actor_critic policy
         advantages_list = []
         for rollout in rollouts_list:
-            advantages = rollout.returns[:-1] - rollout.value_preds[:-1]
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
+            advantages = rollout.high_returns[:-1] - rollout.high_value[:-1]
+            # 非决策点不参与归一化，只在决策点上计算均值和方差
+            #advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
             advantages_list.append(advantages) # [num_steps, num_processes, 1]
 
         value_loss_epoch = 0
-        action_loss_epoch = 0
-        dist_entropy_epoch = 0
+        decision_loss_epoch = 0
+        waypoint_loss_epoch = 0
+        decision_entropy_epoch = 0
+        waypoint_entropy_epoch = 0
 
-        for e in range(self.ppo_epoch):
-            if self.actor_critic.is_recurrent:
-                # raise ('sampler not implemented for recurrent policies')
-                data_generator = recurrent_generator(rollouts_list, advantages_list, self.num_mini_batch, seq_len = 16)
-                #data_generator = recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, self.num_mini_batch)
-            else:
-                data_generator = magent_feed_forward_generator(rollouts_list, advantages_list, self.num_mini_batch)
-            
-            # 收集所有样本
-            all_samples = list(data_generator) # list of tuples = num_mini_batch
-            
-            # 按parallel_batch_size分组处理
-            for i in range(0, len(all_samples), self.parallel_batch_size):
-                batch_group = all_samples[i:i+self.parallel_batch_size]
-                
-                # 合并多个batch
-                # reshape and concat along second dimension (episodes_per_batch * parallel_batch_size), (num_agent, batch, num_steps, dim) 
-                combined_obs = torch.cat([sample[0] for sample in batch_group], dim=1)  # concat on dim=1
-                combined_hidden_states = torch.cat([sample[1] for sample in batch_group], dim=1) # [agent, batch, hidden_size]
-                combined_actions = torch.cat([sample[2] for sample in batch_group], dim=1)
-                combined_value_preds = torch.cat([sample[3] for sample in batch_group], dim=1)
-                combined_returns = torch.cat([sample[4] for sample in batch_group], dim=1)
-                combined_masks = torch.cat([sample[5] for sample in batch_group], dim=1)
-                combined_old_log_probs = torch.cat([sample[6] for sample in batch_group], dim=1)
-                combined_advantages = torch.cat([sample[7] for sample in batch_group], dim=1)
-                combined_env_states = torch.cat([sample[8] for sample in batch_group], dim=1)
-                combined_tasks = torch.cat([sample[9] for sample in batch_group], dim=1)
-
-                # 转换成形状(num_steps, num_agent * batch, dim)
-                combined_obs = combined_obs.permute(2, 0, 1, 3).reshape(-1, combined_obs.size(0) * combined_obs.size(1), combined_obs.size(3))
-                combined_hidden_states = combined_hidden_states.reshape(combined_hidden_states.size(0) * combined_hidden_states.size(1), -1) # [agent * batch, hidden_size]
-                combined_actions = combined_actions.permute(2, 0, 1, 3).reshape(-1, combined_actions.size(0) * combined_actions.size(1), combined_actions.size(3))
-                combined_value_preds = combined_value_preds.permute(2, 0, 1, 3).reshape(-1, combined_value_preds.size(0) * combined_value_preds.size(1), combined_value_preds.size(3))
-                combined_returns = combined_returns.permute(2, 0, 1, 3).reshape(-1, combined_returns.size(0) * combined_returns.size(1), combined_returns.size(3))
-                combined_masks = combined_masks.permute(2, 0, 1, 3).reshape(-1, combined_masks.size(0) * combined_masks.size(1), combined_masks.size(3))
-                combined_old_log_probs = combined_old_log_probs.permute(2, 0, 1, 3).reshape(-1, combined_old_log_probs.size(0) * combined_old_log_probs.size(1), combined_old_log_probs.size(3))
-                combined_advantages = combined_advantages.permute(2, 0, 1, 3).reshape(-1, combined_advantages.size(0) * combined_advantages.size(1), combined_advantages.size(3))
-                combined_env_states = combined_env_states.permute(2, 0, 1, 3).reshape(-1, combined_env_states.size(0) * combined_env_states.size(1), combined_env_states.size(3))
-                combined_tasks = combined_tasks.permute(2, 0, 1, 3).reshape(-1, combined_tasks.size(0) * combined_tasks.size(1), combined_tasks.size(3))
-
-
-                ## 检测代码开始
-                # print("pre_0;", batch_group[0][0][0, 0, 0, :])
-                # print("pre_1:", batch_group[1][0][0, 0, 0, :])
-                # print("pre_2:", batch_group[2][0][0, 0, 0, :])
-                # print("pre_3:", batch_group[3][0][0, 0, 0, :])
-
-                # print("combined_obs_0:", combined_obs[0, 0, :])
-                # print("combined_obs_1:", combined_obs[0, 6, :])
-                # print("combined_obs_1:", combined_obs[0, 12, :])
-                # print("combined_obs_1:", combined_obs[0, 18, :])
-                # print("combined_obs.shape:", combined_obs.size())
-                ## 检测代码结束
-
-                # 一次性处理合并后的大batch
-                if self.actor_critic.is_recurrent:
-                    T, N = combined_obs.shape[0], combined_obs.shape[1]  # , numagent * episodes_per_batch * parallel_batch_size
-
-                    # 初始化            
-                    values_list = []
-                    action_log_probs_list = []
-                    dist_entropy_sum = 0 # 初始化熵的总和
-                    # current_states = torch.zeros(N, combined_hidden_states.shape[2], device=combined_hidden_states.device) #[batchsize, hidden_size]
-                    current_states = combined_hidden_states # 取第一个时间步的隐藏状态作为初始状态
-                    
-                    # 逐时间步处理
-                    for t in range(T):
-                        #print("current_states: ", current_states[0:3])
-                        current_states = current_states * combined_masks[t]  # 根据mask更新hidden state
-                        values_t, action_log_probs_t, dist_entropy_t, current_states = self.actor_critic.evaluate_actions(
-                            combined_obs[t],
-                            current_states,
-                            combined_masks[t],
-                            combined_actions[t],
-                            combined_env_states[t],
-                            combined_tasks[t]
-                        )
-                        # values_t:[N, 1], action_log_probs_t:[N, 1], dist_entropy_t:[N, 1]
-
-                        values_list.append(values_t)
-                        action_log_probs_list.append(action_log_probs_t) 
-                        dist_entropy_sum += dist_entropy_t
-
-                    # values, action_log_probs, dist_entropy:[T, N, 1]
-                    values = torch.stack(values_list, dim=0) # [T, N, -1]
-                    action_log_probs = torch.stack(action_log_probs_list, dim=0) # [T, N, -1]
-                    dist_entropy = dist_entropy_sum / T
-                else:
-                    # 非循环网络的原有处理方式
-                    values, action_log_probs, dist_entropy, _ = self.actor_critic.evaluate_actions(
-                        obs_batch, recurrent_hidden_states_batch, masks_batch, actions_batch
-                    )
-
-                ratio = torch.exp(action_log_probs - combined_old_log_probs) # [T, N, 1]
-                surr1 = ratio * combined_advantages
-                surr2 = torch.clamp(ratio, 1.0 - self.clip_param, 1.0 + self.clip_param) * combined_advantages
-                action_loss = -torch.min(surr1, surr2).mean()
-
-                if self.use_clipped_value_loss:
-                    value_pred_clipped= combined_value_preds+(values-combined_value_preds).clamp(-self.clip_param,self.clip_param)
-                    value_losses = (values - combined_returns).pow(2)
-                    value_losses_clipped = (value_pred_clipped - combined_returns).pow(2)
-                    value_loss = .5 * torch.max(value_losses, value_losses_clipped).mean()
-                else:
-                    value_loss = 0.5 * F.mse_loss(combined_returns, values)
-
-                self.optimizer.zero_grad()
-                (value_loss * self.value_loss_coef + action_loss - dist_entropy * self.entropy_coef).backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-                self.optimizer.step()
-
-                value_loss_epoch += value_loss.item()
-                action_loss_epoch += action_loss.item()
-                dist_entropy_epoch += dist_entropy.item()
-            
-            # 在处理完所有batch组后更新参数
-            nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-            self.optimizer.step()
-            self.optimizer.zero_grad()
-        
-        num_updates = self.ppo_epoch * self.num_mini_batch
-
-        value_loss_epoch /= num_updates
-        action_loss_epoch /= num_updates
-        dist_entropy_epoch /= num_updates
-
-        return value_loss_epoch, action_loss_epoch, dist_entropy_epoch        
-
-    def taskG_update(self, rollouts_list):
-        total_loss = 0.0
-        total_correct = 0
+        # 统计决策点、探索点、生成点数量
+        total_decision_points = 0
+        total_explore_points = 0
+        total_collect_points = 0
         total_samples = 0
 
         for e in range(self.ppo_epoch):
-            # 使用所有rollouts的数据来训练任务生成器
-            e_data_generator = tgnet_feed_forward_generator(rollouts_list, self.num_mini_batch)
+            data_generator = smdp_feed_forward_generator(rollouts_list, advantages_list, self.num_mini_batch)
+            
+            for sample in data_generator:
+                (env_states_batch, map_obs_batch, vec_obs_batch, critic_maps_batch,
+                 goals_batch, tasks_batch,
+                 map_log_probs_batch, decision_log_probs_batch,
+                 high_value_preds_batch, high_return_batch,
+                 masks_batch, goal_dones_batch, high_adv_targ,
+                 agent_ids_batch) = sample
+                
+                # === 1. 提取各种mask ===
+                decision_mask = goal_dones_batch.squeeze(-1) > 0.5  # [batch_size] - 是否是决策点
+                explore_mask = (tasks_batch.squeeze(-1) < 0.5) & decision_mask  # task=0 且是决策点
+                collect_mask = (tasks_batch.squeeze(-1) > 0.5) & decision_mask  # task=1 且是决策点
+                
+                num_decisions = decision_mask.sum().item()
+                num_explore = explore_mask.sum().item()
+                num_collect = collect_mask.sum().item()
+                
+                total_decision_points += num_decisions
+                total_explore_points += num_explore
+                total_collect_points += num_collect
+                total_samples += goal_dones_batch.size(0)
 
-            for sample in e_data_generator:
-                tasks_batch, tgnet_input_batch = sample
+                # === 2. 评估高层动作（前向传播所有数据）===
+                # 返回: high_values, new_decision_log_probs, new_map_log_probs, 
+                #       decision_dist_entropy, waypoint_dist_entropy
+                # 评估高层动作（全部数据都forward）
+                (high_values, new_decision_log_probs, new_map_log_probs, 
+                 decision_dist_entropy, waypoint_dist_entropy) = \
+                    self.actor_critic.evaluate_high_actions(
+                        env_states_batch,
+                        map_obs_batch, vec_obs_batch,
+                        critic_maps_batch,
+                        goals_batch, tasks_batch,
+                        agent_ids=agent_ids_batch   # ⭐ 传入智能体ID
+                    )
+                
+                # high_values: [batch_size, 1]
+                # new_decision_log_probs: [batch_size, 1] - 决策头的log prob
+                # new_map_log_probs: [batch_size, 1] - 探索头的log prob
+                # decision_dist_entropy: [batch_size, 1]
+                # waypoint_dist_entropy: [batch_size, 1]
 
-                # forward
-                task_logits, _ = self.actor_critic.taskG(tgnet_input_batch)
+                # === 3. 只在相应的mask上计算熵 ===
+                # 注意：evaluate_high_actions 应该返回 [batch_size] 的熵，而不是标量
+                
+                # 决策熵：只在决策点计算
+                if num_decisions > 0:
+                    decision_entropy_masked = decision_dist_entropy[decision_mask].mean()
+                else:
+                    decision_entropy_masked = torch.tensor(0.0, device=high_values.device)
+                
+                # 探索熵：只在explore点计算
+                if num_explore > 0:
+                    waypoint_entropy_masked = waypoint_dist_entropy[explore_mask].mean()
+                else:
+                    waypoint_entropy_masked = torch.tensor(0.0, device=high_values.device)
 
-                # loss
-                task_loss = F.cross_entropy(task_logits, tasks_batch.argmax(dim=1))
+                # === 4. Critic Loss（密集更新：所有点）===
+                if self.dense_critic:
+                    # 密集 Critic：使用全部数据
+                    if self.use_clipped_value_loss:
+                        value_pred_clipped = high_value_preds_batch + \
+                            (high_values - high_value_preds_batch).clamp(
+                                -self.clip_param, self.clip_param)
+                        value_losses = (high_values - high_return_batch).pow(2)
+                        value_losses_clipped = (value_pred_clipped - high_return_batch).pow(2)
+                        value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+                    else:
+                        value_loss = 0.5 * F.mse_loss(high_return_batch, high_values)
+                else:
+                    # 稀疏 Critic：只在决策点更新
+                    if num_decisions > 0:
+                        if self.use_clipped_value_loss:
+                            value_pred_clipped = high_value_preds_batch[decision_mask] + \
+                                (high_values[decision_mask] - 
+                                 high_value_preds_batch[decision_mask]).clamp(
+                                    -self.clip_param, self.clip_param)
+                            value_losses = (high_values[decision_mask] - 
+                                          high_return_batch[decision_mask]).pow(2)
+                            value_losses_clipped = (value_pred_clipped - 
+                                                   high_return_batch[decision_mask]).pow(2)
+                            value_loss = 0.5 * torch.max(value_losses, 
+                                                        value_losses_clipped).mean()
+                        else:
+                            value_loss = 0.5 * F.mse_loss(
+                                high_return_batch[decision_mask], 
+                                high_values[decision_mask]
+                            )
+                    else:
+                        value_loss = torch.tensor(0.0, device=high_values.device)
 
-                # backward
-                self.optimizer_tgnet.zero_grad()
-                task_loss.backward()
-                nn.utils.clip_grad_norm_(self.actor_critic.task.parameters(), self.max_grad_norm)
-                self.optimizer_tgnet.step()
+                # === 5. Actor Loss - 决策头（所有决策点）===
+                if num_decisions > 0:
+                    # 计算决策头的ratio
+                    decision_ratio = torch.exp(new_decision_log_probs - decision_log_probs_batch)
+                    decision_surr1 = decision_ratio * high_adv_targ
+                    decision_surr2 = torch.clamp(decision_ratio, 1.0 - self.clip_param,
+                                                 1.0 + self.clip_param) * high_adv_targ
+                    
+                    # 只在决策点计算loss
+                    decision_loss_raw = -torch.min(decision_surr1, decision_surr2)
+                    decision_loss = (decision_loss_raw * goal_dones_batch).sum() / goal_dones_batch.sum()
+                else:
+                    decision_loss = torch.tensor(0.0, device=high_values.device)
 
-                # 计算预测正确数量
-                preds = torch.argmax(task_logits, dim=1)
-                targets = tasks_batch.argmax(dim=1)
-                correct = (preds == targets).sum().item()
-                total_correct += correct
-                total_samples += targets.size(0)
+                # === 6. Actor Loss - 探索头（只在explore模式的决策点）===
+                if num_explore > 0:
+                    # 计算探索头的ratio（只在explore点）
+                    waypoint_ratio = torch.exp(new_map_log_probs[explore_mask] - 
+                                              map_log_probs_batch[explore_mask])
+                    waypoint_surr1 = waypoint_ratio * high_adv_targ[explore_mask]
+                    waypoint_surr2 = torch.clamp(waypoint_ratio, 1.0 - self.clip_param,
+                                                 1.0 + self.clip_param) * high_adv_targ[explore_mask]
+                    
+                    waypoint_loss = -torch.min(waypoint_surr1, waypoint_surr2).mean()
+                else:
+                    waypoint_loss = torch.tensor(0.0, device=high_values.device)
 
-                total_loss += task_loss.item()
+                # === 7. 总Loss（带梯度控制）===
+                # 注意：在collect模式下，探索头的梯度应该被阻止
+                total_loss = (value_loss * self.value_loss_coef + 
+                             decision_loss - 
+                             decision_entropy_masked * self.entropy_coef)
+                
+                # 只在有explore点时才加入探索头的loss
+                if num_explore > 0:
+                    total_loss = total_loss + waypoint_loss - waypoint_entropy_masked * self.entropy_coef
 
-        avg_loss = total_loss / (self.ppo_epoch * self.num_mini_batch)
-        accuracy = total_correct / total_samples if total_samples > 0 else 0.0
+                # === 8. 反向传播和优化 ===
+                self.optimizer.zero_grad()
+                total_loss.backward()
+                
+                # 可选：在collect模式下手动清零探索头的梯度
+                # 这样可以确保collect时探索头完全不更新
+                if num_collect > 0 and num_explore == 0:
+                    # 如果这个batch只有collect点，清零探索头参数的梯度
+                    for name, param in self.actor_critic.named_parameters():
+                        if 'waypoint' in name or 'map_head' in name:  # 根据您的网络结构调整
+                            if param.grad is not None:
+                                param.grad.zero_()
 
-        return avg_loss, accuracy
+                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                self.optimizer.step()
+
+                # 统计loss
+                value_loss_epoch += value_loss.item()
+                decision_loss_epoch += decision_loss.item()
+                waypoint_loss_epoch += waypoint_loss.item()
+                decision_entropy_epoch += decision_entropy_masked.item()
+                waypoint_entropy_epoch += waypoint_entropy_masked.item()
+
+        num_updates = self.ppo_epoch * self.num_mini_batch
+
+        value_loss_epoch /= num_updates
+        decision_loss_epoch /= num_updates
+        waypoint_loss_epoch /= num_updates
+        decision_entropy_epoch /= num_updates
+        waypoint_entropy_epoch /= num_updates
+
+        # 打印统计信息
+        if total_decision_points > 0:
+            print(f"Decision points: {total_decision_points} "
+                  f"(Explore: {total_explore_points}, Collect: {total_collect_points})")
+
+        return (value_loss_epoch, decision_loss_epoch, waypoint_loss_epoch, 
+                decision_entropy_epoch, waypoint_entropy_epoch)
+                
             
 def feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     num_steps, num_processes = rollouts_list[0].rewards.size()[0:2]
@@ -401,26 +421,121 @@ def feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch,\
               masks_batch, old_action_log_probs_batch, adv_targ, goal
 
-def magent_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
+def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
+    """
+    为高层策略生成训练样本（Dense Critic + Sparse Actor）
+    - Yield 全量数据（包括决策点和非决策点）
+    - 通过 goal_dones mask 来区分
+    - Actor Loss 只在决策点计算
+    - Critic Loss 可以在所有点计算（密集）
+    """
     num_steps, num_processes = rollouts_list[0].rewards.size()[0:2]
-    batch_size = num_processes * num_steps
-    mini_batch_size = int((batch_size/num_mini_batch)) # size of minibatch for each agent
-    sampler = BatchSampler(SubsetRandomSampler(range(batch_size)), mini_batch_size, drop_last=False)
+    
+    # 收集所有agent的数据
+    all_env_states = []
+    all_map_obs = []
+    all_vec_obs = []
+    all_critic_maps = []
+    all_goals = []
+    all_tasks = []
+    all_map_log_probs = []
+    all_decision_log_probs = []
+    all_high_value_preds = []
+    all_high_returns = []
+    all_masks = []
+    all_goal_dones = []
+    all_advantages = []
+    all_agent_ids = []  # ⭐ 新增: 记录智能体ID
+
+    for agent_id, (rollout, advantages) in enumerate(zip(rollouts_list, advantages_list)):
+        batch_size = num_steps * num_processes
+
+        # 展平所有数据 [num_steps, num_processes, ...] -> [num_steps * num_processes, ...]
+        all_env_states.append(rollout.env_states[:-1].view(-1, rollout.env_states.size(-1)))
+        all_map_obs.append(rollout.map_obs.view(-1, *rollout.map_obs.size()[2:]))  # [N, 4, H, W]
+        all_vec_obs.append(rollout.vec_obs.view(-1, rollout.vec_obs.size(-1)))  # [N, vec_dim]
+        all_critic_maps.append(rollout.critic_maps.view(-1, *rollout.critic_maps.size()[2:]))  # [N, 4, H, W]
+        all_goals.append(rollout.goals.view(-1, rollout.goals.size(-1)))  # [N, 2]
+        all_tasks.append(rollout.tasks.view(-1, rollout.tasks.size(-1)))  # [N, 1]
+        all_map_log_probs.append(rollout.map_log_probs.view(-1, 1))
+        all_decision_log_probs.append(rollout.decision_log_probs.view(-1, 1))
+        all_high_value_preds.append(rollout.high_values[:-1].view(-1, 1))
+        all_high_returns.append(rollout.high_returns[:-1].view(-1, 1))
+        all_masks.append(rollout.masks[:-1].view(-1, 1))
+        all_goal_dones.append(rollout.goal_dones[:-1].view(-1, 1))
+        all_advantages.append(advantages.view(-1, 1))
+        # ⭐ 记录智能体ID
+        agent_ids = torch.full((batch_size,), agent_id, dtype=torch.long)
+        all_agent_ids.append(agent_ids)
+    
+    # 拼接所有agent的数据
+    env_states_all = torch.cat(all_env_states, 0)  # [num_agents * num_steps * num_processes, env_state_dim]
+    map_obs_all = torch.cat(all_map_obs, 0)  # [num_agents * num_steps * num_processes, 4, H, W]
+    vec_obs_all = torch.cat(all_vec_obs, 0)  # [num_agents * num_steps * num_processes, vec_dim]
+    critic_maps_all = torch.cat(all_critic_maps, 0)  # [num_agents * num_steps * num_processes, 4, H, W]
+    goals_all = torch.cat(all_goals, 0)
+    tasks_all = torch.cat(all_tasks, 0)
+    map_log_probs_all = torch.cat(all_map_log_probs, 0)
+    decision_log_probs_all = torch.cat(all_decision_log_probs, 0)
+    high_value_preds_all = torch.cat(all_high_value_preds, 0)
+    high_returns_all = torch.cat(all_high_returns, 0)
+    masks_all = torch.cat(all_masks, 0)
+    goal_dones_all = torch.cat(all_goal_dones, 0)
+    advantages_all = torch.cat(all_advantages, 0)
+    agent_ids_all = torch.cat(all_agent_ids, 0)  # ⭐ 拼接智能体ID
+    
+    # === 关键改进：Advantage 归一化只在决策点上进行 ===
+    decision_mask = (goal_dones_all.squeeze(-1) > 0.5)
+    
+    if decision_mask.sum() > 0:
+        # 只对决策点的 advantage 进行归一化，只在决策点上计算均值和方差
+        adv_mean = advantages_all[decision_mask].mean()
+        adv_std = advantages_all[decision_mask].std()
+        # 归一化所有 advantage（但统计量只来自决策点）
+        advantages_all = (advantages_all - adv_mean) / (adv_std + 1e-5)
+    else:
+        print("Warning: No decision points found in rollouts")
+        # 如果没有决策点，仍然做归一化（虽然这些数据不会用于 Actor 更新）
+        advantages_all = (advantages_all - advantages_all.mean()) / (advantages_all.std() + 1e-5)
+    
+    # === 使用全量数据 ===
+    batch_size = map_obs_all.size(0)
+    
+    if batch_size < num_mini_batch:
+        num_mini_batch = max(1, batch_size)
+    
+    mini_batch_size = batch_size // num_mini_batch
+    
+    # 随机采样（全量数据）
+    sampler = BatchSampler(
+        SubsetRandomSampler(range(batch_size)), 
+        mini_batch_size, 
+        drop_last=False
+    )
+    
     for indices in sampler:
-        obs_batch=torch.cat([rollout.obs[:-1].view(-1,*rollout.obs.size()[2:])[indices] for rollout in rollouts_list],0)
-        recurrent_hidden_states_batch = torch.cat([rollout.recurrent_hidden_states[:-1].view(-1, 
-                    rollout.recurrent_hidden_states.size(-1))[indices] for rollout in rollouts_list],0)
-        actions_batch = torch.cat([rollout.actions.view(-1,
-                    rollout.actions.size(-1))[indices] for rollout in rollouts_list],0)
-        value_preds_batch=torch.cat([rollout.value_preds[:-1].view(-1, 1)[indices] for rollout in rollouts_list],0)
-        return_batch = torch.cat([rollout.returns[:-1].view(-1, 1)[indices] for rollout in rollouts_list],0)
-        masks_batch = torch.cat([rollout.masks[:-1].view(-1, 1)[indices] for rollout in rollouts_list],0)
-        old_action_log_probs_batch=torch.cat([rollout.action_log_probs.view(-1,1)[indices] for rollout in rollouts_list],0)
-        adv_targ = torch.cat([advantages.view(-1, 1)[indices] for advantages in advantages_list],0)
-
-        yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch,\
-              masks_batch, old_action_log_probs_batch, adv_targ
-
+        env_states_batch = env_states_all[indices]  # [mini_batch_size, env_state_dim]
+        map_obs_batch = map_obs_all[indices]  # [mini_batch_size, 4, H, W]
+        vec_obs_batch = vec_obs_all[indices]  # [mini_batch_size, vec_dim]
+        critic_maps_batch = critic_maps_all[indices]  # [mini_batch_size, 4, H, W]
+        goals_batch = goals_all[indices]  # [mini_batch_size, 2]
+        tasks_batch = tasks_all[indices]  # [mini_batch_size, 1]
+        map_log_probs_batch = map_log_probs_all[indices]
+        decision_log_probs_batch = decision_log_probs_all[indices]
+        high_value_preds_batch = high_value_preds_all[indices]
+        high_return_batch = high_returns_all[indices]
+        masks_batch = masks_all[indices]
+        goal_dones_batch = goal_dones_all[indices]  # ← 关键：yield mask
+        adv_targ = advantages_all[indices]
+        agent_ids_batch = agent_ids_all[indices]  # ⭐ 提取智能体ID batch
+        
+        yield (env_states_batch, map_obs_batch, vec_obs_batch, critic_maps_batch,
+               goals_batch, tasks_batch,
+               map_log_probs_batch, decision_log_probs_batch,
+               high_value_preds_batch, high_return_batch, 
+               masks_batch, goal_dones_batch, adv_targ,
+               agent_ids_batch)  # ⭐ 返回智能体ID batch
+        
 def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_batch, seq_length=30):
     """
     循环网络样本生成器，负责高效地准备和提供循环神经网络所需的序列数据
@@ -607,17 +722,6 @@ def recurrent_from_0_feed_foward_generator(rollouts_list, advantages_list, num_m
        
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch, \
               masks_batch, old_action_log_probs_batch, adv_targ
-
-def tgnet_feed_forward_generator(rollouts_list, num_mini_batch):
-    num_steps, num_processes = rollouts_list[0].rewards.size()[0:2]
-    batch_size = num_processes * num_steps
-    mini_batch_size = int((batch_size/num_mini_batch)) # size of minibatch for each agent
-    sampler = BatchSampler(SubsetRandomSampler(range(batch_size)), mini_batch_size, drop_last=False)
-    for indices in sampler:
-        tasks_batch = torch.cat([rollout.tasks.view(-1, rollout.tasks.size(-1))[indices] for rollout in rollouts_list],0)
-        tgnet_input_batch = torch.cat([rollout.tgnet_input.view(-1, rollout.tgnet_input.size(-1))[indices] for rollout in rollouts_list],0)
-
-        yield tasks_batch, tgnet_input_batch
 
 def recurrent_generator(rollouts_list, advantages_list, num_mini_batch, seq_len):
     """

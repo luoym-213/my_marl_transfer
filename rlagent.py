@@ -16,12 +16,17 @@ class Neo(object):
     self.trainer = PPO(self.actor_critic, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                        args.entropy_coef, lr=args.lr,max_grad_norm=args.max_grad_norm)
     
-    self.cta_task = None
-    self.tgnet_input = None
     self.action = None
     self.action_log_prob = None
     self.value = None
+    self.map_obs = None
+    self.vec_obs = None
+    self.critic_map = None
     self.goal = None
+    self.task = None
+    self.map_log_probs = None
+    self.decision_log_probs = None
+    self.high_value = None
 
   def load_model(self, policy_state):
       self.actor_critic.load_state_dict(policy_state)
@@ -34,16 +39,22 @@ class Neo(object):
     # this function is called at the start of episode
     self.rollouts.env_states[0].copy_(env_state)
 
-  def update_rollout(self, obs, reward, mask, env_state):
-    self.rollouts.insert(obs, self.action, self.action_log_prob, self.value, reward, mask, env_state, self.goal)
+  def update_rollout(self, obs, reward, mask, env_state, goal_dones):
+    self.rollouts.insert(obs, self.action, self.action_log_prob, self.value, 
+                         reward, mask, env_state, 
+                         self.map_obs, self.vec_obs, self.critic_map,
+                         self.goal, self.task, 
+                         self.map_log_probs, self.decision_log_probs, 
+                         self.high_value, goal_dones)
 
   def act(self, step, deterministic=False):
     self.value, self.action, self.action_log_prob, self.states = self.actor_critic.act(self.rollouts.obs[step],
               self.rollouts.recurrent_hidden_states[step],self.rollouts.masks[step],deterministic=deterministic)
     return self.action
 
-  def wrap_horizon(self, next_value):
-    self.rollouts.compute_returns(next_value, True, self.args.gamma, self.args.tau)
+  def wrap_horizon(self, next_low_value, next_high_value):
+    self.rollouts.compute_returns(next_low_value, True, self.args.gamma, self.args.tau)
+    self.rollouts.compute_high_returns(next_high_value, self.args.gamma, self.args.tau)
 
   def after_update(self):
     self.rollouts.after_update()
