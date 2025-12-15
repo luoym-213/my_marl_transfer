@@ -392,9 +392,11 @@ class JointPPO():
         waypoint_entropy_epoch /= num_updates
 
         # 打印统计信息
+        """
         if total_decision_points > 0:
             print(f"Decision points: {total_decision_points} "
                   f"(Explore: {total_explore_points}, Collect: {total_collect_points})")
+        """
 
         return (value_loss_epoch, decision_loss_epoch, waypoint_loss_epoch, 
                 decision_entropy_epoch, waypoint_entropy_epoch)
@@ -527,7 +529,7 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         masks_batch = masks_all[indices]
         goal_dones_batch = goal_dones_all[indices]  # ← 关键：yield mask
         adv_targ = advantages_all[indices]
-        agent_ids_batch = agent_ids_all[indices]  # ⭐ 提取智能体ID batch
+        agent_ids_batch = agent_ids_all[indices].to(high_value_preds_batch.device)  # ⭐ 提取智能体ID batch
         
         yield (env_states_batch, map_obs_batch, vec_obs_batch, critic_maps_batch,
                goals_batch, tasks_batch,

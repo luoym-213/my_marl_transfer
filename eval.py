@@ -130,7 +130,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             obs = normalize_obs(obs, obs_mean, obs_std)
             master.envs_info = info
-            episode_rewards += np.array(reward)
+            episode_rewards += reward.cpu().numpy()
             episode_high_rewards += high_reward.cpu().numpy()
             
             # Render for GIF saving (if needed)
