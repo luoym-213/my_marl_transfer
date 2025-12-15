@@ -141,7 +141,6 @@ class MultiAgentEnv(gym.Env):
 
         # advance world state
         self.world.step()
-        print("World Step:", self.world.steps)
 
         # 收集当前智能体位置
         agents_pos = np.array([a.state.p_pos for a in self.agents])
@@ -177,8 +176,6 @@ class MultiAgentEnv(gym.Env):
         info_n['goal_done'] = self._get_goal_dones(self.agents)
         info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
-        info_n['high_level_rewards'] = total_high_rewards.tolist()
-        print("high level rewards:", info_n['high_level_rewards'])
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
@@ -186,7 +183,7 @@ class MultiAgentEnv(gym.Env):
         for agent in self.agents:
             obs_n.append(self._get_obs(agent))
             reward_n.append(self._get_goal_reward(agent))
-            done_n.append(self._get_done(agent))
+            done_n.append(self._get_done(agent)) # 相当于整个episode是否结束
             info_n['n'].append(self._get_info(agent))
 
         # 获取全局状态，智能体速度、位置，landmark位置
@@ -203,7 +200,10 @@ class MultiAgentEnv(gym.Env):
         # 势能奖励+碰撞惩罚
         all_reward =  reward_n + common_penaltie
 
-        return obs_n, all_reward, done_n, info_n, state
+        # 拼接高层+底层奖励：[2, num_agents]
+        # final_reward = np.concatenate([all_reward, total_high_rewards], axis=0)
+
+        return obs_n, all_reward, total_high_rewards, done_n, info_n, state
 
     def reset(self):
         # reset world

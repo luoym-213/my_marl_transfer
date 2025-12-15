@@ -46,12 +46,12 @@ def train(args, return_early=False):
             # 这里需要给agent_actions和agent_goals包装一下，变成字典形式传入env.step()
             # 需要变成num_processes个环境的列表，每个元素是一个字典，包含两个键值对: 'agents_actions', 'agents_goals'
             step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i]} for i in range(args.num_processes)]
-            obs, reward, done, info, env_state = envs.step(step_data)
+            obs, reward, high_reward, done, info, env_state = envs.step(step_data)
             master.envs_info = info
-            high_rewards = torch.from_numpy(np.array([info[i]['high_level_rewards'] for i in range(args.num_processes)])).float().to(args.device) # shape: [num_processes , num_agents]
+            high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
-            episode_high_rewards += high_rewards
+            episode_high_rewards += high_reward
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
             goal_dones = torch.FloatTensor([info[i]['goal_done'] for i in range(args.num_processes)]).to(args.device)
             final_rewards *= masks
@@ -61,7 +61,7 @@ def train(args, return_early=False):
             episode_rewards *= masks
             episode_high_rewards *= masks
 
-            master.update_rollout(obs, reward, high_rewards, masks, env_state, goal_dones)
+            master.update_rollout(obs, reward, high_reward, masks, env_state, goal_dones)
 
         master.wrap_horizon()
         return_vals = master.update()
