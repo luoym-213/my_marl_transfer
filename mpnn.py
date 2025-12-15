@@ -433,7 +433,7 @@ class MPNN(nn.Module):
         map_log_prob = dist_map.log_prob(flat_idx)  # [Batch]
     
         # 3. 转换坐标
-        y_coords = flat_idx // 100
+        y_coords = torch.div(flat_idx, 100, rounding_mode='floor')  # 向下取整（推荐用于坐标计算）
         x_coords = flat_idx % 100
         if x_coords.dim() > 1:
             x_coords = x_coords.squeeze(-1)  # 移除最后一维
