@@ -144,39 +144,33 @@ class RolloutStorage(object):
             accumulated_reward = self.high_rewards[step] + gamma * accumulated_reward
             step_count = step_count + 1
             
-            # 3. 计算低层critic的returns（dense，每步都更新）
-            # 这部分保持原有的逻辑，用于低层策略
-            # self.high_returns[step] = ... (如果需要的话)
+            # 3. 使用 goal_dones 作为掩码来判断是否为决策点
+            is_decision = self.goal_dones[step]  # [num_processes, 1], 值为0或1
             
             # 4. 计算高层actor的advantage（sparse，仅在决策点）
-            if self.goal_dones[step] > 0.5:  # 这是一个决策点
-                curr_value = self.high_values[step]
-                
-                # 折扣因子：gamma^k，k是从当前决策点到下一个决策点的步数
-                discount_factor = gamma ** step_count  # step_count已经+1了，所以-1
-                # GAE衰减因子: gamma^k * tau
-                gae_discount = gamma ** step_count * tau
-                
-                # TD误差：累积奖励 + 折扣的下一个决策点价值 - 当前价值
-                # delta = R_acc + gamma^k * V_next - V_curr
-                delta = accumulated_reward + discount_factor * next_decision_value * self.masks[step + 1] - curr_value
-                
-                # GAE更新
-                # A_t = delta + (gamma * tau)^k * A_next
-                gae = delta + gae_discount * last_gae
+            curr_value = self.high_values[step]
+            
+            # 折扣因子：gamma^k，k是从当前决策点到下一个决策点的步数
+            discount_factor = gamma ** step_count
+            # GAE衰减因子: gamma^k * tau
+            gae_discount = gamma ** step_count * tau
+            
+            # TD误差：累积奖励 + 折扣的下一个决策点价值 - 当前价值
+            mask_next = self.masks[step + 1] if step < self.high_rewards.size(0) - 1 else torch.ones_like(curr_value)
+            delta = accumulated_reward + discount_factor * next_decision_value * mask_next - curr_value
+            
+            # GAE更新
+            gae = delta + gae_discount * last_gae
 
-                # 存储返回值（高层策略的advantage）
-                self.high_returns[step] = gae + curr_value
-                
-                # 重置，为上一个决策点做准备
-                last_gae = gae
-                next_decision_value = curr_value
-                accumulated_reward = torch.zeros_like(self.high_rewards[0])
-                step_count = torch.zeros_like(self.high_rewards[0])
-            else:
-                # 非决策点：advantage为0（或者不更新high_returns，保持为0）
-                self.high_returns[step] = torch.zeros_like(self.high_values[step])
-                # 注意：累积的reward和step_count会继续传递到上一个决策点
+            # 使用掩码选择：如果是决策点，使用 gae + curr_value；否则使用 0
+            self.high_returns[step] = is_decision * (gae + curr_value)
+            
+            # 更新累积变量（只在决策点重置）
+            # 如果是决策点(is_decision=1)，重置为当前值；否则(is_decision=0)保持累积
+            last_gae = is_decision * gae + (1 - is_decision) * last_gae
+            next_decision_value = is_decision * curr_value + (1 - is_decision) * next_decision_value
+            accumulated_reward = (1 - is_decision) * accumulated_reward  # 决策点重置为0
+            step_count = (1 - is_decision) * step_count  # 决策点重置为0
 
 
     def feed_forward_generator(self, advantages, num_mini_batch, sampler=None):

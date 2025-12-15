@@ -583,30 +583,6 @@ class MPNN(nn.Module):
 
         return value, action, action_log_probs
 
-    def critic_value(self, env_state, task, mask=None):
-        # env_state should be (<batch_size, env_dim>)
-        # task should be (<batch_size, task_dim>)
-        # mask should be (<batch_size, 1>)
-
-        # expand task to global_task
-        batch_size = task.size(0)
-        num_processes = batch_size // self.num_agents
-        task_global = task.view(self.num_agents, num_processes, self.task_dim).transpose(0, 1).contiguous().view(num_processes, self.num_agents * self.task_dim)
-        task = task_global.repeat_interleave(self.num_agents, dim=0) # should be <batch_size, task_dim * num_agents>
-
-        x = torch.cat((env_state, task), dim=1) # should be <batch_size, env_dim + task_dim>
-        # 通过共享主干
-        share_features = self.critic_shared(x) # should be <batch_size, h_dim * 2>
-        # 逐个计算后拼接
-        values = []
-        for i in range(self.num_agents):
-            share_feature_i = share_features[i*num_processes:(i+1)*num_processes]
-            value_i = self.critic_heads[i](share_feature_i)
-            values.append(value_i)
-
-        x = torch.cat(values, dim=0)
-        return x
-
     def act(self, inp, state, env_state, mask=None, deterministic=False):
         """
         inp: [batch_size, dim_o]
@@ -699,10 +675,10 @@ class MPNN(nn.Module):
         # 4. 计算决策头的 log_probs 和 entropy
         # =====================================================
         decision_probs = F.softmax(masked_decision_logits, dim=-1)  # [batch, 2]
-        dist_decision = Categorical(decision_probs)
+        dist_decision = TorchCategorical(probs=decision_probs)
         
         # 计算给定动作的 log_prob
-        decision_log_probs = dist_decision.log_probs(tasks.squeeze(-1)).unsqueeze(-1)  # [batch, 1]
+        decision_log_probs = dist_decision.log_prob(tasks.squeeze(-1))  # [batch]
         
         # 计算每个样本的熵
         decision_entropy = dist_decision.entropy()  # [batch]
@@ -711,7 +687,7 @@ class MPNN(nn.Module):
         # 5. 计算探索头的 log_probs 和 entropy
         # =====================================================
         heatmap_probs = F.softmax(heatmap_logits, dim=-1)  # [batch, 10000]
-        dist_map = Categorical(heatmap_probs)
+        dist_map = TorchCategorical(probs=heatmap_probs)
         
         # 将 goals [batch, 2] 转换为 flat_idx [batch]
         goals_x = goals[:, 0].long()  # [batch]
@@ -719,7 +695,7 @@ class MPNN(nn.Module):
         flat_idx = goals_y * 100 + goals_x  # [batch]
         
         # 计算给定导航点的 log_prob
-        map_log_probs = dist_map.log_probs(flat_idx).unsqueeze(-1)  # [batch, 1]
+        map_log_probs = dist_map.log_prob(flat_idx)  # [batch]
         
         # 计算每个样本的熵
         waypoint_entropy = dist_map.entropy()  # [batch]

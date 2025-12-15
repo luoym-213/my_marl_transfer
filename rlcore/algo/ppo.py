@@ -199,7 +199,7 @@ class JointPPO():
 
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
 
-    def update(self, rollouts_list):
+    def update(self, rollouts_list, dense_critic=True):
         """
         支持双头Actor的PPO更新:
         - 决策头: 生成 [explore=0, collect=1]
@@ -212,7 +212,7 @@ class JointPPO():
         # rollouts_list - list of rollouts of agents which share self.actor_critic policy
         advantages_list = []
         for rollout in rollouts_list:
-            advantages = rollout.high_returns[:-1] - rollout.high_value[:-1]
+            advantages = rollout.high_returns[:-1] - rollout.high_values[:-1]
             # 非决策点不参与归一化，只在决策点上计算均值和方差
             #advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
             advantages_list.append(advantages) # [num_steps, num_processes, 1]
@@ -290,7 +290,7 @@ class JointPPO():
                     waypoint_entropy_masked = torch.tensor(0.0, device=high_values.device)
 
                 # === 4. Critic Loss（密集更新：所有点）===
-                if self.dense_critic:
+                if dense_critic:
                     # 密集 Critic：使用全部数据
                     if self.use_clipped_value_loss:
                         value_pred_clipped = high_value_preds_batch + \

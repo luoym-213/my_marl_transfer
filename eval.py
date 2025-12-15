@@ -86,9 +86,9 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         # Initialize frame collection for GIF
         frames = []
         
-        # Initialize goals to None at the start of each episode
-        goals = None
-        
+        # Initialize goals to None at the start of each episode，初始化为tensor,0
+        goals = torch.zeros((len(obs), 2), dtype=torch.float32, device=args.device)
+
         # Initial render for GIF saving (if needed)
         if should_save_gif:
             attn = None if not render_attn else master.team_attn
@@ -125,13 +125,13 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             step_data = {'agents_actions': actions, 'agents_goals': goals} 
             if isinstance(step_data['agents_goals'], torch.Tensor):
                 step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
-            obs, reward, done, info, env_states = env.step(step_data)
-            high_rewards = torch.from_numpy(np.array([info[i]['high_level_rewards'] for i in range(args.num_processes)])).float().to(args.device) # shape: [num_processes , num_agents]
+            obs, reward, high_reward, done, info, env_states = env.step(step_data)
+            high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             obs = normalize_obs(obs, obs_mean, obs_std)
             master.envs_info = info
             episode_rewards += np.array(reward)
-            episode_high_rewards += high_rewards.cpu().numpy()
+            episode_high_rewards += high_reward.cpu().numpy()
             
             # Render for GIF saving (if needed)
             if should_save_gif:
