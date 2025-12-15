@@ -35,6 +35,9 @@ class GlobalBeliefMap:
 
         self.epsilon = 1e-10
         self.landmark_heatmap = self.get_landmarks_heatmap()
+
+        # 目标发现阈值
+        self.belief_threshold = 0.95
         
     def _precompute_cell_centers(self):
         """预计算每个栅格中心点的世界坐标"""
@@ -296,9 +299,20 @@ class GlobalBeliefMap:
         
         return stats
     
-    def detect_targets(self, belief_threshold=0.95):
-        """检测信念地图中的目标点"""
-        binary_map = (self.belief_grid > belief_threshold).astype(np.int8)
+    def detect_targets(self):
+        """
+        检测信念地图中的目标点
+        returns:
+            dict: {
+                'binary_map': 二值化地图,
+                'num_targets': 目标点数量,
+                'target_positions': 目标点世界坐标列表,
+                'target_grid_positions': 目标点栅格索引列表,
+                'cluster_sizes': 每个目标点对应的簇大小列表,
+                'cluster_labels': 簇标签地图
+            }
+        """
+        binary_map = (self.belief_grid > self.belief_threshold).astype(np.int8)
         
         structure = np.ones((3, 3), dtype=np.int8)
         cluster_labels, num_clusters = label(binary_map, structure=structure)
@@ -331,9 +345,9 @@ class GlobalBeliefMap:
             'cluster_labels': cluster_labels
         }
     
-    def get_target_positions(self, belief_threshold=0.95, min_cluster_size=1):
+    def get_target_positions(self, min_cluster_size=1):
         """直接返回检测到的目标点世界坐标"""
-        result = self.detect_targets(belief_threshold)
+        result = self.detect_targets()
         
         if min_cluster_size > 1:
             filtered_positions = []
@@ -344,9 +358,9 @@ class GlobalBeliefMap:
         
         return result['target_positions']
     
-    def visualize_detected_targets(self, belief_threshold=0.95):
+    def visualize_detected_targets(self):
         """可视化检测到的目标点"""
-        result = self.detect_targets(belief_threshold)
+        result = self.detect_targets()
         
         vis_map = result['cluster_labels'].astype(np.float32)
         
@@ -357,9 +371,9 @@ class GlobalBeliefMap:
         result['visualization_map'] = vis_map
         return result
     
-    def get_targets_summary(self, belief_threshold=0.95):
+    def get_targets_summary(self):
         """获取目标检测的摘要信息"""
-        result = self.detect_targets(belief_threshold)
+        result = self.detect_targets()
         
         summary = {
             'num_targets': result['num_targets'],
@@ -721,3 +735,79 @@ class GlobalBeliefMap:
             heatmap = np.maximum(heatmap, landmark_heatmap)
         
         return heatmap.astype(np.float32)
+    
+    def get_agent_step_rewards(self, agent_positions, radius, discover_reward_scale=1.0):
+        """
+        计算每个智能体在其观测范围内的探索熵奖励和发现目标奖励
+        
+        探索奖励：r_explore^i = Entropy(M_{t-1}) - Entropy(M_{t-1} ∪ O_t^i)
+        发现奖励：r_discover^i = sum_{c in FOV_i} max(0, b_c^new - b_c^old)
+        
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            radius: 观测半径
+            discover_reward_scale: 发现奖励的缩放系数
+        
+        返回:
+            dict: {
+                'explore_rewards': 列表，每个元素是对应智能体的探索奖励
+                'discover_rewards': 列表，每个元素是对应智能体的发现目标奖励
+            }
+        """
+        if len(agent_positions) == 0:
+            return {'explore_rewards': [], 'discover_rewards': []}
+        
+        # 保存当前地图状态
+        original_belief_grid = self.belief_grid.copy()
+        
+        # 计算当前地图的总熵 Entropy(M_{t-1})
+        original_entropy_map = self.compute_shannon_entropy()
+        original_total_entropy = np.sum(original_entropy_map)
+        
+        explore_rewards = []
+        discover_rewards = []
+        
+        # 对每个智能体单独计算两种奖励
+        for agent_pos in agent_positions:
+            # 1. 恢复原始地图状态
+            self.belief_grid = original_belief_grid.copy()
+            
+            # 2. 获取当前智能体的观测范围
+            fov_mask = self.get_fov_mask(agent_pos, radius)
+            
+            # 正向更新：被观测到 且 包含 landmark 的区域
+            positive_mask = fov_mask & self.landmark_map
+            # 负向更新：被观测到 但 不包含 landmark 的区域
+            negative_mask = fov_mask & (~self.landmark_map)
+            
+            # 3. 执行贝叶斯更新
+            self.bayesian_update(positive_mask, negative_mask)
+            
+            # 4. 计算探索奖励（熵减少量）
+            updated_entropy_map = self.compute_shannon_entropy()
+            updated_total_entropy = np.sum(updated_entropy_map)
+            explore_reward = original_total_entropy - updated_total_entropy
+            explore_rewards.append(float(explore_reward))
+            
+            # 5. 计算发现目标奖励（信念正向增量）
+            delta_belief = self.belief_grid - original_belief_grid
+            positive_delta = np.maximum(0, delta_belief[fov_mask])
+            total_discover = np.sum(positive_delta)
+            discover_reward = total_discover * discover_reward_scale
+            discover_rewards.append(float(discover_reward))
+        
+        # 恢复原始地图状态
+        self.belief_grid = original_belief_grid
+        
+        return {
+            'explore_rewards': explore_rewards,
+            'discover_rewards': discover_rewards
+        }
+
+    def get_agent_step_explore_entropy(self, agent_positions, radius, sigma=None, clip_outside=True):
+        """向后兼容的探索熵奖励接口"""
+        return self.get_agent_step_rewards(agent_positions, radius)['explore_rewards']
+
+    def get_agent_discover_target_reward(self, agent_positions, radius, reward_value=1.0):
+        """向后兼容的发现目标奖励接口"""
+        return self.get_agent_step_rewards(agent_positions, radius, reward_value)['discover_rewards']

@@ -49,6 +49,10 @@ class MultiAgentEnv(gym.Env):
         # configure spaces
         self.action_space = []
         self.observation_space = []
+
+        # 初始化已访问目标集合
+        self.visited_landmarks = set()
+
         for agent in self.agents:
             total_action_space = []
             # physical action space
@@ -137,9 +141,19 @@ class MultiAgentEnv(gym.Env):
 
         # advance world state
         self.world.step()
+        print("World Step:", self.world.steps)
 
         # 收集当前智能体位置
         agents_pos = np.array([a.state.p_pos for a in self.agents])
+        landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
+
+        # 必须在更新全图信息图前获取高层奖励，因为高层奖励依赖于step前的全局信息图
+        agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
+        agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
+        agents_reach_target_rewards = self.get_target_reward(agents_pos, landmark_positions)
+        total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards)
+
+        # print(total_high_rewards.shape)
 
         # 根据获取的全局状态更新全局信息图
         if self.enable_exploration_reward:
@@ -159,10 +173,12 @@ class MultiAgentEnv(gym.Env):
         info_n['belief_map'] = self.global_belief_map.belief_grid
         info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos)
-        info_n['distance_fields'] = self.global_belief_map.get_distance_field(agents_pos, normalize=True)
+        info_n['distance_fields'] = self.global_belief_map.get_distance_fields(agents_pos, normalize=True)
         info_n['goal_done'] = self._get_goal_dones(self.agents)
-        info_n['heatmap'] = self.global_belief_map.get_combined_heatmap(agents_pos,0.05)
+        info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
+        info_n['high_level_rewards'] = total_high_rewards.tolist()
+        print("high level rewards:", info_n['high_level_rewards'])
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
@@ -193,6 +209,10 @@ class MultiAgentEnv(gym.Env):
         # reset world
         self.reset_callback(self.world)
         landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
+
+        # 重置已访问目标集合
+        self.visited_landmarks = set()
+
         # 重置global_belief_map
         # 根据智能体初始位置，预先更新地图
         if self.enable_exploration_reward:
@@ -218,14 +238,15 @@ class MultiAgentEnv(gym.Env):
         reset_info['map'].append(target_positions)
 
         # 将高层策略需要的通道图、是否达到目标点分别加入
+        
         reset_info['belief_map'] = self.global_belief_map.belief_grid
         reset_info['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         reset_info['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agent_positions)
-        reset_info['distance_fields'] = self.global_belief_map.get_distance_field(agent_positions, normalize=True)
-        reset_info['heatmap'] = self.global_belief_map.get_combined_heatmap(agent_positions, 0.05)
+        reset_info['distance_fields'] = self.global_belief_map.get_distance_fields(agent_positions, normalize=True)
+        reset_info['heatmap'] = self.global_belief_map.get_agents_heatmap(agent_positions, 0.05)
         reset_info['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
-        # reset下，goal_done全部为False
-        reset_info['goal_done'] = [False] * len(self.agents)
+        # reset下，goal_done全部为True
+        reset_info['goal_done'] = [True] * len(self.agents)
 
         return obs_n, state, reset_info
     
@@ -362,8 +383,8 @@ class MultiAgentEnv(gym.Env):
         # check if high-level goal is achieved
         # agent pos: agent.state.p_pos
         # goal pos: agent.state.g_pos
-        # threshold: self.world.dist_threshold
-        return [np.linalg.norm(agent.state.p_pos - agent.state.g_pos) < self.world.dist_threshold for agent in agents]
+        # threshold: self.world.dist_thres
+        return [np.linalg.norm(agent.state.p_pos - agent.state.g_pos) < self.world.dist_thres for agent in agents]
 
     # reset rendering assets
     def _reset_render(self):
@@ -676,6 +697,46 @@ class MultiAgentEnv(gym.Env):
 
     def get_obs(self):
         return [self._get_obs(agent) for agent in self.agents]
+    
+    def get_target_reward(self, agents_pos, landmarks_pos):
+        """
+        如果智能体到达目标点，如果这个目标点未访问过，返回一个奖励值，否则返回0。
+        判断准则，距离差小于world.dist_thres
+        
+        参数:
+            agents_pos: 智能体位置数组，shape (n_agents, 2)
+            landmarks_pos: 目标点位置列表，每个元素是 (x, y)
+        
+        返回:
+            rewards: 列表，每个智能体的目标到达奖励
+        """
+        # 初始化已访问目标集合（需要在 __init__ 中定义）
+        if not hasattr(self, 'visited_landmarks'):
+            self.visited_landmarks = set()
+        
+        rewards = []
+        TARGET_REWARD = 10.0  # 到达新目标的奖励值
+        
+        for agent_idx, agent_pos in enumerate(agents_pos):
+            agent_reward = 0.0
+            
+            # 检查该智能体是否到达任何目标点
+            for landmark_idx, landmark_pos in enumerate(landmarks_pos):
+                # 计算到目标点的距离
+                dist = np.linalg.norm(agent_pos - landmark_pos)
+                
+                # 如果距离小于阈值，认为到达目标
+                if dist < self.world.dist_thres:
+                    # 检查该目标是否已被访问过
+                    if landmark_idx not in self.visited_landmarks:
+                        # 首次访问该目标，给予奖励并标记为已访问
+                        agent_reward = TARGET_REWARD
+                        self.visited_landmarks.add(landmark_idx)
+                        break  # 一个智能体在一个step只能获得一次目标奖励
+            
+            rewards.append(agent_reward)
+        
+        return rewards
 
 # vectorized wrapper for a batch of multi-agent environments
 # assumes all environments have the same observation and action space

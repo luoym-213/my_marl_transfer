@@ -12,12 +12,12 @@ class RolloutStorage(object):
         self.obs = torch.zeros(num_steps + 1, num_processes, *obs_shape)
         self.recurrent_hidden_states = torch.zeros(num_steps + 1, num_processes, recurrent_hidden_state_size)
         self.env_states = torch.zeros(num_steps + 1, num_processes, num_agent*6)
-        self.rewards = torch.zeros(num_steps, num_processes, 1)
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
         self.num_steps = num_steps
         self.step = 0
 
         # 低层策略存储相关
+        self.rewards = torch.zeros(num_steps, num_processes, 1)
         self.actions = torch.zeros(num_steps, num_processes, 1)
         self.actions = self.actions.long()
         self.action_log_probs = torch.zeros(num_steps, num_processes, 1)
@@ -25,10 +25,11 @@ class RolloutStorage(object):
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
         
         # 高层策略存储相关
+        self.high_rewards = torch.zeros(num_steps, num_processes, 1)
         self.map_obs = torch.zeros(num_steps, num_processes, 4, 100, 100)  # 高层输入的地图观测
-        self.vec_obs = torch.zeros(num_steps, num_processes, num_agent*6)  # 高层输入的矢量观测
+        self.vec_obs = torch.zeros(num_steps, num_processes, 5)  # 高层输入的矢量观测
         self.critic_maps = torch.zeros(num_steps, num_processes, 4, 100, 100)  # 高层critic的地图输入,用于计算高层价值
-        self.tasks = torch.zeros(num_steps, num_processes, 1)   # action_mode: explore=0, collect=1
+        self.tasks = torch.zeros(num_steps, num_processes, 1, dtype=torch.long)   # action_mode: explore=0, collect=1
         self.goals = torch.zeros(num_steps, num_processes, 2)   # final_target: [x_goal, y_goal]
         self.map_log_probs = torch.zeros(num_steps, num_processes, 1)
         self.decision_log_probs = torch.zeros(num_steps, num_processes, 1)
@@ -41,17 +42,18 @@ class RolloutStorage(object):
         # 环境基础信息
         self.obs = self.obs.to(device)
         self.recurrent_hidden_states = self.recurrent_hidden_states.to(device)
-        self.rewards = self.rewards.to(device)
         self.env_states = self.env_states.to(device)
         self.masks = self.masks.to(device)
 
         # 低层策略存储相关
+        self.rewards = self.rewards.to(device)
         self.actions = self.actions.to(device)
         self.action_log_probs = self.action_log_probs.to(device)
         self.value_preds = self.value_preds.to(device)
         self.returns = self.returns.to(device)
         
         # 高层策略存储相关
+        self.high_rewards = self.high_rewards.to(device)
         self.map_obs = self.map_obs.to(device)
         self.vec_obs = self.vec_obs.to(device)
         self.critic_maps = self.critic_maps.to(device)
@@ -64,7 +66,7 @@ class RolloutStorage(object):
         self.goal_dones = self.goal_dones.to(device)
 
     def insert(self, obs, actions, action_log_probs, value_preds, 
-               rewards, masks, env_states, 
+               rewards, high_rewards, masks, env_states, 
                map_obs, vec_obs, critic_maps,
                goals, task, 
                map_log_probs, decision_log_probs, 
@@ -81,10 +83,10 @@ class RolloutStorage(object):
         self.value_preds[self.step].copy_(value_preds)
         
         # 高层策略存储相关
+        self.high_rewards[self.step].copy_(high_rewards)
         self.map_obs[self.step].copy_(map_obs)
         self.vec_obs[self.step].copy_(vec_obs)
         self.critic_maps[self.step].copy_(critic_maps)
-
         self.goals[self.step].copy_(goals)
         self.tasks[self.step].copy_(task)
         self.map_log_probs[self.step].copy_(map_log_probs)
@@ -124,14 +126,14 @@ class RolloutStorage(object):
         self.high_values[-1] = next_high_value
         
         # 初始化：这些变量维护"未来"的信息
-        last_gae = torch.zeros_like(self.rewards[0])
+        last_gae = torch.zeros_like(self.high_rewards[0])
         next_decision_value = next_high_value  # Buffer外的值V(s_T+1)
-        accumulated_reward = torch.zeros_like(self.rewards[0])
-        step_count = torch.zeros_like(self.rewards[0])  # 用于计算gamma^k，两个决策点之间的步数
-        
-        for step in reversed(range(self.rewards.size(0))):
+        accumulated_reward = torch.zeros_like(self.high_rewards[0])
+        step_count = torch.zeros_like(self.high_rewards[0])  # 用于计算gamma^k，两个决策点之间的步数
+
+        for step in reversed(range(self.high_rewards.size(0))):
             # 1. 处理环境Done（mask=0表示episode结束）
-            if step < self.rewards.size(0) - 1: # 非最后一步
+            if step < self.high_rewards.size(0) - 1: # 非最后一步
                 # 如果环境结束，重置所有累积量,如果 step+1 是 done，那么未来的链条断开
                 accumulated_reward = accumulated_reward * self.masks[step + 1]
                 step_count = step_count * self.masks[step + 1]
@@ -139,7 +141,7 @@ class RolloutStorage(object):
                 last_gae = last_gae * self.masks[step + 1]
         
             # 2. 累积奖励（所有步都累积，包括决策点和非决策点）
-            accumulated_reward = self.rewards[step] + gamma * accumulated_reward
+            accumulated_reward = self.high_rewards[step] + gamma * accumulated_reward
             step_count = step_count + 1
             
             # 3. 计算低层critic的returns（dense，每步都更新）
@@ -169,8 +171,8 @@ class RolloutStorage(object):
                 # 重置，为上一个决策点做准备
                 last_gae = gae
                 next_decision_value = curr_value
-                accumulated_reward = torch.zeros_like(self.rewards[0])
-                step_count = torch.zeros_like(self.rewards[0])
+                accumulated_reward = torch.zeros_like(self.high_rewards[0])
+                step_count = torch.zeros_like(self.high_rewards[0])
             else:
                 # 非决策点：advantage为0（或者不更新high_returns，保持为0）
                 self.high_returns[step] = torch.zeros_like(self.high_values[step])

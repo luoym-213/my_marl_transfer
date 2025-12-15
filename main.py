@@ -31,13 +31,15 @@ def train(args, return_early=False):
     n = len(master.all_agents)
     episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
     final_rewards = torch.zeros([args.num_processes, n], device=args.device)
+    episode_high_rewards = torch.zeros([args.num_processes, n], device=args.device)
+    final_high_rewards = torch.zeros([args.num_processes, n], device=args.device)
 
     # start simulations
     start = datetime.datetime.now()
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
-                #print("step: ", step)
+                print("step: ", step)
                 actions_list, goals_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             agent_goals = np.transpose(np.array(goals_list),(1,0,2))
@@ -46,15 +48,20 @@ def train(args, return_early=False):
             step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i]} for i in range(args.num_processes)]
             obs, reward, done, info, env_state = envs.step(step_data)
             master.envs_info = info
+            high_rewards = torch.from_numpy(np.array([info[i]['high_level_rewards'] for i in range(args.num_processes)])).float().to(args.device) # shape: [num_processes , num_agents]
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
+            episode_high_rewards += high_rewards
             masks = torch.FloatTensor(1-1.0*done).to(args.device)
             goal_dones = torch.FloatTensor([info[i]['goal_done'] for i in range(args.num_processes)]).to(args.device)
             final_rewards *= masks
             final_rewards += (1 - masks) * episode_rewards
+            final_high_rewards *= masks
+            final_high_rewards += (1 - masks) * episode_high_rewards
             episode_rewards *= masks
+            episode_high_rewards *= masks
 
-            master.update_rollout(obs, reward, masks, env_state, goal_dones)
+            master.update_rollout(obs, reward, high_rewards, masks, env_state, goal_dones)
 
         master.wrap_horizon()
         return_vals = master.update()
@@ -80,25 +87,38 @@ def train(args, return_early=False):
         if j%args.log_interval == 0:
             end = datetime.datetime.now()
             seconds = (end-start).total_seconds()
-            mean_reward = final_rewards.mean(dim=0).cpu().numpy()
-            print("Updates {} | Num timesteps {} | Time {} | FPS {}\nMean reward {}\nEntropy {:.4f} Value loss {:.4f} Policy loss {:.4f}\n" \
+            mean_low_reward = final_rewards.mean(dim=0).cpu().numpy()
+            mean_high_reward = final_high_rewards.mean(dim=0).cpu().numpy()
+            print("Updates {} | Num timesteps {} | Time {} | FPS {} \
+                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} lowPolicy loss {:.4f} \
+                  \nMean high reward {} Decision Entropy {:.4f} Waypoint Entropy {:.4f} high Value loss {:.4f} high Decision loss {:.4f} high Waypoint loss {:.4f}\n "
             .format(j, total_num_steps, str(end-start), int(total_num_steps / seconds), 
-                  mean_reward, dist_entropy[0], value_loss[0], action_loss[0]))
+                  mean_low_reward, dist_low_entropy[0], value_low_loss[0], action_low_loss[0],
+                  mean_high_reward, decision_entropy[0], waypoint_entropy[0], value_high_loss[0],
+                  decision_high_loss[0], waypoint_high_loss[0]))
+            
             if not args.test:
                 for idx in range(n):
-                    writer.add_scalar('agent'+str(idx)+'/training_reward', mean_reward[idx], j)
+                    writer.add_scalar('agent'+str(idx)+'/training_low_reward', mean_low_reward[idx], j)
+                    writer.add_scalar('agent'+str(idx)+'/training_high_reward', mean_high_reward[idx], j)
 
-                writer.add_scalar('all/value_loss', value_loss[0], j)
-                writer.add_scalar('all/action_loss', action_loss[0], j)
-                writer.add_scalar('all/dist_entropy', dist_entropy[0], j)
+                writer.add_scalar('all/low_value_loss', value_low_loss[0], j)
+                writer.add_scalar('all/action_low_loss', action_low_loss[0], j)
+                writer.add_scalar('all/dist_low_entropy', dist_low_entropy[0], j)
+                writer.add_scalar('all/high_value_loss', value_high_loss[0], j)
+                writer.add_scalar('all/decision_high_loss', decision_high_loss[0], j)
+                writer.add_scalar('all/waypoint_high_loss', waypoint_high_loss[0], j)
+                writer.add_scalar('all/decision_entropy', decision_entropy[0], j)
+                writer.add_scalar('all/waypoint_entropy', waypoint_entropy[0], j)
 
         if args.eval_interval is not None and j%args.eval_interval==0:
             ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)
             print('===========================================================================================')
-            _, eval_perstep_rewards, final_min_dists, num_success, eval_episode_len, _, _ = evaluate(args, None, master.all_policies,
+            _, eval_perstep_rewards, _, eval_high_perstep_rewards, final_min_dists, num_success, eval_episode_len, _, _ = evaluate(args, None, master.all_policies,
                                                                                                ob_rms=ob_rms, env=eval_env,
                                                                                                master=eval_master, render=args.render)
             print('Evaluation {:d} | Mean per-step reward {:.2f}'.format(j//args.eval_interval, eval_perstep_rewards.mean()))
+            print('Mean high-level per-step reward {:.2f}'.format(eval_high_perstep_rewards.mean()))
             print('Num success {:d}/{:d} | Episode Length {:.2f}'.format(num_success, args.num_eval_episodes, eval_episode_len))
             if final_min_dists:
                 print('Final_dists_mean {}'.format(np.stack(final_min_dists).mean(0)))
@@ -110,6 +130,7 @@ def train(args, return_early=False):
                 writer.add_scalar('all/episode_length', eval_episode_len, j)
                 for idx in range(n):
                     writer.add_scalar('agent'+str(idx)+'/eval_per_step_reward', eval_perstep_rewards.mean(0)[idx], j)
+                    writer.add_scalar('agent'+str(idx)+'/eval_high_per_step_reward', eval_high_perstep_rewards.mean(0)[idx], j)
                     if final_min_dists:
                         writer.add_scalar('agent'+str(idx)+'/eval_min_dist', np.stack(final_min_dists).mean(0)[idx], j)
 

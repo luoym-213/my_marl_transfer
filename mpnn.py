@@ -5,6 +5,7 @@ from rlcore.distributions import Categorical
 import torch.nn.functional as F
 import math
 from scipy.optimize import linear_sum_assignment  # 匈牙利算法
+from torch.distributions import Categorical as TorchCategorical
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -407,44 +408,51 @@ class MPNN(nn.Module):
     
         # 1. 决策动作
         decision_probs = F.softmax(masked_decision_logits, dim=-1)
-        dist_mode = Categorical(decision_probs)
+        dist_mode = TorchCategorical(probs=decision_probs)
     
         if deterministic:
             action_mode = torch.argmax(decision_probs, dim=-1)
         else:
-            action_mode = dist_mode.sample()
-    
+            action_mode = dist_mode.sample().squeeze(-1)    # [batch]
+
+
+
         # ✅ 计算决策动作的 log_prob
-        decision_log_prob = dist_mode.log_probs(action_mode)  # [Batch]
+        decision_log_prob = dist_mode.log_prob(action_mode)  # [Batch]
     
         # 2. 导航点动作
-        heatmap_probs = F.softmax(heatmap_logits, dim=-1)
-        dist_map = Categorical(heatmap_probs)
-    
+        heatmap_probs = F.softmax(heatmap_logits, dim=-1)   # [Batch, 10000]
+        dist_map = TorchCategorical(probs=heatmap_probs)
+
         if deterministic:
             flat_idx = torch.argmax(heatmap_probs, dim=-1)
         else:
-            flat_idx = dist_map.sample()
+            flat_idx = dist_map.sample().squeeze(-1)    # [batch]
     
         # ✅ 计算导航点动作的 log_prob
-        map_log_prob = dist_map.log_probs(flat_idx)  # [Batch]
+        map_log_prob = dist_map.log_prob(flat_idx)  # [Batch]
     
         # 3. 转换坐标
         y_coords = flat_idx // 100
         x_coords = flat_idx % 100
+        if x_coords.dim() > 1:
+            x_coords = x_coords.squeeze(-1)  # 移除最后一维
+        if y_coords.dim() > 1:
+            y_coords = y_coords.squeeze(-1)
 
         # 4. 根据决策调整导航点
         target_x = vec_inp[:, 3]
         target_y = vec_inp[:, 4]
-        collect_mask = (action_mode == 1)
+        collect_mask = (action_mode == 1)  # [Batch]
         x_coords = torch.where(collect_mask, target_x.long(), x_coords)
         y_coords = torch.where(collect_mask, target_y.long(), y_coords)
+        waypoints = torch.stack([x_coords, y_coords], dim=1).float()  # [Batch, 2]
         
         return {
-            "action_mode": action_mode,              # [Batch]
-            "waypoints": [x_coords, y_coords],       # [Batch,2]
-            "decision_log_prob": decision_log_prob,  # ✅ [Batch] 标量
-            "map_log_prob": map_log_prob,            # ✅ [Batch] 标量
+            "action_modes": action_mode.unsqueeze(-1),              # [Batch, 1]
+            "waypoints": waypoints,                   # [Batch,2]
+            "decision_log_probs": decision_log_prob.unsqueeze(-1),  # ✅ [Batch, 1] 标量
+            "map_log_probs": map_log_prob.unsqueeze(-1)            # ✅ [Batch, 1] 标量
         }
     
     def get_high_value(self, map_inp, vec_inp):

@@ -24,8 +24,8 @@ class Neo(object):
     self.critic_map = None
     self.goal = None
     self.task = None
-    self.map_log_probs = None
-    self.decision_log_probs = None
+    self.map_log_prob = None
+    self.decision_log_prob = None
     self.high_value = None
 
   def load_model(self, policy_state):
@@ -39,12 +39,12 @@ class Neo(object):
     # this function is called at the start of episode
     self.rollouts.env_states[0].copy_(env_state)
 
-  def update_rollout(self, obs, reward, mask, env_state, goal_dones):
+  def update_rollout(self, obs, reward, high_reward, mask, env_state, goal_dones):
     self.rollouts.insert(obs, self.action, self.action_log_prob, self.value, 
-                         reward, mask, env_state, 
+                         reward, high_reward, mask, env_state, 
                          self.map_obs, self.vec_obs, self.critic_map,
                          self.goal, self.task, 
-                         self.map_log_probs, self.decision_log_probs, 
+                         self.map_log_prob, self.decision_log_prob, 
                          self.high_value, goal_dones)
 
   def act(self, step, deterministic=False):

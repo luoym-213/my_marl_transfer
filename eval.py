@@ -43,6 +43,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     num_eval_episodes = args.num_eval_episodes
     all_episode_rewards = np.full((num_eval_episodes, env.n), 0.0)
     per_step_rewards = np.full((num_eval_episodes, env.n), 0.0)
+    all_high_episode_rewards = np.full((num_eval_episodes, env.n), 0.0)
+    per_high_step_rewards = np.full((num_eval_episodes, env.n), 0.0)
 
     # TODO: provide support for recurrent policies and mask
     recurrent_hidden_states = None
@@ -72,6 +74,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         obs = normalize_obs(obs, obs_mean, obs_std)
         done = [False]*env.n
         episode_rewards = np.full(env.n, 0.0)
+        episode_high_rewards = np.full(env.n, 0.0)
         episode_steps = 0
         
         # Determine rendering behavior
@@ -123,10 +126,12 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             if isinstance(step_data['agents_goals'], torch.Tensor):
                 step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
             obs, reward, done, info, env_states = env.step(step_data)
+            high_rewards = torch.from_numpy(np.array([info[i]['high_level_rewards'] for i in range(args.num_processes)])).float().to(args.device) # shape: [num_processes , num_agents]
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             obs = normalize_obs(obs, obs_mean, obs_std)
             master.envs_info = info
             episode_rewards += np.array(reward)
+            episode_high_rewards += high_rewards.cpu().numpy()
             
             # Render for GIF saving (if needed)
             if should_save_gif:
@@ -161,6 +166,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                     time.sleep(0.08)
 
         per_step_rewards[t] = episode_rewards/episode_steps
+        per_high_step_rewards[t] = episode_high_rewards/episode_steps
         num_success += info['n'][0]['is_success']
         episode_length = (episode_length*t + info['n'][0]['world_steps'])/(t+1)
         
@@ -179,6 +185,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             print("Ep {} | Success: {} \n Av per-step reward: {:.2f} | Ep Length {}".format(t,info['n'][0]['is_success'],
                 per_step_rewards[t][0],info['n'][0]['world_steps']))
         all_episode_rewards[t, :] = episode_rewards # all_episode_rewards shape: num_eval_episodes x num agents
+        all_high_episode_rewards[t, :] = episode_high_rewards # all_episode_rewards shape: num_eval_episodes x num agents
 
         # Save GIF for this episode
         if should_save_gif and frames:
@@ -198,7 +205,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     if successful_episodes_count > 0:
         successful_average_length = successful_steps_total / successful_episodes_count
 
-    return all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count
+    return all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count
 
 
 if __name__ == '__main__':
@@ -206,7 +213,7 @@ if __name__ == '__main__':
     checkpoint = torch.load(args.load_dir, map_location=lambda storage, loc: storage)
     policies_list = checkpoint['models']
     ob_rms = checkpoint['ob_rms']
-    all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count = evaluate(args, args.seed, 
+    all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count = evaluate(args, args.seed, 
                     policies_list, ob_rms, args.render, render_attn=args.masking)
     print("Average Per Step Reward {}\nNum Success {}/{} | Av. Episode Length {:.2f})"
             .format(per_step_rewards.mean(0),num_success,args.num_eval_episodes,episode_length))

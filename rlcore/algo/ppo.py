@@ -429,7 +429,7 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     - Actor Loss 只在决策点计算
     - Critic Loss 可以在所有点计算（密集）
     """
-    num_steps, num_processes = rollouts_list[0].rewards.size()[0:2]
+    num_steps, num_processes = rollouts_list[0].high_rewards.size()[0:2]
     
     # 收集所有agent的数据
     all_env_states = []
