@@ -24,6 +24,7 @@ def get_args():
     parser.add_argument('--num-processes', type=int, default=32, help='how many training CPU processes to use (default: 32)')
     parser.add_argument('--num-steps', type=int, default=128, help='number of forward steps in PPO (default: 128)')
     parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
+    parser.add_argument('--gpu-id', type=int, default=None, help='Specific GPU ID to use (e.g., 0 or 1). Default (None) uses CUDA_VISIBLE_DEVICES setting.')
     parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')
     parser.add_argument('--arena-size', type=int, default=1, help='size of arena')
     parser.add_argument('--high-level-interval', type=int, default=5, help='number of steps between high-level decisions')
@@ -78,7 +79,15 @@ def get_args():
     args.clipped_value_loss = not args.no_clipped_value_loss
 
     args.cuda = not args.no_cuda and torch.cuda.is_available()
-    args.device = torch.device("cuda" if args.cuda else "cpu")
+    # 【新增逻辑】如果指定了 --gpu-id，则设置环境变量
+    if args.cuda and args.gpu_id is not None:
+        # 核心：使用 os.environ 来设置环境变量，这会影响所有后续的子进程
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
+        # 确保 args.device 指向正确的设备，但请注意，这只是主进程的设备
+        args.device = torch.device(f"cuda:{args.gpu_id}")
+    else:
+        # 如果没有指定 GPU ID，或者禁用 CUDA，则使用默认逻辑
+        args.device = torch.device("cuda" if args.cuda else "cpu")
     args.log_dir = args.log_dir + '_' + args.save_dir
     args.save_dir = '../marlsave/save_new/'+args.save_dir
     args.log_dir = args.save_dir + '/' + args.log_dir
