@@ -9,7 +9,9 @@ This is the official repository of the 'Learning Transferable Cooperative Behavi
 This work has been presented at the [Learning and Reasoning with Graph-Structured Reprsentations](https://graphreason.github.io/) workshop (https://graphreason.github.io/papers/29.pdf) at ICML, 2019 held in Long Beach, USA. 
 
 ## Installation
-See `requirements.txt` file for the list of dependencies. Create a virtualenv with python 3.5 and setup everything by executing `pip install -r requirements.txt`. 
+First install pytorch by conda:
+`conda install pytorch==2.4.1 torchvision==0.20.0 torchaudio==2.4.1 pytorch-cuda=12.1 -c pytorch -c nvidia`.
+See `requirements.txt` file for the list of dependencies. Create a virtualenv with python 3.8 and setup everything by executing `pip install -r requirements.txt`. 
 
 ## Examples
 
