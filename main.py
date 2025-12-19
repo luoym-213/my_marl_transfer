@@ -82,6 +82,18 @@ def train(args, return_early=False):
             savedir = args.save_dir+'/ep'+str(j)+'.pt'
             torch.save(savedict, savedir)
 
+
+            # 新增：按模块拆分保存（每个 agent 独立目录）
+            # 修改后：只保存第一个智能体的模块参数（因为参数共享）
+            if len(master.all_agents) > 0:
+                # 创建保存目录，不再区分 agent0, agent1...
+                module_dir = os.path.join(args.save_dir, f'ep{j}_modules')
+                os.makedirs(module_dir, exist_ok=True)
+                
+                # 只调用第一个智能体的保存函数
+                master.all_agents[0].actor_critic.save_all_modules(module_dir)
+                print(f"✅ Saved shared modular checkpoints to {module_dir}")
+
         total_num_steps = (j + 1) * args.num_processes * args.num_steps
 
         if j%args.log_interval == 0:

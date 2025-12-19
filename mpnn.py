@@ -20,6 +20,7 @@ class MPNN(nn.Module):
                  pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None, entity_mp=False, is_recurrent=True):
         super().__init__()
 
+        # ==================== 基础配置 ====================
         self.h_dim = hidden_dim
         self.nonlin = nonlin
         self.num_agents = num_agents # number of agents
@@ -38,62 +39,21 @@ class MPNN(nn.Module):
         # task generation parameters
         self.task_dim = 2
         self.h_dim2 = self.h_dim // 2 # 64
-
-        self.encoder = nn.Sequential(nn.Linear(self.input_size,self.h_dim),
-                                     self.nonlin(inplace=True))
-
-        self.messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
-
-        self.update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
-                                    self.nonlin(inplace=True))
-
-        self.value_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
-                                        self.nonlin(inplace=True),
-                                        nn.Linear(self.h_dim,1))
-
-        self.policy_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
-                                         self.nonlin(inplace=True))
-        
-        self.agent_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
-                                     self.nonlin(inplace=True))
-        
-        self.agent_messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
-
-        self.agent_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
-                                          self.nonlin(inplace=True))
-
-        self.low_agent_encoder = nn.Sequential(nn.Linear(self.low_level_input, self.h_dim),
-                                              self.nonlin(inplace=True))
-
-        if self.entity_mp:
-            self.entity_encoder = nn.Sequential(nn.Linear(2,self.h_dim),
-                                                self.nonlin(inplace=True))
-            
-            self.entity_messages = MultiHeadAttention(n_heads=self.n_heads,input_dim=self.h_dim,embed_dim=self.embed_dim)
-            
-            self.entity_update = nn.Sequential(nn.Linear(self.h_dim+self.embed_dim,self.h_dim),
-                                               self.nonlin(inplace=True))
-        
         num_actions = action_space.n
-        self.dist = Categorical(self.h_dim,num_actions)
 
-        # 添加GRU层
-        self.gru = nn.GRUCell(self.h_dim, self.h_dim) 
+        # ==================== 模块化网络 ====================
+        self.modules_dict = nn.ModuleDict()
+        
+        # 1. 底层策略网络
+        self.modules_dict['low_level'] = self._build_low_level_modules(action_space)
+        
+        # 2. 高层策略网络
+        self.modules_dict['high_level'] = self._build_high_level_modules()
+        
+        # 3. 高层 Critic
+        self.modules_dict['high_critic'] = self._build_high_critic_modules()
 
-        # TaskGeneration module
-        self.task = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),self.nonlin(inplace=True), # 128 -> 128
-            nn.Linear(self.h_dim, self.h_dim2),self.nonlin(inplace=True), # 128 -> 64
-            nn.Linear(self.h_dim2, self.task_dim)    # 64 -> task_dim
-        )
-
-        self.task_encoder = nn.Sequential(nn.Linear(self.task_dim, self.h_dim2),self.nonlin(inplace=True)) # task_dim -> 64
-
-        # 拼接融合层
-        self.fusion = nn.Sequential(
-            nn.Linear(self.h_dim + self.h_dim2, self.h_dim),
-            self.nonlin(inplace=True)
-        )
-
+        # ==================== 其他属性 ====================
         if norm_in:
             self.in_fn = nn.BatchNorm1d(self.input_size)
             self.in_fn.weight.data.fill_(1)
@@ -101,198 +61,364 @@ class MPNN(nn.Module):
         else:
             self.in_fn = lambda x: x
         self.apply(weights_init)
-
         self.attn_mat = np.ones((num_agents, num_agents))
-
-        self.dropout_mask = None        
-
-        # ================================ Critic Start ==================================== 
-        # ==========================================
-        # 1. 全局地图编码器 (Global Map Encoder)
-        # 输入: [B, 4, 100, 100] -> 输出: [B, 256]
-        # ==========================================
-        self.critic_map_backbone = nn.Sequential(
-            # L1: 100 -> 50
-            nn.Conv2d(4, 16, kernel_size=5, stride=2, padding=2),
-            nn.ReLU(),
-            # L2: 50 -> 25
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            # L3: 25 -> 13 (padding=1)
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(),
-            # L4: 13 -> 6 (padding=0, 丢弃最外圈无用信息，进一步压缩)
-            nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=0), 
-            nn.ReLU()
-        )
+        self.dropout_mask = None     
         
-        # 计算 Flatten 后的维度: 64 * 6 * 6 = 2304
-        self.critic_map_flat_dim = 64 * 6 * 6
+
+        self.value_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
+                                        self.nonlin(inplace=True),
+                                        nn.Linear(self.h_dim,1))
+
+        self.policy_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
+                                         self.nonlin(inplace=True))
+
+        self.low_agent_encoder = nn.Sequential(nn.Linear(self.low_level_input, self.h_dim),
+                                              self.nonlin(inplace=True))
         
-        # 降维层：将展平后的图像特征压缩，方便与向量融合
-        self.critic_map_compress = nn.Sequential(
-            nn.Linear(self.critic_map_flat_dim, 256),
-            nn.ReLU()
-        )
+        # ==================== 代办 ====================
+        self.dist = Categorical(self.h_dim,num_actions)
 
-        # ==========================================
-        # 2. 全局向量编码器 (Global Vector Encoder)
-        # 输入: [B, N_vec] -> 输出: [B, 128]
-        # ==========================================
-        # 向量维度: N个智能体(x,y) + M个宝藏(x,y)
-        self.critic_vec_input_dim = num_agents * 2 + num_agents * 2
+    # ==================== 模块构建函数 ====================
+    def _build_low_level_modules(self, action_space):
+        """构建底层策略网络"""
+        num_actions = action_space.n
+        low_level = nn.ModuleDict({
+            'encoder': nn.Sequential(
+                nn.Linear(self.low_level_input, self.h_dim),
+                self.nonlin(inplace=True)
+            ),
+            'value_head': nn.Sequential(
+                nn.Linear(self.h_dim, self.h_dim),
+                self.nonlin(inplace=True),
+                nn.Linear(self.h_dim, 1)
+            ),
+            'policy_head': nn.Sequential(
+                nn.Linear(self.h_dim, self.h_dim),
+                self.nonlin(inplace=True)
+            ),
+            'dist': Categorical(self.h_dim, num_actions)
+        })
         
-        self.critic_vec_encoder = nn.Sequential(
-            nn.Linear(self.critic_vec_input_dim, 128),
-            nn.ReLU(),
-            nn.Linear(128, 128),
-            nn.ReLU()
-        )
+        return low_level
 
-        # ==========================================
-        # 3. 融合与价值头 (Fusion & Value Head)
-        # 输入: 256(Map) + 128(Vec) = 384
-        # 输出: [B, num_agents]
-        # ==========================================
-        self.critic_fusion_layer = nn.Sequential(
-            nn.Linear(256 + 128, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU()
-        )
-        
-        # 为每个智能体创建独立的输出头
-        self.critic_value_out_heads = nn.ModuleList([
-            nn.Linear(128, 1) 
-            for _ in range(self.num_agents)
-        ])
-
-        # ================================ Critic End ==================================== 
-
-        # ================================ Actor Start ====================================
-        # ====================================================================
-        # 1. 地图流编码器 (Map Encoder)
-        # 输入: [Batch, 4, 100, 100] -> 输出: [Batch, 64, 12, 12]
-        # ====================================================================
-        self.map_conv1 = nn.Sequential(
-            nn.Conv2d(4, 16, kernel_size=5, stride=2, padding=2), # 100 -> 50
-            nn.ReLU()
-        )
-        self.map_conv2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1), # 50 -> 25
-            nn.ReLU()
-        )
-        self.map_conv3 = nn.Sequential(
-            # Padding=0 是关键，切掉边缘，从 25x25 变成 12x12
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=0), # 25 -> 12
-            nn.ReLU()
-        )
-
-        # ====================================================================
-        # 2. 向量流编码器 (Vector Encoder)
-        # 输入: [Batch, 5] -> 输出: [Batch, 64]
-        # ====================================================================
-        self.vec_mlp = nn.Sequential(
-            nn.Linear(5, 32),
-            nn.ReLU(),
-            nn.Linear(32, 64),
-            nn.ReLU()
-        )
-
-        # ====================================================================
-        # 3. 决策头 (Decision Head)
-        # 输入: h_shared [128] -> 输出: Logits [2] (Explore vs Collect)
-        # ====================================================================
-        self.decision_head = nn.Sequential(
-            nn.Linear(128, 64), # 128 = 64(Map) + 64(Vec)
-            nn.ReLU(),
-            nn.Linear(64, 2)    # 输出 Explore, Collect 的 Logits
-        )
-
-        # ====================================================================
-        # 4. 探索点生成头 (Waypoint Head - Decoder)
-        # 输入: F_spatial + h_shared -> 输出: Heatmap [1, 100, 100]
-        # ====================================================================
-        
-        # 特征融合层：将拼接后的 192 维特征降维融合
-        self.decoder_fuse = nn.Sequential(
-            nn.Conv2d(192, 64, kernel_size=1), # 192 = 64(Spatial) + 128(Broadcasted Shared)
-            nn.ReLU()
-        )
-        
-        # 上采样层 1: 12x12 -> 24x24
-        self.decoder_up1 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(64, 32, kernel_size=3, padding=1),
-            nn.ReLU()
-        )
-        
-        # 上采样层 2: 24x24 -> 48x48
-        self.decoder_up2 = nn.Sequential(
-            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
-            nn.Conv2d(32, 16, kernel_size=3, padding=1),
-            nn.ReLU()
-        )
-        
-        # 上采样层 3: 48x48 -> 100x100 (直接指定 size)
-        self.decoder_out = nn.Sequential(
-            nn.Upsample(size=(100, 100), mode='bilinear', align_corners=False),
-            nn.Conv2d(16, 1, kernel_size=1) # 输出单通道 Logits
-            # 注意：这里没有 Activation，因为后续要做 Softmax 和 Masking
-        )
-
-
-    def _fwd(self, inp, state=None):
-        # inp should be (batch_size,input_size)
-        # inp - {iden, vel(2), pos(2), entities(...)}
-        # state should be (batch_size, hidden_size)
-        agent_inp = inp[:,:self.input_size]
-        mask, mask_agents = self.calculate_mask(agent_inp) # shape <batch_size/N,N,N> with 0 for comm allowed, 1 for restricted         
-
-        h = self.encoder(agent_inp) # should be (batch_size,self.h_dim)
-        '''
-        other_agent_inp = inp[:,self.input_size+self.num_entities*2:] # x,y relative pos of agents wrt agents
-        ha = self.agent_encoder(other_agent_inp.contiguous().view(-1,2)).view(-1,self.num_agents-1,self.h_dim) # [num_agents*num_processes, num_agents-1, 128]
-        #print("ha shape: ", ha.shape) 
-        agent_message,agent_attn = self.agent_messages(h.unsqueeze(1),ha,mask=mask_agents,return_attn = True)
-        h = self.agent_update(torch.cat((h,agent_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
-        #print("h shape: ", h.shape)
-        '''
-        if self.entity_mp:
-            landmark_inp = inp[:,self.input_size:self.input_size+self.num_entities*2] # x,y pos of landmarks wrt agents
-            # should be (batch_size,self.num_entities,self.h_dim)
-            # compute entity mask
-            mask_entity = self.calculate_mask_entity(landmark_inp)
-            he = self.entity_encoder(landmark_inp.contiguous().view(-1,2)).view(-1,self.num_entities,self.h_dim)
-            # entity_message = self.entity_messages(h.unsqueeze(1),he).squeeze(1) # should be (batch_size,self.h_dim)
-            entity_message,entity_attn = self.entity_messages(h.unsqueeze(1),he,mask=mask_entity,return_attn=True) # should be (batch_size,self.h_dim)
-            h = self.entity_update(torch.cat((h,entity_message.squeeze(1)),1)) # should be (batch_size,self.h_dim)
-
-        # h = h.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
-        
-        # 使用GRU处理输入
-        new_state = self.gru(h, state)
-        
-        # 将新的隐藏状态重新塑形回 (batch_size_per_agent, num_agents, hidden_dim)
-        h = new_state.view(self.num_agents,-1,self.h_dim).transpose(0,1) # should be (batch_size/N,N,self.h_dim)
-
-        for k in range(self.K):
-            m, attn = self.messages(h, mask=mask, return_attn=True) # should be <batch_size/N,N,self.embed_dim>
-            h = self.update(torch.cat((h,m),2)) # should be <batch_size/N,N,self.h_dim>
-        h = h.transpose(0,1).contiguous().view(-1,self.h_dim)
-        
-        self.attn_mat = attn.squeeze().detach().cpu().numpy()
-        # print("h shape: ", h.shape)
-        return h, new_state # should be <batch_size, self.h_dim> again
-
-    def forward(self, inp, state, mask=None):
-        # 保存当前的隐藏状态
-        if state is not None:
-            self.hidden_state = state
+    def _build_high_level_modules(self):
+        """构建高层策略网络（Actor）"""
+        high_level = nn.ModuleDict({
+            # 地图编码器
+            'map_conv1': nn.Sequential(
+                nn.Conv2d(4, 16, kernel_size=5, stride=2, padding=2),
+                nn.ReLU()
+            ),
+            'map_conv2': nn.Sequential(
+                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                nn.ReLU()
+            ),
+            'map_conv3': nn.Sequential(
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=0),
+                nn.ReLU()
+            ),
             
-        x = self._fwd(inp)
-        # 返回更新后的隐藏状态
-        return x, self.hidden_state.clone()
+            # 向量编码器
+            'vec_mlp': nn.Sequential(
+                nn.Linear(5, 32),
+                nn.ReLU(),
+                nn.Linear(32, 64),
+                nn.ReLU()
+            ),
+            
+            # 决策头
+            'decision_head': nn.Sequential(
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, 2)
+            ),
+            
+            # 探索点解码器
+            'decoder_fuse': nn.Sequential(
+                nn.Conv2d(192, 64, kernel_size=1),
+                nn.ReLU()
+            ),
+            'decoder_up1': nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(64, 32, kernel_size=3, padding=1),
+                nn.ReLU()
+            ),
+            'decoder_up2': nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(32, 16, kernel_size=3, padding=1),
+                nn.ReLU()
+            ),
+            'decoder_out': nn.Sequential(
+                nn.Upsample(size=(100, 100), mode='bilinear', align_corners=False),
+                nn.Conv2d(16, 1, kernel_size=1)
+            )
+        })
+        
+        return high_level
+
+    def _build_high_critic_modules(self):
+        """构建高层 Critic"""
+        high_critic = nn.ModuleDict({
+            'map_backbone': nn.Sequential(
+                nn.Conv2d(4, 16, kernel_size=5, stride=2, padding=2),
+                nn.ReLU(),
+                nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+                nn.ReLU(),
+                nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=0),
+                nn.ReLU()
+            ),
+            'map_compress': nn.Sequential(
+                nn.Linear(64 * 6 * 6, 256),
+                nn.ReLU()
+            ),
+            'vec_encoder': nn.Sequential(
+                nn.Linear(self.num_agents * 2 + self.num_agents * 2, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU()
+            ),
+            'fusion_layer': nn.Sequential(
+                nn.Linear(256 + 128, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU()
+            )
+        })
+        
+        # 每个智能体的独立输出头
+        high_critic['value_heads'] = nn.ModuleList([
+            nn.Linear(128, 1) for _ in range(self.num_agents)
+        ])
+        
+        return high_critic
+
+    # ==================== 参数管理接口 ====================
+    
+    def get_module_params(self, module_name):
+        """
+        获取指定模块的参数
+        
+        Args:
+            module_name: 'shared', 'low_level', 'high_level', 'high_critic'
+        
+        Returns:
+            list of parameters
+        """
+        if module_name not in self.modules_dict:
+            raise ValueError(f"Module '{module_name}' not found! Available: {list(self.modules_dict.keys())}")
+        
+        return list(self.modules_dict[module_name].parameters())
+
+    def freeze_module(self, module_name):
+        """冻结指定模块的参数"""
+        for param in self.get_module_params(module_name):
+            param.requires_grad = False
+        print(f"✅ Module '{module_name}' frozen")
+
+    def unfreeze_module(self, module_name):
+        """解冻指定模块的参数"""
+        for param in self.get_module_params(module_name):
+            param.requires_grad = True
+        print(f"✅ Module '{module_name}' unfrozen")
+
+    def save_module_checkpoint(self, module_name, path):
+        """
+        保存指定模块的参数
+        
+        Args:
+            module_name: 模块名称
+            path: 保存路径
+        """
+        if module_name not in self.modules_dict:
+            raise ValueError(f"Module '{module_name}' not found!")
+        
+        checkpoint = {
+            'module_name': module_name,
+            'state_dict': self.modules_dict[module_name].state_dict(),
+            'config': {
+                'num_agents': self.num_agents,
+                'num_entities': self.num_entities,
+                'hidden_dim': self.h_dim,
+                'embed_dim': self.embed_dim
+            }
+        }
+        
+        torch.save(checkpoint, path)
+        print(f"✅ Saved '{module_name}' checkpoint to {path}")
+
+    def load_module_checkpoint(self, module_name, path, strict=True, freeze=False):
+        """
+        加载指定模块的参数
+        
+        Args:
+            module_name: 模块名称
+            path: checkpoint 路径
+            strict: 是否严格匹配参数
+            freeze: 是否加载后冻结
+        
+        Returns:
+            missing_keys, unexpected_keys
+        """
+        checkpoint = torch.load(path, map_location='cpu')
+        
+        # 验证配置
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            if config.get('num_agents') != self.num_agents:
+                print(f"⚠️ Warning: num_agents mismatch! "
+                      f"Checkpoint: {config['num_agents']}, Current: {self.num_agents}")
+        
+        # 加载参数
+        missing, unexpected = self.modules_dict[module_name].load_state_dict(
+            checkpoint['state_dict'], 
+            strict=strict
+        )
+        
+        if freeze:
+            self.freeze_module(module_name)
+        
+        print(f"✅ Loaded '{module_name}' checkpoint from {path}")
+        if missing:
+            print(f"  Missing keys: {missing}")
+        if unexpected:
+            print(f"  Unexpected keys: {unexpected}")
+        
+        return missing, unexpected
+
+    def save_all_modules(self, save_dir):
+        """保存所有模块到指定目录"""
+        import os
+        os.makedirs(save_dir, exist_ok=True)
+        
+        for module_name in self.modules_dict.keys():
+            save_path = os.path.join(save_dir, f"{module_name}.pth")
+            self.save_module_checkpoint(module_name, save_path)
+
+    def load_pretrained_low_level(self, path, freeze=True):
+        """
+        便捷函数：加载预训练的底层网络
+        
+        Args:
+            path: checkpoint 路径
+            freeze: 是否冻结参数
+        """
+        return self.load_module_checkpoint('low_level', path, strict=False, freeze=freeze)
+
+    def get_trainable_params_by_modules(self, module_names, learning_rates=None):
+        """
+        获取多个模块的参数组（用于优化器）
+        
+        Args:
+            module_names: 模块名称列表
+            learning_rates: 对应的学习率列表（可选）
+        
+        Returns:
+            param_groups for optimizer
+        
+        Example:
+            >>> param_groups = model.get_trainable_params_by_modules(
+            ...     ['high_level', 'high_critic', 'low_level'],
+            ...     [3e-4, 3e-4, 1e-5]  # 底层使用更小的学习率
+            ... )
+            >>> optimizer = torch.optim.Adam(param_groups)
+        """
+        param_groups = []
+        
+        if learning_rates is None:
+            learning_rates = [None] * len(module_names)
+        
+        for module_name, lr in zip(module_names, learning_rates):
+            params = self.get_module_params(module_name)
+            if lr is not None:
+                param_groups.append({'params': params, 'lr': lr})
+            else:
+                param_groups.append({'params': params})
+        
+        return param_groups
+
+    # ==================== 前向传播接口（保持兼容）====================
+    
+    @property
+    def low_agent_encoder(self):
+        return self.modules_dict['low_level']['encoder']
+    
+    @property
+    def value_head(self):
+        return self.modules_dict['low_level']['value_head']
+    
+    @property
+    def policy_head(self):
+        return self.modules_dict['low_level']['policy_head']
+    
+    @property
+    def dist(self):
+        return self.modules_dict['low_level']['dist']
+    
+    @property
+    def map_conv1(self):
+        return self.modules_dict['high_level']['map_conv1']
+    
+    @property
+    def map_conv2(self):
+        return self.modules_dict['high_level']['map_conv2']
+    
+    @property
+    def map_conv3(self):
+        return self.modules_dict['high_level']['map_conv3']
+    
+    @property
+    def vec_mlp(self):
+        return self.modules_dict['high_level']['vec_mlp']
+    
+    @property
+    def decision_head(self):
+        return self.modules_dict['high_level']['decision_head']
+    
+    @property
+    def decoder_fuse(self):
+        return self.modules_dict['high_level']['decoder_fuse']
+    
+    @property
+    def decoder_up1(self):
+        return self.modules_dict['high_level']['decoder_up1']
+    
+    @property
+    def decoder_up2(self):
+        return self.modules_dict['high_level']['decoder_up2']
+    
+    @property
+    def decoder_out(self):
+        return self.modules_dict['high_level']['decoder_out']
+    
+    @property
+    def critic_map_backbone(self):
+        return self.modules_dict['high_critic']['map_backbone']
+    
+    @property
+    def critic_map_compress(self):
+        return self.modules_dict['high_critic']['map_compress']
+    
+    @property
+    def critic_vec_encoder(self):
+        return self.modules_dict['high_critic']['vec_encoder']
+    
+    @property
+    def critic_fusion_layer(self):
+        return self.modules_dict['high_critic']['fusion_layer']
+    
+    @property
+    def critic_value_out_heads(self):
+        return self.modules_dict['high_critic']['value_heads']
+    
+    @property
+    def critic_map_flat_dim(self):
+        return 64 * 6 * 6
+    
+    @property
+    def critic_vec_input_dim(self):
+        return self.num_agents * 2 + self.num_agents * 2
 
     def high_level_forward(self, vec_inp, map_inp):
         """
@@ -583,49 +709,6 @@ class MPNN(nn.Module):
 
         return value, action, action_log_probs
 
-    def act(self, inp, state, env_state, mask=None, deterministic=False):
-        """
-        inp: [batch_size, dim_o]
-        state: [batch_size, dim_h]
-        env_state: [batch_size, env_dim]
-        mask: [batch_size, 1], mask for actions
-        """
-        x, new_state = self._fwd(inp, state)
-        # 这里需要把x存入buffer中，看是return比较好这里可以直接存
-        tgnet_input = x  # 取前task_dim维度作为tgnet的输入 <batch_size, dim_h>
-
-        # 训练阶段使用cta的任务
-        cta_task = self.CTA(env_state) # should be <batch_size, task_dim>
-        x = self._task_fwd(x, cta_task)  # 拼接任务向量
-
-        # value 不再使用sigle agent的输出头，使用中心的critic
-        # value = self._value(x)
-        value = self.critic_value(env_state, cta_task, mask)
-
-        dist = self.dist(self._policy(x))
-        if deterministic:
-            action = dist.mode()
-        else:
-            action = dist.sample()
-        action_log_probs = dist.log_probs(action).view(-1,1)
-        
-        # 返回更新后的隐藏状态
-        return value, action, action_log_probs, new_state, cta_task, tgnet_input
-
-    def evaluate_actions(self, inp, state, mask, action, env_state, task=None): 
-        x, new_state = self._fwd(inp, state)  # 修正：传递state参数
-        x = self._task_fwd(x, task)
-
-        # value = self._value(x) # [num_mini_batch, 1]
-        value = self.critic_value(env_state, task, mask)
-        dist = self.dist(self._policy(x))
-        action_log_probs = dist.log_probs(action)
-        dist_entropy = dist.entropy().mean() # [num_mini_batch, 1] -> 1 scalar
-        
-        # 返回更新后的隐藏状态
-        return value, action_log_probs, dist_entropy, new_state  # 修正：返回new_state而不是self.hidden_state.clone()
-    
-
     def evaluate_high_actions(self, env_states, map_obs, vec_obs, critic_maps, goals, tasks, agent_ids):
         """
         Input:
@@ -712,16 +795,6 @@ class MPNN(nn.Module):
         dist_entropy = dist.entropy().mean()
         
         return value, action_log_probs, dist_entropy
-
-    def get_value(self, inp, state, mask, env_state):
-            
-        x, new_state = self._fwd(inp, state)
-        # 训练阶段使用cta的任务
-        cta_task = self.CTA(env_state) # should be <batch_size, task_dim>
-        x = self._task_fwd(x, cta_task)  # 添加任务生成模块
-        # value = self._value(x)
-        value = self.critic_value(env_state, cta_task, mask)
-        return value
     
     def get_low_value(self, inp, goals):
         new_inp = self.data_processing_low_level(inp, goals)
