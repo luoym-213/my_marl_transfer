@@ -637,6 +637,45 @@ class MPNN(nn.Module):
             "decision_log_probs": decision_log_prob.unsqueeze(-1),  # ✅ [Batch, 1] 标量
             "map_log_probs": map_log_prob.unsqueeze(-1)            # ✅ [Batch, 1] 标量
         }
+
+    def get_random_high_level_goal(self, vec_inp, map_inp, deterministic=False):
+        """
+        随机采样高层动作（用于单独训练底层网络）
+        
+        Args:
+            vec_inp: [Batch, 5] - 向量输入（未使用，仅为接口兼容）
+            map_inp: [Batch, 4, 100, 100] - 地图输入（未使用）
+            deterministic: bool - 是否确定性采样（未使用）
+        
+        Returns:
+            dict: {
+                "action_modes": [Batch, 1] - 固定为 0（探索模式）
+                "waypoints": [Batch, 2] - 随机生成的导航点，范围 [-50, 50]
+                "decision_log_probs": [Batch, 1] - 固定为 0（无实际概率）
+                "map_log_probs": [Batch, 1] - 固定为 0（无实际概率）
+            }
+        """
+        batch_size = vec_inp.size(0)
+        device = vec_inp.device
+        
+        # 1. 决策动作：固定为 0 (Explore)
+        action_mode = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        
+        # 2. 随机生成导航点，范围 [0, 100]，结果使用整数
+        # 使用 uniform 分布采样,结果要用整数
+        waypoints = torch.randint(0, 101, (batch_size, 2), dtype=torch.float, device=device)
+        #print("Randomly sampled waypoints:", waypoints)
+        
+        # 3. log_probs 设为 0（因为是随机采样，无真实分布）
+        decision_log_prob = torch.zeros(batch_size, 1, device=device)
+        map_log_prob = torch.zeros(batch_size, 1, device=device)
+        
+        return {
+            "action_modes": action_mode,              # [Batch, 1]
+            "waypoints": waypoints,                   # [Batch, 2]
+            "decision_log_probs": decision_log_prob,  # [Batch, 1]
+            "map_log_probs": map_log_prob            # [Batch, 1]
+        }
     
     def get_high_value(self, map_inp, vec_inp):
         # map_inp: [num_processes, 4, H, W]

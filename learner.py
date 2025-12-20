@@ -219,7 +219,8 @@ class Learner(object):
                 vec_inp_agents = vec_inps[proc_indices, agent_indices]  # [N, 5]
                 
                 # 5. 批量执行高层策略
-                batch_goals = policy.get_high_level_goal(vec_inp_agents, map_inps)  # 需要实现batch版本
+                # batch_goals = policy.get_high_level_goal(vec_inp_agents, map_inps)  # 需要实现batch版本
+                batch_goals = policy.get_random_high_level_goal(vec_inp_agents, map_inps)  # 需要实现batch版本
                 
                 # 6. 批量更新 all_goals 和 all_tasks
                 # 计算线性索引: agent_idx * num_processes + process_idx
@@ -240,7 +241,9 @@ class Learner(object):
             
             all_vec_inps = vec_inps  # [num_processes, num_agents, 5]
 
-            all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_vec_inp) # 计算所有process的高层value： [num_processes, num_agents]
+            #all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_vec_inp) # 计算所有process的高层value： [num_processes, num_agents]
+            #随机产生一个all_high_value以避免影响训练
+            all_high_value = torch.zeros((num_processes, num_agents), device=self.device)
 
             # 低层策略的处理
             # props = policy.act(all_obs, all_hidden, all_env_state, all_masks, deterministic=False) # a single forward pass
@@ -283,10 +286,11 @@ class Learner(object):
         return_high_vals = []
         return_vals = []
         # use SMDP_ppo for training high level layer
-        for i, trainer in enumerate(self.high_trainers_list):
-            rollouts_list = [agent.rollouts for agent in self.teams_list[i]]
-            high_vals = trainer.update(rollouts_list)
-            return_high_vals.append([np.array(high_vals)]*len(rollouts_list))
+        # for i, trainer in enumerate(self.high_trainers_list):
+        #     rollouts_list = [agent.rollouts for agent in self.teams_list[i]]
+        #     high_vals = trainer.update(rollouts_list)
+        #     return_high_vals.append([np.array(high_vals)]*len(rollouts_list))
+        return_high_vals = [[np.array([0.0,0.0,0.0,0.0,0.0])]*len(self.teams_list[i]) for i in range(len(self.teams_list))]
 
         # use ippo ppo for training low level layer
         if self.use_pretrained_low_level:

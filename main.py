@@ -49,10 +49,11 @@ def train(args, return_early=False):
             obs, reward, high_reward, done, info, env_state = envs.step(step_data)
             ### 验证
             #将任务点转为世界坐标
-            goalx = goals_list[0][0][0]*0.02 + 0.01 - 1
-            goaly = goals_list[0][0][1]*0.02 + 0.01 - 1
-            print(f"Step {step} goal world coord: ", (goalx, goaly))
-            print(f"Step {step} obs sample: ", obs[0,0,2:4])  # 打印第一个环境的观测样本
+            # goalx = goals_list[0][0][0]*0.02 + 0.01 - 1
+            # goaly = goals_list[0][0][1]*0.02 + 0.01 - 1
+            # print(f"Step {step} goal world coord: ", (goalx, goaly))
+            # print(f"Step {step} env_state sample: ", goals_list[0][0])  # 打印第一个环境的状态样本
+            # print(f"Step {step} obs sample: ", obs[0,0,2:4])  # 打印第一个环境的观测样本
             master.envs_info = info
             high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
