@@ -147,12 +147,11 @@ class MultiAgentEnv(gym.Env):
         landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
 
         # 必须在更新全图信息图前获取高层奖励，因为高层奖励依赖于step前的全局信息图
-        agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
-        agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
+        agents_explore_rewards, agents_discover_target_rewards = self.global_belief_map.get_agent_step_rewards(agents_pos, self.world.mask_obs_dist,discover_reward_scale=1.0)
         agents_reach_target_rewards = self.get_target_reward(agents_pos, landmark_positions)
         total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards)
 
-        # print(total_high_rewards.shape)
+        #print("high_rewards:",total_high_rewards)
 
         # 根据获取的全局状态更新全局信息图
         if self.enable_exploration_reward:
@@ -165,17 +164,17 @@ class MultiAgentEnv(gym.Env):
         # 添加world_steps到info_n中
         info_n['world_steps'] = self.world.steps
 
-        # 将centroids和target_positions添加到info_n中
-        info_n['map'].append(centroids)
-        info_n['map'].append(target_positions)
-        # 将高层策略需要的通道图、是否达到目标点分别加入
-        info_n['belief_map'] = self.global_belief_map.belief_grid
-        info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
-        info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos)
-        info_n['distance_fields'] = self.global_belief_map.get_distance_fields(agents_pos, normalize=True)
+        # # 将centroids和target_positions添加到info_n中
+        # info_n['map'].append(centroids)
+        # info_n['map'].append(target_positions)
+        # # 将高层策略需要的通道图、是否达到目标点分别加入
+        # info_n['belief_map'] = self.global_belief_map.belief_grid
+        # info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
+        # info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos)
+        # info_n['distance_fields'] = self.global_belief_map.get_distance_fields(agents_pos, normalize=True)
         info_n['goal_done'] = self._get_goal_dones(self.agents)
-        info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
-        info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
+        # info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
+        # info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()

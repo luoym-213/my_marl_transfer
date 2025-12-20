@@ -799,10 +799,11 @@ class GlobalBeliefMap:
         # 恢复原始地图状态
         self.belief_grid = original_belief_grid
         
-        return {
-            'explore_rewards': explore_rewards,
-            'discover_rewards': discover_rewards
-        }
+        # return {
+        #     'explore_rewards': explore_rewards,
+        #     'discover_rewards': discover_rewards
+        # }
+        return explore_rewards,discover_rewards
 
     def get_agent_step_explore_entropy(self, agent_positions, radius, sigma=None, clip_outside=True):
         """向后兼容的探索熵奖励接口"""

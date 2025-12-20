@@ -36,11 +36,12 @@ def train(args, return_early=False):
 
     # start simulations
     start = datetime.datetime.now()
+    get_goal_num = 0
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
                 # print("step: ", step)
-                actions_list, goals_list = master.act(step)
+                actions_list, goals_list, updated_goal_num = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             agent_goals = np.transpose(np.array(goals_list),(1,0,2))
             # 这里需要给agent_actions和agent_goals包装一下，变成字典形式传入env.step()
@@ -67,6 +68,7 @@ def train(args, return_early=False):
             final_high_rewards += (1 - masks) * episode_high_rewards
             episode_rewards *= masks
             episode_high_rewards *= masks
+            get_goal_num += updated_goal_num
 
             master.update_rollout(obs, reward, high_reward, masks, env_state, goal_dones)
 
@@ -108,11 +110,13 @@ def train(args, return_early=False):
             seconds = (end-start).total_seconds()
             mean_low_reward = final_rewards.mean(dim=0).cpu().numpy()
             mean_high_reward = final_high_rewards.mean(dim=0).cpu().numpy()
+            mean_get_goal_num = get_goal_num*1./args.log_interval
+            get_goal_num = 0
             print("Updates {} | Num timesteps {} | Time {} | FPS {} \
-                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} lowPolicy loss {:.4f} \
+                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} lowPolicy loss {:.4f} Mean low get goal {:.4f}\
                   \nMean high reward {} Decision Entropy {:.4f} Waypoint Entropy {:.4f} high Value loss {:.4f} high Decision loss {:.4f} high Waypoint loss {:.4f}\n "
             .format(j, total_num_steps, str(end-start), int(total_num_steps / seconds), 
-                  mean_low_reward, dist_low_entropy[0], value_low_loss[0], action_low_loss[0],
+                  mean_low_reward, dist_low_entropy[0], value_low_loss[0], action_low_loss[0],mean_get_goal_num,
                   mean_high_reward, decision_entropy[0], waypoint_entropy[0], value_high_loss[0],
                   decision_high_loss[0], waypoint_high_loss[0]))
             
