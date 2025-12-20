@@ -61,7 +61,23 @@ def setup_master(args, env=None, return_env=False):
             if policy2 is None:
                 policy2 = MPNN(input_size=pol_obs_dim,num_agents=num_friendly,num_entities=num_entities,action_space=action_space,
                                pos_index=pos_index, mask_dist=args.mask_dist,mask_obs_dist=args.mask_obs_dist,entity_mp=entity_mp,is_recurrent=args.is_recurrent).to(args.device)
+
             team2.append(Neo(args,policy2,(obs_dim,),action_space))
+
+        # ================== 新增：加载预训练底层网络 ==================
+        # 假设你在 args 中定义了 load_low_level_path 和 freeze_low_level
+        if hasattr(args, 'load_low_level_path') and args.load_low_level_path is not None:
+            print(f"🔄 Loading pretrained low-level model from: {args.load_low_level_path}")
+            
+            # 如果有 policy1 (Adversary)，加载
+            if policy1 is not None:
+                policy1.load_pretrained_low_level(args.load_low_level_path, freeze=True) # 建议默认冻结
+                
+            # 如果有 policy2 (Friendly)，加载
+            if policy2 is not None:
+                policy2.load_pretrained_low_level(args.load_low_level_path, freeze=True)
+        # ============================================================
+        
     master = Learner(args, [team1, team2], [policy1, policy2], env=env) # 传入并行环境
     
     if args.continue_training:
@@ -81,9 +97,17 @@ class Learner(object):
         # self.trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
         #                                args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
         #                                use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
-        self.trainers_list = [IPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
-                                       args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
-                                       use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
+        # ⭐ 检测是否加载了预训练底层网络
+        self.use_pretrained_low_level = (
+            hasattr(args, 'load_low_level_path') and 
+            args.load_low_level_path is not None
+        )
+
+        # 初始化训练器
+        if not self.use_pretrained_low_level:
+            self.trainers_list = [IPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
+                                        args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
+                                        use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
         self.high_trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                                        args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
                                        use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
@@ -265,10 +289,13 @@ class Learner(object):
             return_high_vals.append([np.array(high_vals)]*len(rollouts_list))
 
         # use ippo ppo for training low level layer
-        for i, trainer in enumerate(self.trainers_list):
-            rollouts_list = [agent.rollouts for agent in self.teams_list[i]]
-            vals = trainer.update(rollouts_list)
-            return_vals.append([np.array(vals)]*len(rollouts_list))
+        if self.use_pretrained_low_level:
+            return_vals = [[np.array([0.0,0.0,0.0])]*len(self.teams_list[i]) for i in range(len(self.teams_list))]
+        else:
+            for i, trainer in enumerate(self.trainers_list):
+                rollouts_list = [agent.rollouts for agent in self.teams_list[i]]
+                vals = trainer.update(rollouts_list)
+                return_vals.append([np.array(vals)]*len(rollouts_list))
 
         low_arr = np.stack([x for v in return_vals for x in v])     # [num_agents, 3]
         high_arr = np.stack([x for v in return_high_vals for x in v])   # [num_agents, 5]

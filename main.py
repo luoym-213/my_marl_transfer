@@ -47,6 +47,12 @@ def train(args, return_early=False):
             # 需要变成num_processes个环境的列表，每个元素是一个字典，包含两个键值对: 'agents_actions', 'agents_goals'
             step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i]} for i in range(args.num_processes)]
             obs, reward, high_reward, done, info, env_state = envs.step(step_data)
+            ### 验证
+            #将任务点转为世界坐标
+            goalx = goals_list[0][0][0]*0.02 + 0.01 - 1
+            goaly = goals_list[0][0][1]*0.02 + 0.01 - 1
+            print(f"Step {step} goal world coord: ", (goalx, goaly))
+            print(f"Step {step} obs sample: ", obs[0,0,2:4])  # 打印第一个环境的观测样本
             master.envs_info = info
             high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)

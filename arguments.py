@@ -49,6 +49,7 @@ def get_args():
     parser.add_argument('--clip-param', type=float, default=0.2, help='ppo clip parameter (default: 0.2)')
     parser.add_argument('--recurrent-hidden-state-size', type=int, default=128, help='number of batches for ppo (default: 32)')
     parser.add_argument('--is-recurrent', action='store_true')
+    parser.add_argument("--load-low-level-path", type=str, default=None, help="Path of pre-trained low-level policy")
 
     # logging
     parser.add_argument('--save-dir', default='tmp', help='directory to save models (default: tmp)')

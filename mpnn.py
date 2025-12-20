@@ -65,15 +65,15 @@ class MPNN(nn.Module):
         self.dropout_mask = None     
         
 
-        self.value_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
-                                        self.nonlin(inplace=True),
-                                        nn.Linear(self.h_dim,1))
+        # self.value_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
+        #                                 self.nonlin(inplace=True),
+        #                                 nn.Linear(self.h_dim,1))
 
-        self.policy_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
-                                         self.nonlin(inplace=True))
+        # self.policy_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
+        #                                  self.nonlin(inplace=True))
 
-        self.low_agent_encoder = nn.Sequential(nn.Linear(self.low_level_input, self.h_dim),
-                                              self.nonlin(inplace=True))
+        # self.low_agent_encoder = nn.Sequential(nn.Linear(self.low_level_input, self.h_dim),
+        #                                       self.nonlin(inplace=True))
         
         # ==================== 代办 ====================
         self.dist = Categorical(self.h_dim,num_actions)
@@ -298,13 +298,70 @@ class MPNN(nn.Module):
 
     def load_pretrained_low_level(self, path, freeze=True):
         """
+        智能加载函数：支持加载 '模块化Checkpoint' 或 '完整训练Checkpoint'
+        """
+        print(f"🔄 Loading low-level params from {path}...")
+        checkpoint = torch.load(path, map_location='cpu')
+        
+        low_level_state_dict = {}
+        
+        # === 情况 A: 这是一个模块化 Checkpoint ===
+        if 'state_dict' in checkpoint:
+            print("  Type: Module Checkpoint")
+            low_level_state_dict = checkpoint['state_dict']
+            
+        # === 情况 B: 这是一个完整训练 Checkpoint ===
+        elif 'models' in checkpoint:
+            print("  Type: Full Training Checkpoint (extracting params...)")
+            full_state_dict = checkpoint['models'][0]
+            
+            # ⭐ 关键修改：明确底层网络的键名前缀
+            # 旧代码中，底层网络的键名应该是 'low_agent_encoder.*', 'value_head.*' 等
+            target_keys = [
+                'low_agent_encoder',  # ← 这是底层编码器的真正名字
+                'value_head',
+                'policy_head',
+                'dist'
+            ]
+            
+            for key, value in full_state_dict.items():
+                # 去除可能的 'modules_dict.low_level.' 前缀（如果是新版代码保存的）
+                clean_key = key.replace('modules_dict.low_level.', '')
+                
+                # 检查是否属于底层网络（必须完整匹配前缀）
+                if any(clean_key.startswith(prefix) for prefix in target_keys):
+                    # ⭐ 如果是旧代码，需要将 'low_agent_encoder' 映射为 'encoder'
+                    # 因为新代码中底层模块内部的名字是 'encoder'
+                    final_key = clean_key.replace('low_agent_encoder', 'encoder')
+                    low_level_state_dict[final_key] = value
+                    
+        else:
+            raise ValueError(f"Unknown checkpoint format! Keys found: {list(checkpoint.keys())}")
+
+        # 加载参数
+        missing, unexpected = self.modules_dict['low_level'].load_state_dict(
+            low_level_state_dict, 
+            strict=False 
+        )
+        
+        if freeze:
+            self.freeze_module('low_level')
+            
+        print(f"✅ Low-level loaded. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+        if missing:
+            print(f"  ⚠️ Missing: {missing}")
+        if unexpected:
+            print(f"  ⚠️ Unexpected: {unexpected}")
+        
+        return missing, unexpected
+        """
         便捷函数：加载预训练的底层网络
         
         Args:
             path: checkpoint 路径
             freeze: 是否冻结参数
         """
-        return self.load_module_checkpoint('low_level', path, strict=False, freeze=freeze)
+        # return self.load_module_checkpoint('low_level', path, strict=False, freeze=freeze)
 
     def get_trainable_params_by_modules(self, module_names, learning_rates=None):
         """
