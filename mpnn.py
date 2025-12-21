@@ -565,6 +565,9 @@ class MPNN(nn.Module):
             x_coords = x_coords.squeeze(-1)  # 移除最后一维
         if y_coords.dim() > 1:
             y_coords = y_coords.squeeze(-1)
+        ## 转换为世界坐标
+        x_coords = x_coords * 0.02 + (-1 + 0.01)  # 转换为[-0.99, 1.01]的世界坐标
+        y_coords = y_coords * 0.02 + (-1 + 0.01)  # 转换为[-0.99, 1.01]的世界坐标
 
         # 4. 根据决策调整导航点
         target_x = vec_inp[:, 3]
