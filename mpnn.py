@@ -665,6 +665,10 @@ class MPNN(nn.Module):
         # 使用 uniform 分布采样,结果要用整数
         waypoints = torch.randint(0, 101, (batch_size, 2), dtype=torch.float, device=device)
         #print("Randomly sampled waypoints:", waypoints)
+        # 将生成的waypoints转为世界坐标系
+        # self.cell_world_x = self.world_min(-1) + (grid_x + 0.5) * self.cell_size(0.02)
+        # self.cell_world_y = self.world_min + (grid_y + 0.5) * self.cell_size
+        waypoints = waypoints * 0.02 + (-1 + 0.01)  # 转换为[-0.99, 1.01]的世界坐标
         
         # 3. log_probs 设为 0（因为是随机采样，无真实分布）
         decision_log_prob = torch.zeros(batch_size, 1, device=device)
