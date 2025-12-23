@@ -16,6 +16,8 @@ class AgentState(EntityState):
         self.c = None
         # goal position
         self.g_pos = None
+        # target action: explore-0, collect-1
+        self.task = None
 
 # action of the agent
 class Action(object):
@@ -68,7 +70,7 @@ class Agent(Entity):
         self.silent = False
         # cannot observe the world
         self.blind = False
-        # physical motor noise amount
+        # physical motor noise amount 
         self.u_noise = None
         # communication noise amount
         self.c_noise = None

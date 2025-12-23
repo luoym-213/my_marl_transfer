@@ -88,6 +88,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         
         # Initialize goals to None at the start of each episode，初始化为tensor,0
         goals = torch.zeros((len(obs), 2), dtype=torch.float32, device=args.device)
+        tasks = torch.zeros((len(obs), 1), dtype=torch.long, device=args.device)
 
         # Initial render for GIF saving (if needed)
         if should_save_gif:
@@ -120,11 +121,13 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         while not np.all(done):
             actions = []
             with torch.no_grad():
-                actions, goals = master.eval_act(obs, env_states, goals)
+                actions, goals, tasks = master.eval_act(obs, env_states, goals, tasks)
             episode_steps += 1
-            step_data = {'agents_actions': actions, 'agents_goals': goals} 
+            step_data = {'agents_actions': actions, 'agents_goals': goals, 'agents_tasks': tasks} 
             if isinstance(step_data['agents_goals'], torch.Tensor):
                 step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
+            if isinstance(step_data['agents_tasks'], torch.Tensor):
+                step_data['agents_tasks'] = step_data['agents_tasks'].cpu().numpy()
             obs, reward, high_reward, done, info, env_states = env.step(step_data)
             high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)

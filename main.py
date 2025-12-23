@@ -40,12 +40,13 @@ def train(args, return_early=False):
         for step in range(args.num_steps):
             with torch.no_grad():
                 # print("step: ", step)
-                actions_list, goals_list = master.act(step)
+                actions_list, goals_list, tasks_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             agent_goals = np.transpose(np.array(goals_list),(1,0,2))
-            # 这里需要给agent_actions和agent_goals包装一下，变成字典形式传入env.step()
-            # 需要变成num_processes个环境的列表，每个元素是一个字典，包含两个键值对: 'agents_actions', 'agents_goals'
-            step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i]} for i in range(args.num_processes)]
+            agent_tasks = np.transpose(np.array(tasks_list),(1,0,2))
+            # 这里需要给agent_actions,agent_goals,agent_tasks包装一下，变成字典形式传入env.step()
+            # 需要变成num_processes个环境的列表，每个元素是一个字典，包含键值对: 'agents_actions', 'agents_goals', 'agents_tasks'
+            step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i], 'agents_tasks': agent_tasks[i]} for i in range(args.num_processes)]
             obs, reward, high_reward, done, info, env_state = envs.step(step_data)
             ### 验证
             # print(f"Step {step} goal world coord: ", goals_list[0][0][0:2])

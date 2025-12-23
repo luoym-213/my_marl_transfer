@@ -50,8 +50,14 @@ class MultiAgentEnv(gym.Env):
         self.action_space = []
         self.observation_space = []
 
+        # landmarks 位置
+        self.landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
+
         # 初始化已访问目标集合
         self.visited_landmarks = set()
+        
+        # 初始化智能体退役状态列表
+        self.agents_done = [False] * self.n
 
         for agent in self.agents:
             total_action_space = []
@@ -98,9 +104,7 @@ class MultiAgentEnv(gym.Env):
         if self.enable_exploration_reward:
             self.world_size = 2
             self.cell_size = 0.02
-            # 收集landmark位置
-            landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
-            self.global_belief_map = GlobalBeliefMap(world_size=self.world_size, cell_size=self.cell_size, landmark_positions=landmark_positions, landmark_radius=0.05)
+            self.global_belief_map = GlobalBeliefMap(world_size=self.world_size, cell_size=self.cell_size, landmark_positions=self.landmark_positions, landmark_radius=0.05)
         else:
             self.global_belief_map = None
 
@@ -124,16 +128,22 @@ class MultiAgentEnv(gym.Env):
         last_goal_n = []
         action_n = data['agents_actions']
         goal_n = data['agents_goals']
+        task_n = data['agents_tasks']
 
         # 获取step前全局状态，智能体速度、位置，landmark位置
         state = self._get_state(self.world)
 
         # set action and goal for each agent
         for i, agent in enumerate(self.agents):
-            ## 设置agent.action,留给world.step()使用
-            self._set_action(action_n[i], agent, self.action_space[i])
-            ## 设置agent.state.g_pos, 供reward计算使用
-            self._set_goal(goal_n[i], agent)
+            # 如果智能体已经退役，设置其速度为0，不执行新动作
+            if self.agents_done[i]:
+                agent.state.p_vel = np.zeros(self.world.dim_p)
+                agent.action.u = np.zeros(self.world.dim_p)
+            else:
+                ## 设置agent.action,留给world.step()使用
+                self._set_action(action_n[i], agent, self.action_space[i])
+                ## 设置agent.state.g_pos, 供reward计算使用
+                self._set_goal(goal_n[i], agent)
         
         # 计算step前的距离奖励，即上一步智能体距离目标点的距离，以便后续计算差分奖励
         for agent in self.agents:
@@ -144,14 +154,14 @@ class MultiAgentEnv(gym.Env):
 
         # 收集当前智能体位置
         agents_pos = np.array([a.state.p_pos for a in self.agents])
-        landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
 
         # 必须在更新全图信息图前获取高层奖励，因为高层奖励依赖于step前的全局信息图
         agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
         agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
-        agents_reach_target_rewards = self.get_target_reward(agents_pos, landmark_positions)
+        # 到达目标点奖励，需要满足当前当前task = 1，即collect模式，且距离目标点小于阈值
+        agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, self.landmark_positions)
         total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards)
-
+        print("agents_done:", self.agents_done)
         # print(total_high_rewards.shape)
 
         # 根据获取的全局状态更新全局信息图
@@ -176,6 +186,7 @@ class MultiAgentEnv(gym.Env):
         info_n['goal_done'] = self._get_goal_dones(self.agents)
         info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
+        info_n['agents_done'] = self.agents_done
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
@@ -199,6 +210,12 @@ class MultiAgentEnv(gym.Env):
 
         # 势能奖励+碰撞惩罚
         all_reward =  reward_n + common_penaltie
+        
+        # 对已退役的智能体，将其奖励设置为0
+        for i in range(len(all_reward)):
+            if self.agents_done[i]:
+                all_reward[i] = 0.0
+                total_high_rewards[i] = 0.0
 
         # 拼接高层+底层奖励：[2, num_agents]
         # final_reward = np.concatenate([all_reward, total_high_rewards], axis=0)
@@ -208,15 +225,18 @@ class MultiAgentEnv(gym.Env):
     def reset(self):
         # reset world
         self.reset_callback(self.world)
-        landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
+        self.landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
 
         # 重置已访问目标集合
         self.visited_landmarks = set()
+        
+        # 重置智能体退役状态
+        self.agents_done = [False] * self.n
 
         # 重置global_belief_map
         # 根据智能体初始位置，预先更新地图
         if self.enable_exploration_reward:
-            self.global_belief_map.reset(landmark_positions)
+            self.global_belief_map.reset(self.landmark_positions)
             self.global_belief_map.update_beliefs(np.array([a.state.p_pos for a in self.world.policy_agents]), self.world.mask_obs_dist)
 
         # reset renderer
@@ -247,6 +267,7 @@ class MultiAgentEnv(gym.Env):
         reset_info['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
         # reset下，goal_done全部为True
         reset_info['goal_done'] = [True] * len(self.agents)
+        reset_info['agents_done'] = self.agents_done
 
         return obs_n, state, reset_info
     
@@ -698,13 +719,16 @@ class MultiAgentEnv(gym.Env):
     def get_obs(self):
         return [self._get_obs(agent) for agent in self.agents]
     
-    def get_target_reward(self, agents_pos, landmarks_pos):
+    def get_target_reward(self, agents_pos, agents_task, landmarks_pos):
         """
+        首先检查agents_task，只有在collect模式（1）下才计算目标奖励。
         如果智能体到达目标点，如果这个目标点未访问过，返回一个奖励值，否则返回0。
         判断准则，距离差小于world.dist_thres
+        当智能体到达目标后，会被标记为退役状态，后续将停止运动并持续返回0奖励。
         
         参数:
             agents_pos: 智能体位置数组，shape (n_agents, 2)
+            agents_task: 智能体任务列表，1表示collect模式，0表示explore模式
             landmarks_pos: 目标点位置列表，每个元素是 (x, y)
         
         返回:
@@ -720,6 +744,17 @@ class MultiAgentEnv(gym.Env):
         for agent_idx, agent_pos in enumerate(agents_pos):
             agent_reward = 0.0
             
+            # 如果智能体已经退役，直接返回0奖励
+            if self.agents_done[agent_idx]:
+                rewards.append(agent_reward)
+                continue
+            
+            # 首先检查该智能体是否处于collect模式（task=1）
+            agent_task = agents_task[agent_idx]
+            if agent_task[0] != 1:  # 只有在collect模式下才计算目标奖励
+                rewards.append(agent_reward)
+                continue
+            
             # 检查该智能体是否到达任何目标点
             for landmark_idx, landmark_pos in enumerate(landmarks_pos):
                 # 计算到目标点的距离
@@ -732,6 +767,8 @@ class MultiAgentEnv(gym.Env):
                         # 首次访问该目标，给予奖励并标记为已访问
                         agent_reward = TARGET_REWARD
                         self.visited_landmarks.add(landmark_idx)
+                        # 标记该智能体为退役状态
+                        self.agents_done[agent_idx] = True
                         break  # 一个智能体在一个step只能获得一次目标奖励
             
             rewards.append(agent_reward)

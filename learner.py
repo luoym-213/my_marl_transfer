@@ -140,6 +140,7 @@ class Learner(object):
         # 根据当前的环境中智能体的状态进行决策，生成下一步的动作列表，这里可以直接当作分层网络的总启，下面再进行细分是high还是low
         actions_list = []
         goals_list = []
+        tasks_list = []
         for team, policy in zip(self.teams_list, self.policies_list):
             # concatenate all inputs
             all_obs = torch.cat([agent.rollouts.obs[step] for agent in team])
@@ -276,8 +277,9 @@ class Learner(object):
 
                 actions_list.append(all_action[i].cpu().numpy())
                 goals_list.append(all_goals[i].cpu().numpy())
+                tasks_list.append(all_tasks[i].cpu().numpy())
 
-        return actions_list, goals_list
+        return actions_list, goals_list, tasks_list
 
     def update(self):
         return_high_vals = []
@@ -415,7 +417,7 @@ class Learner(object):
         for agent, policy in zip(self.all_agents, policies_list):
             agent.load_model(policy)
 
-    def eval_act(self, obs, env_states, goals):
+    def eval_act(self, obs, env_states, goals, tasks):
         # used only while evaluating policies. Assuming that agents are in order of team!
         # goals: 上一步的目标分配 [num_agents, 2]
         obs1 = []
@@ -438,6 +440,7 @@ class Learner(object):
         for team,policy,obs in zip(self.teams_list,self.policies_list,all_obs):
             # 默认采取之前的目标分配，[num_agents, 2]
             all_goals = goals
+            all_tasks = tasks
 
             num_agents = len(team)
 
@@ -492,13 +495,14 @@ class Learner(object):
                 # 计算线性索引: agent_idx * num_processes + process_idx
                 linear_indices = agent_indices * 1 + proc_indices
                 
-                all_goals[linear_indices] = batch_goals["waypoints"]  # [N, 2]
+                all_goals[linear_indices] = batch_goals["waypoints"]  # [N, 2] 转换为float
+                all_tasks[linear_indices] = batch_goals["action_modes"]  # [N, 1] 转换为float
 
             if len(obs)!=0:
                 _,action,_ = policy.low_level_act(torch.cat(obs).to(self.device), all_goals, deterministic=True)
                 actions.append(action.squeeze(1).cpu().numpy())
 
-        return np.hstack(actions), all_goals
+        return np.hstack(actions), all_goals, all_tasks
 
     def eval_reward_choose(self, all_rewards, task):
         n,dim = task.shape
