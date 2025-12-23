@@ -128,7 +128,9 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                 step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
             if isinstance(step_data['agents_tasks'], torch.Tensor):
                 step_data['agents_tasks'] = step_data['agents_tasks'].cpu().numpy()
-            obs, reward, high_reward, done, info, env_states = env.step(step_data)
+            obs, reward, high_reward, done_info, info, env_states = env.step(step_data)
+            done = done_info['all']
+            done_agent = done_info['agent']
             high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             obs = normalize_obs(obs, obs_mean, obs_std)

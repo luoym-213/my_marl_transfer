@@ -86,19 +86,19 @@ class MultiAgentVecNormalize(VecEnvWrapper):
             self.high_ret_rms.update(self.highret)
             high_rews = np.clip(high_rews / np.sqrt(self.high_ret_rms.var + self.epsilon), -self.cliphighrew, self.cliphighrew)
 
-        # ⭐ 重置已完成环境的累计回报
-        # 如果任一 agent done，重置该环境的所有 agent 的 ret
-        if news.ndim == 2:
-            # 如果是多智能体，检查每个环境的所有智能体
-            done_envs = np.any(news, axis=1, keepdims=True)  # (num_envs, 1)
-            done_mask = np.repeat(done_envs, self.n, axis=1)  # (num_envs, n)
-        else:
-            # 单智能体情况
-            done_mask = news.reshape(-1, 1)
+        # # ⭐ 重置已完成环境的累计回报
+        # # 如果任一 agent done，重置该环境的所有 agent 的 ret
+        # if obs.ndim >= 2:
+        #     # 如果是多智能体，检查每个环境的所有智能体
+        #     done_envs = np.any(news['all'], axis=1, keepdims=True)  # (num_envs, 1)
+        #     done_mask = np.repeat(done_envs, self.n, axis=1)  # (num_envs, n)
+        # else:
+        #     # 单智能体情况
+        #     done_mask = news.reshape(-1, 1)
 
-        # 清零已完成环境的累计回报
-        self.ret = self.ret * (1 - done_mask)
-        self.highret = self.highret * (1 - done_mask)
+        # # 清零已完成环境的累计回报
+        # self.ret = self.ret * (1 - done_mask)
+        # self.highret = self.highret * (1 - done_mask)
         
         return obs, rews, high_rews, news, infos, sta
 

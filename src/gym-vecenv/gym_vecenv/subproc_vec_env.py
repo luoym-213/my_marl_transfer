@@ -10,7 +10,7 @@ def worker(remote, parent_remote, env_fn_wrapper):
         cmd, data = remote.recv()
         if cmd == 'step':
             ob, reward, high_reward, done, info, sta = env.step(data)
-            if np.any(done):
+            if np.any(done['all']):
                 ob, sta, info = env.reset()
             remote.send((ob, reward, high_reward, done, info, sta))
         elif cmd == 'reset':

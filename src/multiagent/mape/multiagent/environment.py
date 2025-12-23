@@ -122,6 +122,7 @@ class MultiAgentEnv(gym.Env):
         reward_n = []
         done_n = []
         info_n = {'n': [], 'map': [], 'world_steps': self.world.steps}
+        done = {}
         self.agents = self.world.policy_agents
         last_reward_n = []
         current_reward_n = []
@@ -161,7 +162,6 @@ class MultiAgentEnv(gym.Env):
         # 到达目标点奖励，需要满足当前当前task = 1，即collect模式，且距离目标点小于阈值
         agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, self.landmark_positions)
         total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards)
-        print("agents_done:", self.agents_done)
         # print(total_high_rewards.shape)
 
         # 根据获取的全局状态更新全局信息图
@@ -186,7 +186,6 @@ class MultiAgentEnv(gym.Env):
         info_n['goal_done'] = self._get_goal_dones(self.agents)
         info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
-        info_n['agents_done'] = self.agents_done
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
@@ -217,10 +216,10 @@ class MultiAgentEnv(gym.Env):
                 all_reward[i] = 0.0
                 total_high_rewards[i] = 0.0
 
-        # 拼接高层+底层奖励：[2, num_agents]
-        # final_reward = np.concatenate([all_reward, total_high_rewards], axis=0)
+        done['all'] = done_n
+        done['agent'] = self.agents_done
 
-        return obs_n, all_reward, total_high_rewards, done_n, info_n, state
+        return obs_n, all_reward, total_high_rewards, done, info_n, state
 
     def reset(self):
         # reset world
@@ -267,7 +266,6 @@ class MultiAgentEnv(gym.Env):
         reset_info['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
         # reset下，goal_done全部为True
         reset_info['goal_done'] = [True] * len(self.agents)
-        reset_info['agents_done'] = self.agents_done
 
         return obs_n, state, reset_info
     

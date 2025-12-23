@@ -47,7 +47,10 @@ def train(args, return_early=False):
             # 这里需要给agent_actions,agent_goals,agent_tasks包装一下，变成字典形式传入env.step()
             # 需要变成num_processes个环境的列表，每个元素是一个字典，包含键值对: 'agents_actions', 'agents_goals', 'agents_tasks'
             step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i], 'agents_tasks': agent_tasks[i]} for i in range(args.num_processes)]
-            obs, reward, high_reward, done, info, env_state = envs.step(step_data)
+            obs, reward, high_reward, done_info, info, env_state = envs.step(step_data)
+            # 提取done_info信息,将args.num_processes个done['all']和done['agent']分别赋值给done和done_agent
+            done = np.array([done_info[i]['all'] for i in range(args.num_processes)])
+            done_agent = [done_info[i]['agent'] for i in range(args.num_processes)]
             ### 验证
             # print(f"Step {step} goal world coord: ", goals_list[0][0][0:2])
             # print(f"Step {step} obs sample: ", obs[0,0,2:4])  # 打印第一个环境的观测样本
