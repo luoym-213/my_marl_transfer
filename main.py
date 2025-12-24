@@ -50,7 +50,7 @@ def train(args, return_early=False):
             obs, reward, high_reward, done_info, info, env_state = envs.step(step_data)
             # 提取done_info信息,将args.num_processes个done['all']和done['agent']分别赋值给done和done_agent
             done = np.array([done_info[i]['all'] for i in range(args.num_processes)])
-            done_agent = [done_info[i]['agent'] for i in range(args.num_processes)]
+            done_agent = np.array([done_info[i]['agent'] for i in range(args.num_processes)])
             ### 验证
             # print(f"Step {step} goal world coord: ", goals_list[0][0][0:2])
             # print(f"Step {step} obs sample: ", obs[0,0,2:4])  # 打印第一个环境的观测样本
@@ -59,15 +59,15 @@ def train(args, return_early=False):
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward
             episode_high_rewards += high_reward
-            masks = torch.FloatTensor(1-1.0*done).to(args.device)
+            all_masks = torch.FloatTensor(1-1.0*done).to(args.device)
+            masks = torch.FloatTensor(1-1.0*done_agent).to(args.device)
             goal_dones = torch.FloatTensor([info[i]['goal_done'] for i in range(args.num_processes)]).to(args.device)
-            final_rewards *= masks
-            final_rewards += (1 - masks) * episode_rewards
-            final_high_rewards *= masks
-            final_high_rewards += (1 - masks) * episode_high_rewards
-            episode_rewards *= masks
-            episode_high_rewards *= masks
-
+            final_rewards *= all_masks
+            final_rewards += (1 - all_masks) * episode_rewards
+            final_high_rewards *= all_masks
+            final_high_rewards += (1 - all_masks) * episode_high_rewards
+            episode_rewards *= all_masks
+            episode_high_rewards *= all_masks
             master.update_rollout(obs, reward, high_reward, masks, env_state, goal_dones)
 
         master.wrap_horizon()

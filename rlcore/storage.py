@@ -156,7 +156,7 @@ class RolloutStorage(object):
             gae_discount = gamma ** step_count * tau
             
             # TD误差：累积奖励 + 折扣的下一个决策点价值 - 当前价值
-            mask_next = self.masks[step + 1] if step < self.high_rewards.size(0) - 1 else torch.ones_like(curr_value)
+            mask_next = self.masks[step + 1] if step < self.high_rewards.size(0) - 1 else torch.ones_like(curr_value) # 最后一步的mask为1
             delta = accumulated_reward + discount_factor * next_decision_value * mask_next - curr_value
             
             # GAE更新

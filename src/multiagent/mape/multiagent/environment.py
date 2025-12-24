@@ -403,7 +403,12 @@ class MultiAgentEnv(gym.Env):
         # agent pos: agent.state.p_pos
         # goal pos: agent.state.g_pos
         # threshold: self.world.dist_thres
-        return [np.linalg.norm(agent.state.p_pos - agent.state.g_pos) < self.world.dist_thres for agent in agents]
+        goal_dones = [np.linalg.norm(agent.state.p_pos - agent.state.g_pos) < self.world.dist_thres for agent in agents] 
+        # 如果agent已经退役，则goal_done也设为False
+        for i in range(len(goal_dones)):
+            if self.agents_done[i]:
+                goal_dones[i] = False
+        return goal_dones
 
     # reset rendering assets
     def _reset_render(self):
