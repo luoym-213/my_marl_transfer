@@ -19,14 +19,16 @@ class Neo(object):
     self.action = None
     self.action_log_prob = None
     self.value = None
-    self.map_obs = None
-    self.vec_obs = None
     self.critic_map = None
     self.goal = None
     self.task = None
-    self.map_log_prob = None
-    self.decision_log_prob = None
+    self.higoal_log_prob = None
     self.high_value = None
+    self.ego_nodes = None
+    self.explore_nodes = None
+    self.landmark_data = None
+    self.landmark_mask = None
+    self.critic_nodes = None
 
   def load_model(self, policy_state):
       self.actor_critic.load_state_dict(policy_state)
@@ -42,10 +44,11 @@ class Neo(object):
   def update_rollout(self, obs, reward, high_reward, mask, env_state, goal_dones):
     self.rollouts.insert(obs, self.action, self.action_log_prob, self.value, 
                          reward, high_reward, mask, env_state, 
-                         self.map_obs, self.vec_obs, self.critic_map,
-                         self.goal, self.task, 
-                         self.map_log_prob, self.decision_log_prob, 
-                         self.high_value, goal_dones)
+                         self.critic_map, self.critic_nodes, self.goal, self.task,
+                         self.higoal_log_prob, self.high_value, 
+                         self.ego_nodes, self.explore_nodes, 
+                         self.landmark_data, self.landmark_mask,
+                         goal_dones)
 
   def act(self, step, deterministic=False):
     self.value, self.action, self.action_log_prob, self.states = self.actor_critic.act(self.rollouts.obs[step],

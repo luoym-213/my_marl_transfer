@@ -204,15 +204,6 @@ class JointPPO():
         self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
 
     def update(self, rollouts_list, dense_critic=True):
-        """
-        支持双头Actor的PPO更新:
-        - 决策头: 生成 [explore=0, collect=1]
-        - 探索头: 生成 waypoints [x, y]
-        
-        更新策略:
-        - collect模式(task=1): 只更新决策头 + Critic
-        - explore模式(task=0): 更新决策头 + 探索头 + Critic
-        """
         # rollouts_list - list of rollouts of agents which share self.actor_critic policy
         advantages_list = []
         for rollout in rollouts_list:
@@ -222,27 +213,20 @@ class JointPPO():
             advantages_list.append(advantages) # [num_steps, num_processes, 1]
 
         value_loss_epoch = 0
-        decision_loss_epoch = 0
-        waypoint_loss_epoch = 0
-        decision_entropy_epoch = 0
-        waypoint_entropy_epoch = 0
-
-        # 统计决策点、探索点、生成点数量
-        total_decision_points = 0
-        total_explore_points = 0
-        total_collect_points = 0
-        total_samples = 0
+        node_loss_epoch = 0
+        node_entropy_epoch = 0
 
         for e in range(self.ppo_epoch):
             data_generator = smdp_feed_forward_generator(rollouts_list, advantages_list, self.num_mini_batch)
             
             for sample in data_generator:
-                (env_states_batch, map_obs_batch, vec_obs_batch, critic_maps_batch,
+                (env_states_batch, obs_batch, critic_maps_batch, critic_nodes_batch,
                  goals_batch, tasks_batch,
-                 map_log_probs_batch, decision_log_probs_batch,
+                 higoal_log_probs_batch,
                  high_value_preds_batch, high_return_batch,
                  masks_batch, goal_dones_batch, high_adv_targ,
-                 agent_ids_batch) = sample
+                 agent_ids_batch, ego_nodes_batch, explore_nodes_batch,
+                 landmark_datas_batch, landmark_masks_batch) = sample
                 
                 # === 1. 提取各种mask ===
                 decision_mask = goal_dones_batch.squeeze(-1) > 0.5  # [batch_size] - 是否是决策点
@@ -250,48 +234,33 @@ class JointPPO():
                 collect_mask = (tasks_batch.squeeze(-1) > 0.5) & decision_mask  # task=1 且是决策点
                 
                 num_decisions = decision_mask.sum().item()
-                num_explore = explore_mask.sum().item()
-                num_collect = collect_mask.sum().item()
-                
-                total_decision_points += num_decisions
-                total_explore_points += num_explore
-                total_collect_points += num_collect
-                total_samples += goal_dones_batch.size(0)
 
                 # === 2. 评估高层动作（前向传播所有数据）===
                 # 返回: high_values, new_decision_log_probs, new_map_log_probs, 
                 #       decision_dist_entropy, waypoint_dist_entropy
                 # 评估高层动作（全部数据都forward）
-                (high_values, new_decision_log_probs, new_map_log_probs, 
-                 decision_dist_entropy, waypoint_dist_entropy) = \
+                (high_values, new_higoal_log_probs, higoal_dist_entropy) = \
                     self.actor_critic.evaluate_high_actions(
-                        env_states_batch,
-                        map_obs_batch, vec_obs_batch,
-                        critic_maps_batch,
+                        env_states_batch, obs_batch,
+                        critic_maps_batch, critic_nodes_batch,
                         goals_batch, tasks_batch,
+                        ego_nodes_batch, explore_nodes_batch,
+                        landmark_datas_batch, landmark_masks_batch,
                         agent_ids=agent_ids_batch   # ⭐ 传入智能体ID
                     )
                 
                 # high_values: [batch_size, 1]
-                # new_decision_log_probs: [batch_size, 1] - 决策头的log prob
-                # new_map_log_probs: [batch_size, 1] - 探索头的log prob
-                # decision_dist_entropy: [batch_size, 1]
-                # waypoint_dist_entropy: [batch_size, 1]
+                # new_higoal_log_probs: [batch_size, 1] - 决策log prob
+                # higoal_dist_entropy: [batch_size, 1] - 决策熵
 
                 # === 3. 只在相应的mask上计算熵 ===
                 # 注意：evaluate_high_actions 应该返回 [batch_size] 的熵，而不是标量
                 
                 # 决策熵：只在决策点计算
                 if num_decisions > 0:
-                    decision_entropy_masked = decision_dist_entropy[decision_mask].mean()
+                    decision_entropy_masked = higoal_dist_entropy[decision_mask].mean()
                 else:
                     decision_entropy_masked = torch.tensor(0.0, device=high_values.device)
-                
-                # 探索熵：只在explore点计算
-                if num_explore > 0:
-                    waypoint_entropy_masked = waypoint_dist_entropy[explore_mask].mean()
-                else:
-                    waypoint_entropy_masked = torch.tensor(0.0, device=high_values.device)
 
                 # === 4. Critic Loss（密集更新：所有点）===
                 if dense_critic:
@@ -332,7 +301,7 @@ class JointPPO():
                 # === 5. Actor Loss - 决策头（所有决策点）===
                 if num_decisions > 0:
                     # 计算决策头的ratio
-                    decision_ratio = torch.exp(new_decision_log_probs - decision_log_probs_batch)
+                    decision_ratio = torch.exp(new_higoal_log_probs - higoal_log_probs_batch)
                     decision_surr1 = decision_ratio * high_adv_targ
                     decision_surr2 = torch.clamp(decision_ratio, 1.0 - self.clip_param,
                                                  1.0 + self.clip_param) * high_adv_targ
@@ -343,69 +312,31 @@ class JointPPO():
                 else:
                     decision_loss = torch.tensor(0.0, device=high_values.device)
 
-                # === 6. Actor Loss - 探索头（只在explore模式的决策点）===
-                if num_explore > 0:
-                    # 计算探索头的ratio（只在explore点）
-                    waypoint_ratio = torch.exp(new_map_log_probs[explore_mask] - 
-                                              map_log_probs_batch[explore_mask])
-                    waypoint_surr1 = waypoint_ratio * high_adv_targ[explore_mask]
-                    waypoint_surr2 = torch.clamp(waypoint_ratio, 1.0 - self.clip_param,
-                                                 1.0 + self.clip_param) * high_adv_targ[explore_mask]
-                    
-                    waypoint_loss = -torch.min(waypoint_surr1, waypoint_surr2).mean()
-                else:
-                    waypoint_loss = torch.tensor(0.0, device=high_values.device)
-
-                # === 7. 总Loss（带梯度控制）===
+                # === 6. 总Loss（带梯度控制）===
                 # 注意：在collect模式下，探索头的梯度应该被阻止
                 total_loss = (value_loss * self.value_loss_coef + 
                              decision_loss - 
                              decision_entropy_masked * self.entropy_coef)
-                
-                # 只在有explore点时才加入探索头的loss
-                if num_explore > 0:
-                    total_loss = total_loss + waypoint_loss - waypoint_entropy_masked * self.entropy_coef
 
-                # === 8. 反向传播和优化 ===
+                # === 7. 反向传播和优化 ===
                 self.optimizer.zero_grad()
                 total_loss.backward()
-                
-                # 可选：在collect模式下手动清零探索头的梯度
-                # 这样可以确保collect时探索头完全不更新
-                if num_collect > 0 and num_explore == 0:
-                    # 如果这个batch只有collect点，清零探索头参数的梯度
-                    for name, param in self.actor_critic.named_parameters():
-                        if 'waypoint' in name or 'map_head' in name:  # 根据您的网络结构调整
-                            if param.grad is not None:
-                                param.grad.zero_()
 
                 nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
                 self.optimizer.step()
 
                 # 统计loss
                 value_loss_epoch += value_loss.item()
-                decision_loss_epoch += decision_loss.item()
-                waypoint_loss_epoch += waypoint_loss.item()
-                decision_entropy_epoch += decision_entropy_masked.item()
-                waypoint_entropy_epoch += waypoint_entropy_masked.item()
+                node_loss_epoch += decision_loss.item()
+                node_entropy_epoch += decision_entropy_masked.item()
 
         num_updates = self.ppo_epoch * self.num_mini_batch
 
         value_loss_epoch /= num_updates
-        decision_loss_epoch /= num_updates
-        waypoint_loss_epoch /= num_updates
-        decision_entropy_epoch /= num_updates
-        waypoint_entropy_epoch /= num_updates
+        node_loss_epoch /= num_updates
+        node_entropy_epoch /= num_updates
 
-        # 打印统计信息
-        """
-        if total_decision_points > 0:
-            print(f"Decision points: {total_decision_points} "
-                  f"(Explore: {total_explore_points}, Collect: {total_collect_points})")
-        """
-
-        return (value_loss_epoch, decision_loss_epoch, waypoint_loss_epoch, 
-                decision_entropy_epoch, waypoint_entropy_epoch)
+        return (value_loss_epoch, node_loss_epoch, node_entropy_epoch)
                 
             
 def feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
@@ -441,32 +372,34 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     
     # 收集所有agent的数据
     all_env_states = []
-    all_map_obs = []
-    all_vec_obs = []
+    all_obs = []
     all_critic_maps = []
+    all_critic_nodes = []
     all_goals = []
     all_tasks = []
-    all_map_log_probs = []
-    all_decision_log_probs = []
+    all_higoal_log_probs = []
     all_high_value_preds = []
     all_high_returns = []
     all_masks = []
     all_goal_dones = []
     all_advantages = []
     all_agent_ids = []  # ⭐ 新增: 记录智能体ID
+    all_ego_nodes = []
+    all_explore_nodes = []
+    all_landmark_datas = []
+    all_landmark_masks = []
 
     for agent_id, (rollout, advantages) in enumerate(zip(rollouts_list, advantages_list)):
         batch_size = num_steps * num_processes
 
         # 展平所有数据 [num_steps, num_processes, ...] -> [num_steps * num_processes, ...]
         all_env_states.append(rollout.env_states[:-1].view(-1, rollout.env_states.size(-1)))
-        all_map_obs.append(rollout.map_obs.view(-1, *rollout.map_obs.size()[2:]))  # [N, 4, H, W]
-        all_vec_obs.append(rollout.vec_obs.view(-1, rollout.vec_obs.size(-1)))  # [N, vec_dim]
-        all_critic_maps.append(rollout.critic_maps.view(-1, *rollout.critic_maps.size()[2:]))  # [N, 4, H, W]
+        all_obs.append(rollout.obs[:-1].view(-1, *rollout.obs.size()[2:]))
+        all_critic_maps.append(rollout.critic_maps.view(-1, *rollout.critic_maps.size()[2:]))  # [N, 3, H, W]
+        all_critic_nodes.append(rollout.critic_nodes.view(-1, *rollout.critic_nodes.size()[2:]))  # [N, num_agents, 4]
         all_goals.append(rollout.goals.view(-1, rollout.goals.size(-1)))  # [N, 2]
         all_tasks.append(rollout.tasks.view(-1, rollout.tasks.size(-1)))  # [N, 1]
-        all_map_log_probs.append(rollout.map_log_probs.view(-1, 1))
-        all_decision_log_probs.append(rollout.decision_log_probs.view(-1, 1))
+        all_higoal_log_probs.append(rollout.higoal_log_probs.view(-1, 1))
         all_high_value_preds.append(rollout.high_values[:-1].view(-1, 1))
         all_high_returns.append(rollout.high_returns[:-1].view(-1, 1))
         all_masks.append(rollout.masks[:-1].view(-1, 1))
@@ -475,22 +408,29 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         # ⭐ 记录智能体ID
         agent_ids = torch.full((batch_size,), agent_id, dtype=torch.long)
         all_agent_ids.append(agent_ids)
+        all_ego_nodes.append(rollout.ego_nodes.view(-1, rollout.ego_nodes.size(-1)))
+        all_explore_nodes.append(rollout.explore_nodes.view(-1, *rollout.explore_nodes.size()[2:])) # [N, K, 4]
+        all_landmark_datas.append(rollout.landmark_datas[:-1].view(-1, *rollout.landmark_datas.size()[2:])) # [N, M, landmark_dim]
+        all_landmark_masks.append(rollout.landmark_masks[:-1].view(-1, *rollout.landmark_masks.size()[2:])) # [N, M, 1]
     
     # 拼接所有agent的数据
     env_states_all = torch.cat(all_env_states, 0)  # [num_agents * num_steps * num_processes, env_state_dim]
-    map_obs_all = torch.cat(all_map_obs, 0)  # [num_agents * num_steps * num_processes, 4, H, W]
-    vec_obs_all = torch.cat(all_vec_obs, 0)  # [num_agents * num_steps * num_processes, vec_dim]
-    critic_maps_all = torch.cat(all_critic_maps, 0)  # [num_agents * num_steps * num_processes, 4, H, W]
+    obs_all = torch.cat(all_obs, 0)  # [num_agents * num_steps * num_processes, ...]
+    critic_maps_all = torch.cat(all_critic_maps, 0)  # [num_agents * num_steps * num_processes, 3, H, W]
+    critic_nodes_all = torch.cat(all_critic_nodes, 0)  # [num_agents * num_steps * num_processes, num_agents, 4]
     goals_all = torch.cat(all_goals, 0)
     tasks_all = torch.cat(all_tasks, 0)
-    map_log_probs_all = torch.cat(all_map_log_probs, 0)
-    decision_log_probs_all = torch.cat(all_decision_log_probs, 0)
+    higoal_log_probs_all = torch.cat(all_higoal_log_probs, 0)
     high_value_preds_all = torch.cat(all_high_value_preds, 0)
     high_returns_all = torch.cat(all_high_returns, 0)
     masks_all = torch.cat(all_masks, 0)
     goal_dones_all = torch.cat(all_goal_dones, 0)
     advantages_all = torch.cat(all_advantages, 0)
     agent_ids_all = torch.cat(all_agent_ids, 0)  # ⭐ 拼接智能体ID
+    ego_nodes_all = torch.cat(all_ego_nodes, 0)
+    explore_nodes_all = torch.cat(all_explore_nodes, 0)
+    landmark_datas_all = torch.cat(all_landmark_datas, 0)
+    landmark_masks_all = torch.cat(all_landmark_masks, 0)
     
     # === 关键改进：Advantage 归一化只在决策点上进行 ===
     decision_mask = (goal_dones_all.squeeze(-1) > 0.5)
@@ -507,7 +447,7 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         advantages_all = (advantages_all - advantages_all.mean()) / (advantages_all.std() + 1e-5)
     
     # === 使用全量数据 ===
-    batch_size = map_obs_all.size(0)
+    batch_size = env_states_all.size(0)
     
     if batch_size < num_mini_batch:
         num_mini_batch = max(1, batch_size)
@@ -523,26 +463,30 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     
     for indices in sampler:
         env_states_batch = env_states_all[indices]  # [mini_batch_size, env_state_dim]
-        map_obs_batch = map_obs_all[indices]  # [mini_batch_size, 4, H, W]
-        vec_obs_batch = vec_obs_all[indices]  # [mini_batch_size, vec_dim]
+        obs_batch = obs_all[indices]  # [mini_batch_size, ...]
         critic_maps_batch = critic_maps_all[indices]  # [mini_batch_size, 4, H, W]
+        critic_nodes_batch = critic_nodes_all[indices]  # [mini_batch_size, num_agents, 4]
         goals_batch = goals_all[indices]  # [mini_batch_size, 2]
         tasks_batch = tasks_all[indices]  # [mini_batch_size, 1]
-        map_log_probs_batch = map_log_probs_all[indices]
-        decision_log_probs_batch = decision_log_probs_all[indices]
+        higoal_log_probs_batch = higoal_log_probs_all[indices]
         high_value_preds_batch = high_value_preds_all[indices]
         high_return_batch = high_returns_all[indices]
         masks_batch = masks_all[indices]
         goal_dones_batch = goal_dones_all[indices]  # ← 关键：yield mask
         adv_targ = advantages_all[indices]
         agent_ids_batch = agent_ids_all[indices].to(high_value_preds_batch.device)  # ⭐ 提取智能体ID batch
+        ego_nodes_batch = ego_nodes_all[indices]
+        explore_nodes_batch = explore_nodes_all[indices]
+        landmark_datas_batch = landmark_datas_all[indices]
+        landmark_masks_batch = landmark_masks_all[indices]
         
-        yield (env_states_batch, map_obs_batch, vec_obs_batch, critic_maps_batch,
+        yield (env_states_batch, obs_batch, critic_maps_batch, critic_nodes_batch,
                goals_batch, tasks_batch,
-               map_log_probs_batch, decision_log_probs_batch,
+               higoal_log_probs_batch,
                high_value_preds_batch, high_return_batch, 
                masks_batch, goal_dones_batch, adv_targ,
-               agent_ids_batch)  # ⭐ 返回智能体ID batch
+               agent_ids_batch, ego_nodes_batch, explore_nodes_batch,
+               landmark_datas_batch, landmark_masks_batch)  # ⭐ 返回智能体ID batch
         
 def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_batch, seq_length=30):
     """

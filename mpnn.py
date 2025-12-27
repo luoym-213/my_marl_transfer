@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import math
 from scipy.optimize import linear_sum_assignment  # 匈牙利算法
 from torch.distributions import Categorical as TorchCategorical
+from planning.rrt_GNN import RRT_GNN, plan_batch
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -126,7 +127,46 @@ class MPNN(nn.Module):
                 nn.ReLU()
             ),
             
-            # 决策头
+            # ===== 动态图推理模块 =====
+            # Ego节点编码器 [5] -> [64]
+            'ego_node_encoder': nn.Sequential(
+                nn.Linear(5, 32),
+                nn.ReLU(),
+                nn.Linear(32, 64),
+                nn.ReLU()
+            ),
+            
+            # Explore节点编码器 [4] -> [64]
+            'explore_node_encoder': nn.Sequential(
+                nn.Linear(4, 32),
+                nn.ReLU(),
+                nn.Linear(32, 64),
+                nn.ReLU()
+            ),
+            
+            # Landmark节点编码器 [4] -> [64]
+            'landmark_node_encoder': nn.Sequential(
+                nn.Linear(4, 32),
+                nn.ReLU(),
+                nn.Linear(32, 64),
+                nn.ReLU()
+            ),
+            
+            # 边编码器 [3] -> [32]
+            'edge_encoder': nn.Sequential(
+                nn.Linear(3, 32),
+                nn.ReLU()
+            ),
+            
+            # 注意力投影层
+            'q_proj': nn.Linear(64, 64),  # ego -> query
+            'k_proj': nn.Linear(96, 64),  # node(64) + edge(32) -> key
+            'v_proj': nn.Linear(96, 64),  # node(64) + edge(32) -> value
+            
+            # 节点选择头（统一对所有节点打分）
+            'node_selection_head': nn.Linear(64, 1),
+            
+            # 决策头（保留用于其他用途，如果不需要可以删除）
             'decision_head': nn.Sequential(
                 nn.Linear(128, 64),
                 nn.ReLU(),
@@ -159,8 +199,9 @@ class MPNN(nn.Module):
     def _build_high_critic_modules(self):
         """构建高层 Critic"""
         high_critic = nn.ModuleDict({
+            # 全局地图编码器 [B, 3, H, W] -> [B, 256]
             'map_backbone': nn.Sequential(
-                nn.Conv2d(4, 16, kernel_size=5, stride=2, padding=2),
+                nn.Conv2d(3, 16, kernel_size=5, stride=2, padding=2),
                 nn.ReLU(),
                 nn.Conv2d(16, 32, kernel_size=3, stride=2, padding=1),
                 nn.ReLU(),
@@ -173,21 +214,25 @@ class MPNN(nn.Module):
                 nn.Linear(64 * 6 * 6, 256),
                 nn.ReLU()
             ),
-            'vec_encoder': nn.Sequential(
-                nn.Linear(self.num_agents * 2 + self.num_agents * 2, 128),
+            
+            # 单个智能体状态编码器 [4] -> [64]
+            'agent_encoder': nn.Sequential(
+                nn.Linear(4, 32),  # [x, y, x_g, y_g]
                 nn.ReLU(),
-                nn.Linear(128, 128),
+                nn.Linear(32, 64),
                 nn.ReLU()
             ),
+            
+            # 融合层：全局特征(256) + 智能体特征(64) -> 价值
             'fusion_layer': nn.Sequential(
-                nn.Linear(256 + 128, 256),
+                nn.Linear(256 + 64, 128),
                 nn.ReLU(),
-                nn.Linear(256, 128),
+                nn.Linear(128, 128),
                 nn.ReLU()
             )
         })
         
-        # 每个智能体的独立输出头
+        # 每个智能体的独立价值输出头
         high_critic['value_heads'] = nn.ModuleList([
             nn.Linear(128, 1) for _ in range(self.num_agents)
         ])
@@ -458,8 +503,8 @@ class MPNN(nn.Module):
         return self.modules_dict['high_critic']['map_compress']
     
     @property
-    def critic_vec_encoder(self):
-        return self.modules_dict['high_critic']['vec_encoder']
+    def critic_agent_encoder(self):
+        return self.modules_dict['high_critic']['agent_encoder']
     
     @property
     def critic_fusion_layer(self):
@@ -474,195 +519,441 @@ class MPNN(nn.Module):
         return 64 * 6 * 6
     
     @property
-    def critic_vec_input_dim(self):
-        return self.num_agents * 2 + self.num_agents * 2
-
-    def high_level_forward(self, vec_inp, map_inp):
-        """
-        map_input: [Batch, 4, 100, 100] 
-                   Channel 0: Belief Map 
-                   Channel 1: Entropy Map
-                   Channel 2: Voronoi Mask (0/1) 
-                   Channel 3: Distance Field
-        vec_input: [Batch, 5]
-        """
-        batch_size = map_inp.size(0)
-
-        # ---------------------------
-        # A. 提取特征 (Backbone)
-        # ---------------------------
-        
-        # 1. 空间特征 F_spatial: [B, 64, 12, 12]
-        f_spatial = self.map_conv1(map_inp)
-        f_spatial = self.map_conv2(f_spatial)
-        f_spatial = self.map_conv3(f_spatial)
-
-        # 2. 向量特征 f_vec: [B, 64]
-        f_vec = self.vec_mlp(vec_inp)
-
-        # ---------------------------
-        # B. 特征融合 (Masked Pooling)
-        # ---------------------------
-        
-        # 1. 取出原始 Voronoi Mask (假设是第2个通道) -> [B, 2, 100, 100]
-        voronoi_mask_raw = map_inp[:, 2:3, :, :]
-
-        # 2. 下采样 Mask 到 12x12，模式为 nearest (保持 0/1 硬边界)
-        mask_down = F.interpolate(voronoi_mask_raw, size=(12, 12), mode='nearest')
-        
-        # 3. Masked Global Average Pooling
-        # 只对 Voronoi 区域内的特征求和
-        masked_features = f_spatial * mask_down 
-        sum_features = torch.sum(masked_features, dim=(2, 3)) # [B, 64]
-        
-        # 计算区域面积 (像素数)，加 epsilon 防止除以 0
-        area = torch.sum(mask_down, dim=(2, 3)) + 1e-5 # [B, 1]
-        
-        # 得到局部区域的平均特征向量 v_map: [B, 64]
-        v_map = sum_features / area 
-
-        # 4. 生成共享向量 h_shared: [B, 128]
-        h_shared = torch.cat([v_map, f_vec], dim=1)
-
-        # ---------------------------
-        # C. 决策头 (Decision Head)
-        # ---------------------------
-        
-        # 输出 [Explore, Collect] 的 Logits: [B, 2]
-        decision_logits = self.decision_head(h_shared)
-
-        # ---------------------------
-        # D. 探索点生成头 (Waypoint Head)
-        # ---------------------------
-        
-        # 1. 广播 h_shared 到空间尺寸: [B, 128, 12, 12]
-        h_shared_expanded = h_shared.view(batch_size, 128, 1, 1).expand(-1, -1, 12, 12)
-        
-        # 2. 拼接空间特征与全局特征: [B, 192, 12, 12]
-        decoder_in = torch.cat([f_spatial, h_shared_expanded], dim=1)
-        
-        # 3. 解码生成热力图 Logits: [B, 1, 100, 100]
-        x = self.decoder_fuse(decoder_in)
-        x = self.decoder_up1(x)
-        x = self.decoder_up2(x)
-        heatmap_logits = self.decoder_out(x)
-
-        # ---------------------------
-        # E. 后处理 (Masking)
-        # ---------------------------
-        
-        # 关键步骤：再次使用原始 Voronoi Mask
-        # 将非势力范围内的 Logits 设为负无穷
-        # mask == 0 的地方填入 -1e9
-        heatmap_logits = heatmap_logits.masked_fill(voronoi_mask_raw == 0, -1e9)
-        
-        # 展平以便后续采样: [B, 10000]
-        flat_heatmap_logits = heatmap_logits.view(batch_size, -1)
-
-        return decision_logits, flat_heatmap_logits
-
-    def get_high_level_goal(self, vec_inp, map_inp, deterministic=False):
-        """
-        采样动作的辅助函数 (用于 Rollout)
-        """
-        decision_logits, heatmap_logits = self.high_level_forward(vec_inp, map_inp)
-
-        # ============================================================
-        # 基于 B_candidate 的动作掩码 (Action Masking)
-        # 向量流结构: <x_pos, y_pos, B_candidate, x_target, y_target>
-        # B_candidate 位于索引 2
-        b_candidate = vec_inp[:, 2] # Shape: [Batch]
-
-        # 为了不破坏计算图（如果是训练过程），建议 clone 一份 logits
-        # 如果只是推理 rollout，不 clone 也可以，但 clone 是好习惯
-        masked_decision_logits = decision_logits.clone()
-
-        # 找到没有候选点的样本索引 (B_candidate == 0)
-        # 注意：浮点数比较建议用 < 0.5 或者 isclose，这里假设输入是严格的 0/1
-        mask_no_candidate = (b_candidate < 0.5) 
-
-        # 将这些样本的 COLLECT 动作 (索引 1) 的 Logit 设为负无穷
-        # -1e9 在 Softmax 后会变成 0
-        masked_decision_logits[mask_no_candidate, 1] = -1e9
-
-        # ============================================================
-        # 采样动作并计算 log_probs（关键修改）
-        # ============================================================
+    def ego_node_encoder(self):
+        return self.modules_dict['high_level']['ego_node_encoder']
     
-        # 1. 决策动作
-        decision_probs = F.softmax(masked_decision_logits, dim=-1)
-        dist_mode = TorchCategorical(probs=decision_probs)
+    @property
+    def explore_node_encoder(self):
+        return self.modules_dict['high_level']['explore_node_encoder']
     
-        if deterministic:
-            action_mode = torch.argmax(decision_probs, dim=-1)
+    @property
+    def landmark_node_encoder(self):
+        return self.modules_dict['high_level']['landmark_node_encoder']
+    
+    @property
+    def edge_encoder(self):
+        return self.modules_dict['high_level']['edge_encoder']
+    
+    @property
+    def q_proj(self):
+        return self.modules_dict['high_level']['q_proj']
+    
+    @property
+    def k_proj(self):
+        return self.modules_dict['high_level']['k_proj']
+    
+    @property
+    def v_proj(self):
+        return self.modules_dict['high_level']['v_proj']
+    
+    @property
+    def node_selection_head(self):
+        return self.modules_dict['high_level']['node_selection_head']
+    
+    @property
+    def attn_dim(self):
+        return 64
+
+    def get_explore_nodes(self, vec_inp, map_inp, agent_indices=None, deterministic=False):
+        """
+        vec_inp: [Batch, num_agents, 4]，世界坐标：[x_pos, y_pos, x_goal, y_goal]
+        map_inp: [2, Batch, num_agents, H, W], (0: entropy, 1: voronoi_mask)
+        agent_indices: [N] 可选，仅在部分智能体更新时提供
+        """
+
+        # 1. 通过RRT生成候选目标点
+        ## 输入vec_inp:[Batch, 2], map_inp:[2,Batch, H, W]
+        ## 输出候选目标点B_candidate:[Batch, K, 3]，离散栅格坐标
+        ### vec_inp转化为离散栅格坐标
+        B_pro = vec_inp.size(0) 
+        if agent_indices is not None:
+            # agent_indices: [B_pro]
+            batch_idx = torch.arange(B_pro, device=vec_inp.device)
+            
+            # [B_pro, num_agents, 4] -> [B_pro, 1, 4]
+            update_nodes = vec_inp[batch_idx, agent_indices].unsqueeze(1)
+            
+            # [2, B_pro, num_agents, H, W] -> [B_pro, 1, H, W]
+            voronoi_np = map_inp[1, batch_idx, agent_indices].unsqueeze(1).detach().cpu().numpy().astype(bool)
+            entropy_np = map_inp[0, batch_idx, agent_indices].unsqueeze(1).detach().cpu().numpy().astype(np.float32)
         else:
-            action_mode = dist_mode.sample().squeeze(-1)    # [batch]
+            update_nodes = vec_inp
+            voronoi_np = map_inp[1].detach().cpu().numpy().astype(bool)
+            entropy_np = map_inp[0].detach().cpu().numpy().astype(np.float32)
 
+        B_agents = update_nodes.size(1) # 如果指定了indices，这里是1；否则是num_agents        
 
-
-        # ✅ 计算决策动作的 log_prob
-        decision_log_prob = dist_mode.log_prob(action_mode)  # [Batch]
-    
-        # 2. 导航点动作
-        heatmap_probs = F.softmax(heatmap_logits, dim=-1)   # [Batch, 10000]
-        dist_map = TorchCategorical(probs=heatmap_probs)
-
-        if deterministic:
-            flat_idx = torch.argmax(heatmap_probs, dim=-1)
-        else:
-            flat_idx = dist_map.sample().squeeze(-1)    # [batch]
-    
-        # ✅ 计算导航点动作的 log_prob
-        map_log_prob = dist_map.log_prob(flat_idx)  # [Batch]
-    
-        # 3. 转换坐标
-        y_coords = torch.div(flat_idx, 100, rounding_mode='floor')  # 向下取整（推荐用于坐标计算）
-        x_coords = flat_idx % 100
-        if x_coords.dim() > 1:
-            x_coords = x_coords.squeeze(-1)  # 移除最后一维
-        if y_coords.dim() > 1:
-            y_coords = y_coords.squeeze(-1)
-        ## 转换为世界坐标
-        x_coords = x_coords * 0.02 + (-1 + 0.01)  # 转换为[-0.99, 1.01]的世界坐标
-        y_coords = y_coords * 0.02 + (-1 + 0.01)  # 转换为[-0.99, 1.01]的世界坐标
-
-        # 4. 根据决策调整导航点
-        target_x = vec_inp[:, 3]
-        target_y = vec_inp[:, 4]
-        collect_mask = (action_mode == 1)  # [Batch]
-        x_coords = torch.where(collect_mask, target_x.long(), x_coords)
-        y_coords = torch.where(collect_mask, target_y.long(), y_coords)
-        waypoints = torch.stack([x_coords, y_coords], dim=1).float()  # [Batch, 2]
+        # update_nodes: [B_pro, B_agents, 4] -> 选取位置部分 [B_pro*B_agents, 2]
+        starte_nodes = self._world_to_grid_torch(update_nodes.view(-1, update_nodes.size(2))[:, :2], H=100, W=100)  # [B_pro*B_agents, 2] 整数栅格坐标
+        voronoi_inp = voronoi_np.reshape(-1, voronoi_np.shape[-2], voronoi_np.shape[-1])  # [B_pro*B_agents, H, W]
+        entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])  # [B_pro*B_agents, H, W]
         
+        batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=60, top_k=5)  # [B_pro*B_agents, K, 3]
+        batch_rtt = torch.tensor(batch_rtt, dtype=torch.long, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
+        
+        ## 转为世界坐标
+        explore_nodes_world = self._grid_to_world_torch(batch_rtt[..., :2].float(), H=100, W=100)  # [B_pro, B_agents, K, 2]
+        
+        # update_nodes: [B_pro, B_agents, 4]，前两维是 ego 的位置
+        ego_positions = update_nodes[..., :2]  # [B_pro, B_agents, 2]
+        
+        # 广播减法：explore_nodes_world [B_pro, B_agents, K, 2] - ego_positions [B_pro, B_agents, 1, 2]
+        relative_explore_positions = explore_nodes_world - ego_positions.unsqueeze(2)  # [B_pro, B_agents, K, 2]
+        
+        ## 拼接成候选点特征（现在前两维是相对位置）
+        explore_nodes = torch.cat([relative_explore_positions, batch_rtt[..., 2:3].float()], dim=-1)  # [B_pro, B_agents, K, 3]
+
+        ## 补充候选点节点特征 - Occupied Feature
+        d0 = 0.3
+        # 提取所有智能体的目标位置 [B_pro, num_agents, 2]
+        all_goals = vec_inp[..., 2:4]        
+        
+        # 计算距离矩阵（这里仍然使用绝对位置计算距离）
+        # explore_nodes_world: [B_pro, B_agents, K, 2]（绝对位置）
+        # all_goals: [B_pro, num_agents, 2]（绝对位置）
+        dists = torch.norm(explore_nodes_world.unsqueeze(3) - all_goals.unsqueeze(1).unsqueeze(1), dim=-1)
+
+        mask = torch.ones_like(dists, dtype=torch.bool)
+        if agent_indices is not None:
+            batch_idx = torch.arange(B_pro, device=vec_inp.device)
+            mask[batch_idx, 0, :, agent_indices] = False
+        else:
+            diag_mask = torch.eye(B_agents, device=vec_inp.device).bool()
+            mask = ~diag_mask.view(1, B_agents, 1, B_agents).expand(B_pro, B_agents, 5, B_agents)
+
+        dists = torch.where(mask, dists, torch.tensor(float('inf'), device=dists.device))
+
+        valid_mask = (dists < d0)
+        occ_vals = ((d0 - dists) / d0).pow(2)
+        occ_vals = torch.where(valid_mask, occ_vals, torch.tensor(0.0, device=dists.device))
+        
+        occupied_feature = occ_vals.sum(dim=-1, keepdim=True) # [B_pro, B_agents, K, 1]
+        
+        # ✅ 最终的 explore_nodes: [B_pro, B_agents, K, 4]
+        # 前两维是相对位置，第三维是熵值，第四维是 occupied 特征
+        explore_nodes = torch.cat([explore_nodes, occupied_feature], dim=-1)  # [B_pro, B_agents, K, 4]
+
+        return explore_nodes
+
+    def get_landmark_nodes(self, agent_positions, detected, detected_mask, linear_indices):
+        """
+        agent_positions: [num_agents * num_processes, 2]，世界坐标
+        detected: [num_agents * num_processes, max_landmarks, 4]，landmark特征 [x, y, utility, is_targeted]
+        detected_mask: [num_agents * num_processes, max_landmarks, 1]，候选点有效掩码
+        linear_indices: [N]，需要决策的智能体的线性索引
+
+        return:
+            batch_landmark_nodes: List of Tensors, 每个 Tensor 形状为 [L_i, 4]，一共Batch个需要决策智能体
+                                  特征为 [relative_x, relative_y, utility, is_targeted]
+            batch_landmark_nodes_masks: List of Tensors, 每个 Tensor 形状为 [L_i, 1]，一共Batch个需要决策智能体
+            如果有智能体没有有效 landmark，则对应的 Tensor 形状为 [1, 4] 和 [1, 1]，内容全0（后续会被mask掉）
+        """
+        # 从更新后的 landmark 数据中提取对应的 landmarks
+        batch_landmark_data = detected[linear_indices]  # [N, max_landmarks, 4]
+        batch_landmark_mask = detected_mask[linear_indices]  # [N, max_landmarks, 1]
+        
+        # 提取对应智能体的位置 [N, 2]
+        ego_positions = agent_positions[linear_indices]  # [N, 2]
+
+        batch_landmark_nodes = []
+        batch_landmark_nodes_masks = []
+
+        for i in range(len(linear_indices)):
+            # 获取有效的 landmarks
+            valid_mask = batch_landmark_mask[i, :, 0] > 0.5  # [max_landmarks]
+            valid_landmarks = batch_landmark_data[i, valid_mask]  # [L_i, 4]，L_i 是该智能体的有效 landmark 数量
+            
+            if valid_landmarks.shape[0] > 0:
+                # 提取 landmark 的世界坐标 [L_i, 2]
+                landmark_world_pos = valid_landmarks[:, :2]
+                
+                # 计算相对位置：landmark_pos - agent_pos
+                # ego_positions[i]: [2]
+                # landmark_world_pos: [L_i, 2]
+                relative_pos = landmark_world_pos - ego_positions[i].unsqueeze(0)  # [L_i, 2]
+                
+                # 拼接相对位置和其他特征（utility, is_targeted）
+                landmark_features = torch.cat([
+                    relative_pos,              # [L_i, 2] - 相对位置
+                    valid_landmarks[:, 2:]     # [L_i, 2] - utility, is_targeted
+                ], dim=-1)  # [L_i, 4]
+                
+                batch_landmark_nodes.append(landmark_features)
+                # 创建全1的mask，表示这些都是有效节点
+                batch_landmark_nodes_masks.append(torch.ones(valid_landmarks.shape[0], 1, device=valid_landmarks.device))
+            else:
+                # 如果没有有效 landmark，添加一个占位符（后续会被mask掉）
+                batch_landmark_nodes.append(torch.zeros(1, 4, device=batch_landmark_data.device))
+                batch_landmark_nodes_masks.append(torch.zeros(1, 1, device=batch_landmark_data.device))
+
+        return batch_landmark_nodes, batch_landmark_nodes_masks
+
+    def get_edge_features(self, explore_nodes, landmark_nodes, landmark_node_masks, norm=False, max_distance=2.8):
+        """
+        计算边特征
+        
+        Args:
+            explore_nodes: [B, K, 4]，候选探索点特征
+            landmark_nodes: List of [L_i, 4]，landmark 特征，每个L不固定
+            landmark_node_masks: List of [L_i, 1]，landmark 有效掩码
+            norm: 是否归一化距离，默认False（不归一化）
+            max_distance: 归一化时的最大距离，默认2.8
+            
+        Returns:
+            batch_ego_to_explore_edges: List of [K, 3]
+            batch_ego_to_landmark_edges: List of [L_i, 3]
+            batch_ego_to_landmark_edge_masks: List of [L_i, 1]
+        """
+        # 1. ego -> explore nodes 的边特征
+        batch_ego_to_explore_edges = []  # List of [K, 3]
+        
+        for i in range(explore_nodes.shape[0]):
+            explore_relative_pos = explore_nodes[i, :, :2]  # [K, 2] - 相对位置
+            
+            # 计算距离
+            distances = torch.norm(explore_relative_pos, dim=1, keepdim=True)  # [K, 1]
+            
+            # 根据 norm 选择距离特征
+            if norm:
+                d_feature = torch.clamp(distances / max_distance, max=1.0)  # [K, 1] 归一化
+            else:
+                d_feature = distances  # [K, 1] 原始距离
+            
+            # 计算角度的 cos 和 sin（避免除零）
+            distances_safe = distances.clamp(min=1e-6)
+            cos_theta = explore_relative_pos[:, 0:1] / distances_safe  # [K, 1]
+            sin_theta = explore_relative_pos[:, 1:2] / distances_safe  # [K, 1]
+            
+            # 拼接边特征 [d, cos(θ), sin(θ)]
+            edge_features = torch.cat([d_feature, cos_theta, sin_theta], dim=1)  # [K, 3]
+            batch_ego_to_explore_edges.append(edge_features)
+        
+        # batch_ego_to_explore_edges: List of [K, 3], 长度为 N
+        
+        # 2. ego -> landmark nodes 的边特征
+        batch_ego_to_landmark_edges = []  # List of [L_i, 3]
+        batch_ego_to_landmark_edge_masks = []  # List of [L_i, 1]
+        
+        for i in range(len(landmark_nodes)):
+            landmark_relative_pos = landmark_nodes[i][:, :2]  # [L_i, 2] - 相对位置
+            landmark_mask = landmark_node_masks[i]  # [L_i, 1]
+            
+            # 计算距离
+            distances = torch.norm(landmark_relative_pos, dim=1, keepdim=True)  # [L_i, 1]
+            
+            # 根据 norm 选择距离特征
+            if norm:
+                d_feature = torch.clamp(distances / max_distance, max=1.0)  # [L_i, 1] 归一化
+            else:
+                d_feature = distances  # [L_i, 1] 原始距离
+            
+            # 计算角度的 cos 和 sin（避免除零）
+            distances_safe = distances.clamp(min=1e-6)
+            cos_theta = landmark_relative_pos[:, 0:1] / distances_safe  # [L_i, 1]
+            sin_theta = landmark_relative_pos[:, 1:2] / distances_safe  # [L_i, 1]
+            
+            # 拼接边特征 [d, cos(θ), sin(θ)]
+            edge_features = torch.cat([d_feature, cos_theta, sin_theta], dim=1)  # [L_i, 3]
+            
+            batch_ego_to_landmark_edges.append(edge_features)
+            batch_ego_to_landmark_edge_masks.append(landmark_mask)
+        
+        return batch_ego_to_explore_edges, batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
+
+    def get_high_level_goal(self, batch_ego_nodes, 
+                            batch_explore_nodes, batch_ego_to_explore_edges, 
+                            batch_landmark_nodes, batch_landmark_node_masks, 
+                            batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks, 
+                            deterministic=False):
+        """
+        统一从所有候选节点（explore + landmark）中选择一个目标
+        
+        Args:
+            batch_ego_nodes: [B, 5] [x, y, vel_x, vel_y, battery]
+            batch_explore_nodes: [B, K, 4] [relative_x, relative_y, utility, occupied]
+            batch_ego_to_explore_edges: [B, K, 3] [d, cosθ, sinθ]
+            batch_landmark_nodes: List[Tensor], 每个 [L_i, 4] [relative_x, relative_y, utility, is_targeted]
+            batch_landmark_node_masks: List[Tensor], 每个 [L_i, 1] (1=有效, 0=无效)
+            batch_ego_to_landmark_edges: List[Tensor], 每个 [L_i, 3]
+            batch_ego_to_landmark_edge_masks: List[Tensor], 每个 [L_i, 1]
+            deterministic: bool
+        
+        Returns:
+            dict:
+                action_modes: [B, 1] (0=explore, 1=landmark) 被选中节点的类型
+                waypoints: [B, 2] 绝对世界坐标
+                decision_log_probs: [B, 1] 节点选择的 log_prob
+                map_log_probs: [B, 1] 同上（保持接口兼容）
+        """
+        B = batch_ego_nodes.size(0)
+        K = batch_explore_nodes.size(1)
+        
+        # ===== 1. 节点和边的特征嵌入 =====
+        # 1.1 Ego节点嵌入
+        ego_node_feats = self.ego_node_encoder(batch_ego_nodes)  # [B, 64]
+        
+        # 1.2 Explore节点嵌入
+        explore_node_feats = self.explore_node_encoder(
+            batch_explore_nodes.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 64]
+        
+        explore_edges_tensor = torch.stack(batch_ego_to_explore_edges, dim=0) # [B, K, 3]
+        explore_edge_feats = self.edge_encoder(
+            explore_edges_tensor.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 32]
+        
+        # 1.3 Landmark节点嵌入（可变长度）
+        landmark_node_feats_list = []  # 存储每个样本的 landmark 特征
+        landmark_edge_feats_list = []
+        landmark_lengths = []  # 记录每个样本的有效 landmark 数量
+        
+        for i in range(B):
+            node_feat = self.landmark_node_encoder(batch_landmark_nodes[i])  # [L_i, 64]
+            edge_feat = self.edge_encoder(batch_ego_to_landmark_edges[i])    # [L_i, 32]
+            landmark_node_feats_list.append(node_feat)
+            landmark_edge_feats_list.append(edge_feat)
+            landmark_lengths.append(node_feat.size(0))
+        
+        max_L = max(landmark_lengths) if landmark_lengths else 0
+        
+        # ===== 2. 构建统一的候选节点集合 =====
+        # 将 explore 和 landmark 合并为一个统一的节点集
+        # 总节点数 = K (explore) + max_L (landmark)
+        total_nodes = K + max_L
+        
+        # 2.1 准备 Query
+        q = self.q_proj(ego_node_feats).unsqueeze(1)  # [B, 1, 64]
+        
+        # 2.2 合并所有节点的 Key 和 Value
+        # 初始化统一的 K/V 矩阵: [B, K+max_L, 64]
+        unified_k = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
+        unified_v = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
+        unified_mask = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.bool)
+        
+        # 存储相对坐标用于后续输出
+        unified_relative_pos = torch.zeros(B, total_nodes, 2, device=ego_node_feats.device)
+        
+        # 节点类型标签: 0=explore, 1=landmark
+        node_type_labels = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.long)
+        
+        # 填充 explore 节点 (索引 0 ~ K-1)
+        explore_kv = torch.cat([explore_node_feats, explore_edge_feats], dim=-1)  # [B, K, 96]
+        unified_k[:, :K, :] = self.k_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
+        unified_v[:, :K, :] = self.v_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
+        unified_mask[:, :K] = True  # explore 节点全部有效
+        unified_relative_pos[:, :K, :] = batch_explore_nodes[:, :, :2]  # 相对坐标
+        node_type_labels[:, :K] = 0  # explore 类型
+        
+        # 填充 landmark 节点 (索引 K ~ K+max_L-1)
+        for i in range(B):
+            Li = landmark_lengths[i]
+            if Li > 0:
+                lm_kv = torch.cat([landmark_node_feats_list[i], landmark_edge_feats_list[i]], dim=-1)  # [Li, 96]
+                unified_k[i, K:K+Li, :] = self.k_proj(lm_kv)
+                unified_v[i, K:K+Li, :] = self.v_proj(lm_kv)
+                # 有效的 landmark：必须 mask 有效且未被追踪 (is_targeted=0)
+                valid_mask = batch_landmark_node_masks[i][:, 0] > 0.5
+                not_targeted = batch_landmark_nodes[i][:, 3] < 0.5  # is_targeted 在索引3，<0.5表示未被追踪
+                combined_mask = valid_mask & not_targeted
+                unified_mask[i, K:K+Li] = combined_mask
+                unified_relative_pos[i, K:K+Li, :] = batch_landmark_nodes[i][:, :2]
+                node_type_labels[i, K:K+Li] = 1  # landmark 类型
+        
+        # ===== 3. 注意力机制 =====
+        # 计算注意力分数
+        scale = math.sqrt(self.attn_dim)
+        attn_scores = (q @ unified_k.transpose(1, 2)) / scale  # [B, 1, total_nodes]
+        
+        # 应用 mask（无效节点设为 -inf）
+        attn_scores = attn_scores.masked_fill(~unified_mask.unsqueeze(1), -1e9)
+        
+        # Softmax 得到注意力权重
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, 1, total_nodes]
+        
+        # 注意力加权求和
+        context = (attn_weights @ unified_v).squeeze(1)  # [B, 64]
+        
+        # ===== 4. 节点选择 =====
+        # 对所有节点进行打分
+        selection_logits = self.node_selection_head(unified_v).squeeze(-1)  # [B, total_nodes]
+        
+        # 应用 mask
+        selection_logits = selection_logits.masked_fill(~unified_mask, -1e9)
+        
+        # 构建分类分布
+        node_dist = TorchCategorical(logits=selection_logits)
+        
+        # 采样或选择最优节点
+        if deterministic:
+            selected_idx = torch.argmax(selection_logits, dim=-1)  # [B]
+        else:
+            selected_idx = node_dist.sample()  # [B] or [B, 1]
+        
+        # 确保 selected_idx 是 [B] 形状
+        selected_idx = selected_idx.view(B)  # [B]
+        
+        # 计算 log_prob
+        node_log_prob = node_dist.log_prob(selected_idx)  # [B]
+        
+        # ===== 5. 提取选中节点的信息 =====
+        batch_indices = torch.arange(B, device=ego_node_feats.device)
+        
+        # 5.1 节点类型 (0=explore, 1=landmark)
+        selected_type = node_type_labels[batch_indices, selected_idx]  # [B]
+        
+        # 5.2 相对坐标
+        selected_relative_pos = unified_relative_pos[batch_indices, selected_idx, :]  # [B, 2]
+        
+        # 5.3 转换为绝对世界坐标
+        ego_pos = batch_ego_nodes[:, :2]  # [B, 2]
+        waypoints_world = ego_pos + selected_relative_pos  # [B, 2]
+        
+        # ===== 6. 返回结果 =====
         return {
-            "action_modes": action_mode.unsqueeze(-1),              # [Batch, 1]
-            "waypoints": waypoints,                   # [Batch,2]
-            "decision_log_probs": decision_log_prob.unsqueeze(-1),  # ✅ [Batch, 1] 标量
-            "map_log_probs": map_log_prob.unsqueeze(-1)            # ✅ [Batch, 1] 标量
+            "action_modes": selected_type.unsqueeze(-1),       # [B, 1] 节点类型
+            "waypoints": waypoints_world,                      # [B, 2] 绝对世界坐标
+            "node_log_probs": node_log_prob.unsqueeze(-1), # [B, 1] 节点选择 log_prob
         }
     
-    def get_high_value(self, map_inp, vec_inp):
-        # map_inp: [num_processes, 4, H, W]
-        # vec_inp: [num_processes, num_agents*2 + num_landmarks*2]
-        # 返回： values: [num_processes, num_agents]
-        batch_size = map_inp.size(0)
+    def get_high_value(self, map_inp, agent_states):
+        """
+        计算每个智能体的状态价值
+        
+        Args:
+            map_inp: [B, 3, H, W] 全局地图 (entropy_map, heatmap, landmark_heatmap)
+            agent_states: [B, num_agents, 4] 智能体状态 [x, y, x_g, y_g]
+        
+        Returns:
+            values: [B, num_agents] 每个智能体的价值估计
+        """
+        B = map_inp.size(0)
+        num_agents = agent_states.size(1)
 
-        # 全局地图编码器
+        # 1. 全局地图特征提取 [B, 3, H, W] -> [B, 256]
         f_map = self.critic_map_backbone(map_inp)  # [B, 64, 6, 6]
-        f_map_flat = f_map.view(batch_size, -1)  # [B, 64*6*6]
-        f_map_compress = self.critic_map_compress(f_map_flat)  # [B, 256]
+        f_map_flat = f_map.view(B, -1)  # [B, 64*6*6]
+        f_global = self.critic_map_compress(f_map_flat)  # [B, 256]
 
-        # 结合全局地图特征和局部特征
-        f_vec = self.critic_vec_encoder(vec_inp)  # [B, 128]
-        f_fuse = torch.cat([f_map_compress, f_vec], dim=1)  # [B, 256 + 128]
-
-        fused = self.critic_fusion_layer(f_fuse)    # [B, 128]
-
-        # 为每个智能体计算独立的价值
+        # 2. 为每个智能体计算价值
         values = []
-        for agent_idx in range(self.num_agents):
-            value = self.critic_value_out_heads[agent_idx](fused)  # [B, 1]
+        for agent_idx in range(num_agents):
+            # 2.1 提取该智能体的状态 [B, 4]
+            agent_state = agent_states[:, agent_idx, :]  # [B, 4]
+            
+            # 2.2 编码智能体状态 [B, 4] -> [B, 64]
+            f_agent = self.critic_agent_encoder(agent_state)  # [B, 64]
+            
+            # 2.3 融合全局特征和智能体特征 [B, 256] + [B, 64] -> [B, 320]
+            fused = torch.cat([f_global, f_agent], dim=1)  # [B, 320]
+            
+            # 2.4 通过融合层 [B, 320] -> [B, 128]
+            h = self.critic_fusion_layer(fused)  # [B, 128]
+            
+            # 2.5 通过该智能体的独立价值头 [B, 128] -> [B, 1]
+            value = self.critic_value_out_heads[agent_idx](h)  # [B, 1]
             values.append(value)
+        
+        # 3. 拼接所有智能体的价值 [B, num_agents]
         values = torch.cat(values, dim=1)  # [B, num_agents]
 
         return values
@@ -769,82 +1060,161 @@ class MPNN(nn.Module):
 
         return value, action, action_log_probs
 
-    def evaluate_high_actions(self, env_states, map_obs, vec_obs, critic_maps, goals, tasks, agent_ids):
+    def evaluate_high_actions(self, env_states, obs,
+                              critic_maps, critic_nodes, goals, tasks, 
+                              ego_nodes, explore_nodes, landmark_datas, landmark_masks, 
+                              agent_ids):
         """
+        评估给定高层动作的log_prob、熵和价值（用于PPO更新）
+        
         Input:
             env_states: [batch, env_dim]
-            map_obs: [batch, 4, H, W]
-            vec_obs: [batch, 5] 
-            agent_ids: [batch, 1]
-        评估高层动作
+            obs: [batch, obs_dim] - 用于提取智能体位置
+            critic_maps: [batch, 3, H, W] - 用于critic
+            critic_nodes: [batch, num_agents, 4] - 用于critic
+            goals: [batch, 2] - 已选择的目标位置（世界坐标）
+            tasks: [batch, 1] - 已选择的任务类型（0=explore, 1=landmark）
+            ego_nodes: [batch, 5]
+            explore_nodes: [batch, K, 4]
+            landmark_datas: [batch, num_landmarks, 4]
+            landmark_masks: [batch, num_landmarks, 1]
+            agent_ids: [batch, 1] - 智能体ID
+            
         Returns:
-            high_values: [batch, 1]
-            decision_log_probs: [batch, 1]
-            map_log_probs: [batch, 1]
-            decision_entropy: [batch] ← 改为每个样本的熵
-            waypoint_entropy: [batch] ← 改为每个样本的熵
+            high_values: [batch, 1] - 状态价值
+            node_log_probs: [batch, 1] - 给定节点选择的log概率
+            node_entropy: [batch, 1] - 节点选择分布的熵
         """
-        batch_size = map_obs.size(0)
+        batch_size = env_states.size(0)
         num_agents = self.num_agents
+        K = explore_nodes.size(1)  # explore节点数量
 
         # =====================================================
-        # 1. Critic: 计算所有智能体的价值 [batch, num_agents]
+        # 1. 重建Graph nodes和Edges
         # =====================================================
-        critic_vec = env_states[:, 2*num_agents:]  # 提取全局向量信息
-        all_values = self.get_high_value(critic_maps, critic_vec)  # [batch, num_agents]
-        
-        # ⭐ 根据 agent_ids 选择对应的价值
-        agent_ids_expanded = agent_ids.unsqueeze(-1)  # [batch, 1]
-        high_values = torch.gather(all_values, dim=1, index=agent_ids_expanded)  # [batch, 1]
+        # 获取 landmark nodes 和 masks
+        landmark_nodes, landmark_node_masks = self.get_landmark_nodes(
+            agent_positions=obs[:, 2:4],  # 提取智能体当前位置
+            detected=landmark_datas,    
+            detected_mask=landmark_masks,
+            linear_indices=torch.arange(batch_size, device=env_states.device)
+        )
+
+        # 计算边特征
+        ego_to_explore_edges, ego_to_landmark_edges, ego_to_landmark_edge_masks = self.get_edge_features(
+            explore_nodes=explore_nodes,
+            landmark_nodes=landmark_nodes,
+            landmark_node_masks=landmark_node_masks,
+            norm=False,
+            max_distance=2.8
+        )
 
         # =====================================================
-        # 2. Actor: 前向传播获取 logits
+        # 2. 复用 get_high_level_goal 的逻辑构建节点分布
         # =====================================================
-        decision_logits, heatmap_logits = self.high_level_forward(vec_obs, map_obs)
-        # decision_logits: [batch, 2]
-        # heatmap_logits: [batch, 10000]
+        B = batch_size
+        
+        # 2.1 节点和边的特征嵌入
+        ego_node_feats = self.ego_node_encoder(ego_nodes)  # [B, 64]
+        
+        explore_node_feats = self.explore_node_encoder(
+            explore_nodes.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 64]
+        
+        explore_edges_tensor = torch.stack(ego_to_explore_edges, dim=0)
+        explore_edge_feats = self.edge_encoder(
+            explore_edges_tensor.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 32]
+        
+        landmark_node_feats_list = []
+        landmark_edge_feats_list = []
+        landmark_lengths = []
+        
+        for i in range(B):
+            node_feat = self.landmark_node_encoder(landmark_nodes[i])
+            edge_feat = self.edge_encoder(ego_to_landmark_edges[i])
+            landmark_node_feats_list.append(node_feat)
+            landmark_edge_feats_list.append(edge_feat)
+            landmark_lengths.append(node_feat.size(0))
+        
+        max_L = max(landmark_lengths) if landmark_lengths else 0
+        
+        # 2.2 构建统一的候选节点集合
+        total_nodes = K + max_L
+        
+        q = self.q_proj(ego_node_feats).unsqueeze(1)  # [B, 1, 64]
+        
+        unified_k = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
+        unified_v = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
+        unified_mask = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.bool)
+        unified_relative_pos = torch.zeros(B, total_nodes, 2, device=ego_node_feats.device)
+        
+        # 填充 explore 节点
+        explore_kv = torch.cat([explore_node_feats, explore_edge_feats], dim=-1)
+        unified_k[:, :K, :] = self.k_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
+        unified_v[:, :K, :] = self.v_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
+        unified_mask[:, :K] = True
+        unified_relative_pos[:, :K, :] = explore_nodes[:, :, :2]
+        
+        # 填充 landmark 节点
+        for i in range(B):
+            Li = landmark_lengths[i]
+            if Li > 0:
+                lm_kv = torch.cat([landmark_node_feats_list[i], landmark_edge_feats_list[i]], dim=-1)
+                unified_k[i, K:K+Li, :] = self.k_proj(lm_kv)
+                unified_v[i, K:K+Li, :] = self.v_proj(lm_kv)
+                valid_mask = landmark_node_masks[i][:, 0] > 0.5
+                not_targeted = landmark_nodes[i][:, 3] < 0.5
+                combined_mask = valid_mask & not_targeted
+                unified_mask[i, K:K+Li] = combined_mask
+                unified_relative_pos[i, K:K+Li, :] = landmark_nodes[i][:, :2]
+        
+        # 2.3 注意力机制
+        scale = math.sqrt(self.attn_dim)
+        attn_scores = (q @ unified_k.transpose(1, 2)) / scale
+        attn_scores = attn_scores.masked_fill(~unified_mask.unsqueeze(1), -1e9)
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        context = (attn_weights @ unified_v).squeeze(1)
+        
+        # 2.4 节点选择分布
+        selection_logits = self.node_selection_head(unified_v).squeeze(-1)  # [B, total_nodes]
+        selection_logits = selection_logits.masked_fill(~unified_mask, -1e9)
+        node_dist = TorchCategorical(logits=selection_logits)
+        
+        # =====================================================
+        # 3. 找到给定 goal 对应的节点索引
+        # =====================================================
+        # 将给定的 goals (世界坐标) 转换为相对坐标
+        ego_pos = ego_nodes[:, :2]  # [B, 2]
+        goals_relative = goals - ego_pos  # [B, 2]
+        
+        # 计算 goals_relative 到所有节点的距离
+        # unified_relative_pos: [B, total_nodes, 2]
+        # goals_relative: [B, 2] -> [B, 1, 2]
+        dists = torch.norm(unified_relative_pos - goals_relative.unsqueeze(1), dim=-1)  # [B, total_nodes]
+        
+        # 只在有效节点中查找最近的
+        dists_masked = dists.masked_fill(~unified_mask, float('inf'))
+        selected_idx = torch.argmin(dists_masked, dim=-1)  # [B]
+        
+        # =====================================================
+        # 4. 计算 log_prob 和 entropy
+        # =====================================================
+        node_log_probs = node_dist.log_prob(selected_idx).unsqueeze(-1)  # [B, 1]
+        node_entropy = node_dist.entropy().unsqueeze(-1)  # [B, 1]
+        
+        # =====================================================
+        # 5. 计算 Critic 价值
+        # =====================================================
+        # 计算所有智能体的价值 [B, num_agents]
+        all_values = self.get_high_value(critic_maps, critic_nodes)  # [B, num_agents]
+        
+        # 根据 agent_ids 选择对应的价值
+        agent_ids_flat = agent_ids.squeeze(-1)  # [B]
+        batch_indices = torch.arange(B, device=env_states.device)
+        high_values = all_values[batch_indices, agent_ids_flat].unsqueeze(-1)  # [B, 1]
 
-        # =====================================================
-        # 3. 应用动作掩码 (Action Masking)
-        # =====================================================
-        b_candidate = vec_obs[:, 2]  # [batch]
-        masked_decision_logits = decision_logits.clone()
-        
-        # 将没有候选点的样本的 COLLECT 动作设为负无穷
-        mask_no_candidate = (b_candidate < 0.5)
-        masked_decision_logits[mask_no_candidate, 1] = -1e9
-
-        # =====================================================
-        # 4. 计算决策头的 log_probs 和 entropy
-        # =====================================================
-        decision_probs = F.softmax(masked_decision_logits, dim=-1)  # [batch, 2]
-        dist_decision = TorchCategorical(probs=decision_probs)
-        
-        # 计算给定动作的 log_prob
-        decision_log_probs = dist_decision.log_prob(tasks.squeeze(-1))  # [batch]
-        
-        # 计算每个样本的熵
-        decision_entropy = dist_decision.entropy()  # [batch]
-
-        # =====================================================
-        # 5. 计算探索头的 log_probs 和 entropy
-        # =====================================================
-        heatmap_probs = F.softmax(heatmap_logits, dim=-1)  # [batch, 10000]
-        dist_map = TorchCategorical(probs=heatmap_probs)
-        
-        # 将 goals [batch, 2] 转换为 flat_idx [batch]
-        goals_x = goals[:, 0].long()  # [batch]
-        goals_y = goals[:, 1].long()  # [batch]
-        flat_idx = goals_y * 100 + goals_x  # [batch]
-        
-        # 计算给定导航点的 log_prob
-        map_log_probs = dist_map.log_prob(flat_idx)  # [batch]
-        
-        # 计算每个样本的熵
-        waypoint_entropy = dist_map.entropy()  # [batch]
-
-        return (high_values, decision_log_probs, map_log_probs, 
-                decision_entropy, waypoint_entropy)
+        return (high_values, node_log_probs, node_entropy)
     
     def evaluate_low_actions(self, inp, goals, action):
         new_inp = self.data_processing_low_level(inp, goals)
@@ -862,6 +1232,42 @@ class MPNN(nn.Module):
         value = self._low_value(x)
         return value
 
+    def _world_to_grid_torch(self, world_xy: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """
+        world_xy: [..., 2] in continuous world coords (x,y), assumed in [-arena_size/2, arena_size/2]
+        return:  [..., 2] grid indices (i,j) as int64, clipped to [0..H-1/W-1]
+        """
+        world_min = -1.0
+        cell_size_x = 2.0 / float(H)
+        cell_size_y = 2.0 / float(W)
+
+        x = world_xy[..., 0]
+        y = world_xy[..., 1]
+
+        i = torch.floor((x - world_min) / cell_size_x)
+        j = torch.floor((y - world_min) / cell_size_y)
+
+        i = i.clamp(0, H - 1)
+        j = j.clamp(0, W - 1)
+
+        return torch.stack([i, j], dim=-1).long()
+    
+    def _grid_to_world_torch(self, grid_ij: torch.Tensor, H: int, W: int) -> torch.Tensor:
+        """
+        grid_ij: [..., 2] grid indices (i,j) as int64
+        return: [..., 2] in continuous world coords (x,y), in [-arena_size/2, arena_size/2]
+        """
+        world_min = -1.0
+        cell_size_x = 2.0 / float(H)
+        cell_size_y = 2.0 / float(W)
+
+        i = grid_ij[..., 0].float()
+        j = grid_ij[..., 1].float()
+
+        x = world_min + (i + 0.5) * cell_size_x
+        y = world_min + (j + 0.5) * cell_size_y
+
+        return torch.stack([x, y], dim=-1)  
 
 class MultiHeadAttention(nn.Module):
     # taken from https://github.com/wouterkool/attention-tsp/blob/master/graph_encoder.py

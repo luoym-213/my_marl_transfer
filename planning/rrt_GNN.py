@@ -10,8 +10,10 @@ import math
 import random
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.spatial import Voronoi, voronoi_plot_2d
-from typing import List, Tuple
+from typing import List, Tuple, Sequence, Optional, Any
+
+from scipy.ndimage import convolve  # 新增：用于快速计算半径内累积熵
+
 
 # 设置matplotlib中文字体
 plt.rcParams['font.sans-serif'] = ['Arial Unicode MS', 'PingFang SC', 'Heiti TC', 'STHeiti', 'SimHei']
@@ -42,9 +44,9 @@ class RRT_GNN:
                  start: List[int],
                  voronoi_mask: np.ndarray,
                  entropy_map: np.ndarray,
-                 entropy_threshold: float = 0.8,
-                 radius: int = 5,
-                 expand_dis: int = 3,
+                 entropy_threshold: float = 0.5,
+                 radius: int = 2,
+                 expand_dis: int = 2,
                  max_iterations: int = 500,
                  top_k: int = 10):
         """
@@ -64,7 +66,7 @@ class RRT_GNN:
         self.voronoi_mask = voronoi_mask
         self.entropy_map = entropy_map
         self.entropy_threshold = entropy_threshold
-        self.radius = radius
+        self.radius = int(radius)
         self.expand_dis = expand_dis
         self.max_iterations = max_iterations
         self.top_k = top_k
@@ -78,45 +80,58 @@ class RRT_GNN:
         # 地图尺寸
         self.map_size = entropy_map.shape
 
+        # 新增：预计算“半径内熵累计和”整图（O(H*W*r^2) 一次，后面查询 O(1)）
+        self._disk_kernel = self._make_disk_kernel(self.radius)
+        self.local_entropy_map = convolve(
+            self.entropy_map.astype(np.float32),
+            self._disk_kernel,
+            mode="constant",
+            cval=0.0,
+        )
+
+    @staticmethod
+    def _make_disk_kernel(radius: int) -> np.ndarray:
+        """生成半径为 radius 的圆盘核（0/1），用于累计半径内像素和。"""
+        if radius <= 0:
+            return np.array([[1.0]], dtype=np.float32)
+
+        d = 2 * radius + 1
+        yy, xx = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        mask = (xx * xx + yy * yy) <= (radius * radius)
+        kernel = mask.astype(np.float32)
+        return kernel
+
     def _generate_sample_list(self) -> List[Tuple[int, int]]:
         """
-        生成采样列表：Voronoi区域内香农熵大于阈值的栅格索引
+        生成采样列表：Voronoi区域内香农熵大于阈值的栅格索引 + Voronoi区域内随机100个索引
 
         返回:
             sample_list: [(x1, y1), (x2, y2), ...] 索引列表
         """
         # 找到满足条件的索引：在Voronoi区域内且熵值大于阈值
         high_entropy_mask = (self.voronoi_mask) & (self.entropy_map > self.entropy_threshold)
-        indices = np.argwhere(high_entropy_mask)
+        high_entropy_indices = np.argwhere(high_entropy_mask)
         
         # 转换为列表 [(x, y), ...]
-        sample_list = [(int(idx[0]), int(idx[1])) for idx in indices]
+        sample_list = [(int(idx[0]), int(idx[1])) for idx in high_entropy_indices]
+        
+        # 额外在Voronoi区域内随机选择100个索引
+        voronoi_indices = np.argwhere(self.voronoi_mask)
+        if len(voronoi_indices) > 0:
+            # 随机选择最多100个索引（如果区域小于100，就全选）
+            n_random = min(100, len(voronoi_indices))
+            random_idx = np.random.choice(len(voronoi_indices), size=n_random, replace=False)
+            random_samples = [(int(voronoi_indices[i][0]), int(voronoi_indices[i][1])) 
+                            for i in random_idx]
+            
+            # 合并两部分（去重）
+            sample_list = list(set(sample_list + random_samples))
         
         return sample_list
 
     def _calculate_local_entropy(self, x: int, y: int) -> float:
-        """
-        计算给定栅格索引周围半径r内的香农熵累计和
-
-        参数:
-            x: 栅格索引x
-            y: 栅格索引y
-
-        返回:
-            entropy_sum: 半径内的熵值累计和
-        """
-        entropy_sum = 0.0
-        
-        # 遍历半径r内的所有栅格
-        for i in range(max(0, x - self.radius), min(self.map_size[0], x + self.radius + 1)):
-            for j in range(max(0, y - self.radius), min(self.map_size[1], y + self.radius + 1)):
-                # 计算距离
-                dist = math.sqrt((i - x) ** 2 + (j - y) ** 2)
-                # 只累计在半径内的栅格
-                if dist <= self.radius:
-                    entropy_sum += self.entropy_map[i, j]
-        
-        return entropy_sum
+        """O(1) 查询：直接查表，而不是每次遍历半径邻域。"""
+        return float(self.local_entropy_map[x, y])
 
     def _get_random_node(self) -> 'RRT_GNN.Node':
         """
@@ -196,12 +211,12 @@ class RRT_GNN:
         
         return new_node
 
-    def planning(self) -> List[dict]:
+    def planning(self) -> List[List[float]]:
         """
         执行RRT规划，返回价值最高的K个节点
 
         返回:
-            top_k_nodes: 包含K个节点信息的列表，每个元素为 {'position': (x, y), 'value': value}
+            top_k_nodes: 包含K个节点信息的列表，每个元素为 [x, y, value]
         """
         # 初始化起始节点的价值
         self.start.value = self._calculate_local_entropy(self.start.x, self.start.y)
@@ -227,12 +242,9 @@ class RRT_GNN:
         sorted_nodes = sorted(self.node_list, key=lambda node: node.value, reverse=True)
         top_k_nodes = sorted_nodes[:min(self.top_k, len(sorted_nodes))]
         
-        # 格式化返回结果
+        # 格式化返回结果，value进行归一化  / 1500
         result = [
-            {
-                'position': (node.x, node.y),
-                'value': node.value
-            }
+            [node.x, node.y, node.value / 1500]
             for node in top_k_nodes
         ]
         
@@ -345,7 +357,7 @@ def main():
         # 打印结果
         print(f"  找到 {len(top_k_nodes)} 个高价值节点:")
         for j, node_info in enumerate(top_k_nodes):
-            print(f"    {j+1}. 位置: {node_info['position']}, 价值: {node_info['value']:.2f}")
+            print(f"    {j+1}. 位置: ({node_info[0]}, {node_info[1]}), 价值: {node_info[2]:.2f}")
         
         all_results.append({
             'agent_id': i,
@@ -405,11 +417,12 @@ def main():
         
         # 标记Top-K候选点
         for j, node_info in enumerate(top_k_nodes):
-            pos = node_info['position']
+            pos = (node_info[0], node_info[1])
+            val = node_info[2]
             if j == 0:  # 最高价值的点
                 ax.plot(pos[0], pos[1], 'D', color=color, markersize=12, 
                        markeredgecolor='yellow', markeredgewidth=2, zorder=8)
-                ax.text(pos[0]+2, pos[1]+2, f'#{j+1}\nv={node_info["value"]:.1f}', 
+                ax.text(pos[0]+2, pos[1]+2, f'#{j+1}\nv={val:.1f}', 
                        color='white', fontsize=8, fontweight='bold',
                        bbox=dict(boxstyle='round', facecolor=color, alpha=0.8),
                        zorder=9)
@@ -443,6 +456,50 @@ def main():
     
     plt.tight_layout()
     plt.show()
+
+
+def plan_batch(
+    starts: Sequence[Sequence[int]],
+    voronoi_masks: np.ndarray,
+    entropy_maps: np.ndarray,
+    entropy_threshold: float = 0.8,
+    radius: int = 5,
+    expand_dis: int = 3,
+    max_iterations: int = 500,
+    top_k: int = 10,
+) -> List[List[List[float]]]:
+    """
+    Batch 版本：对 B 份数据逐个运行 RRT_GNN（不是向量化并行，只是统一入口）
+
+    输入:
+      - starts: (B, 2) 的栅格索引 [[x,y], ...]
+      - voronoi_masks: (B, H, W) bool
+      - entropy_maps: (B, H, W) float
+
+    输出:
+      - results: 长度为 B 的 list；每个元素是 RRT_GNN.planning() 的返回(list[list])
+                 即 [[x, y, value], ...]
+    """
+    if voronoi_masks.ndim != 3 or entropy_maps.ndim != 3:
+        raise ValueError("voronoi_masks 与 entropy_maps 需要是 (B,H,W)")
+    if len(starts) != voronoi_masks.shape[0] or len(starts) != entropy_maps.shape[0]:
+        raise ValueError("starts 与 masks/maps 的 batch 维度 B 不一致")
+
+    results: List[List[dict]] = []
+    B = voronoi_masks.shape[0]
+    for b in range(B):
+        rrt = RRT_GNN(
+            start=list(starts[b]),
+            voronoi_mask=voronoi_masks[b],
+            entropy_map=entropy_maps[b],
+            entropy_threshold=entropy_threshold,
+            radius=radius,
+            expand_dis=expand_dis,
+            max_iterations=max_iterations,
+            top_k=top_k,
+        )
+        results.append(rrt.planning())
+    return results
 
 
 if __name__ == '__main__':

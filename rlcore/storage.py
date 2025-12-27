@@ -26,17 +26,27 @@ class RolloutStorage(object):
         
         # 高层策略存储相关
         self.high_rewards = torch.zeros(num_steps, num_processes, 1)
-        self.map_obs = torch.zeros(num_steps, num_processes, 4, 100, 100)  # 高层输入的地图观测
-        self.vec_obs = torch.zeros(num_steps, num_processes, 5)  # 高层输入的矢量观测
-        self.critic_maps = torch.zeros(num_steps, num_processes, 4, 100, 100)  # 高层critic的地图输入,用于计算高层价值
+        self.critic_maps = torch.zeros(num_steps, num_processes, 3, 100, 100)  # 高层critic的地图输入,用于计算高层价值
+        self.critic_nodes = torch.zeros(num_steps, num_processes, num_agent, 4)  # 高层critic的节点输入,用于计算高层价值
         self.tasks = torch.zeros(num_steps, num_processes, 1, dtype=torch.long)   # action_mode: explore=0, collect=1
         self.goals = torch.zeros(num_steps, num_processes, 2)   # final_target: [x_goal, y_goal]
-        self.map_log_probs = torch.zeros(num_steps, num_processes, 1)
-        self.decision_log_probs = torch.zeros(num_steps, num_processes, 1)
+        self.higoal_log_probs = torch.zeros(num_steps, num_processes, 1)
         self.high_values = torch.zeros(num_steps + 1, num_processes, 1)
         self.high_returns = torch.zeros(num_steps + 1, num_processes, 1)
         self.goal_dones = torch.zeros(num_steps + 1, num_processes, 1) # 当前是否是决策点，yes=1, no=0
         self.goal_dones[0].fill_(1.0) # 初始化第一步为1，因为需要执行高层策略来分配初始目标
+        self.ego_nodes = torch.zeros(num_steps, num_processes, 5)  # Ego节点特征存储: [num_steps, num_processes, 5]
+        self.explore_nodes = torch.zeros(num_steps, num_processes, 5, 4)  # Explore节点特征存储: [num_steps, num_processes, K, 4]
+
+        # ==================== Landmark 存储（张量形式）====================
+        self.max_landmarks = num_agent
+        # Landmark 数据: [num_steps+1, num_processes, max_landmarks, 4]
+        # 每个 landmark 包含: [x, y, utility, is_targeted]
+        self.landmark_datas = torch.zeros(num_steps + 1, num_processes, self.max_landmarks, 4)
+        
+        # Landmark 有效性掩码: [num_steps+1, num_processes, max_landmarks, 1]
+        # 1 表示该位置有有效的 landmark，0 表示该位置为空
+        self.landmark_masks = torch.zeros(num_steps + 1, num_processes, self.max_landmarks, 1)
 
     def to(self, device):
         # 环境基础信息
@@ -54,23 +64,26 @@ class RolloutStorage(object):
         
         # 高层策略存储相关
         self.high_rewards = self.high_rewards.to(device)
-        self.map_obs = self.map_obs.to(device)
-        self.vec_obs = self.vec_obs.to(device)
         self.critic_maps = self.critic_maps.to(device)
+        self.critic_nodes = self.critic_nodes.to(device)
         self.goals = self.goals.to(device)
         self.tasks = self.tasks.to(device)
-        self.map_log_probs = self.map_log_probs.to(device)
-        self.decision_log_probs = self.decision_log_probs.to(device)
+        self.higoal_log_probs = self.higoal_log_probs.to(device)
         self.high_values = self.high_values.to(device)
         self.high_returns = self.high_returns.to(device)
         self.goal_dones = self.goal_dones.to(device)
+        self.ego_nodes = self.ego_nodes.to(device)
+        self.explore_nodes = self.explore_nodes.to(device)
+        self.landmark_datas = self.landmark_datas.to(device)
+        self.landmark_masks = self.landmark_masks.to(device)
 
     def insert(self, obs, actions, action_log_probs, value_preds, 
                rewards, high_rewards, masks, env_states, 
-               map_obs, vec_obs, critic_maps,
-               goals, task, 
-               map_log_probs, decision_log_probs, 
-               high_values, goal_dones):
+                critic_maps, critic_nodes, goals, task,
+               higoal_log_probs, high_values, 
+                ego_nodes, explore_nodes,
+                landmark_data, landmark_mask,
+               goal_dones):
         # 环境基础信息
         self.obs[self.step + 1].copy_(obs)
         self.rewards[self.step].copy_(rewards)
@@ -84,15 +97,18 @@ class RolloutStorage(object):
         
         # 高层策略存储相关
         self.high_rewards[self.step].copy_(high_rewards)
-        self.map_obs[self.step].copy_(map_obs)
-        self.vec_obs[self.step].copy_(vec_obs)
         self.critic_maps[self.step].copy_(critic_maps)
+        self.critic_nodes[self.step].copy_(critic_nodes)
         self.goals[self.step].copy_(goals)
         self.tasks[self.step].copy_(task)
-        self.map_log_probs[self.step].copy_(map_log_probs)
-        self.decision_log_probs[self.step].copy_(decision_log_probs)
+        self.higoal_log_probs[self.step].copy_(higoal_log_probs)
+        self.high_values[self.step].copy_(high_values)
         self.high_values[self.step].copy_(high_values)
         self.goal_dones[self.step + 1].copy_(goal_dones)
+        self.ego_nodes[self.step].copy_(ego_nodes)
+        self.explore_nodes[self.step].copy_(explore_nodes)
+        self.landmark_datas[self.step + 1].copy_(landmark_data)
+        self.landmark_masks[self.step + 1].copy_(landmark_mask)
 
         self.step = (self.step + 1) % self.num_steps
 

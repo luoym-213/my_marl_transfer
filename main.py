@@ -39,7 +39,7 @@ def train(args, return_early=False):
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
-                # print("step: ", step)
+                print("step: ", step)
                 actions_list, goals_list, tasks_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             agent_goals = np.transpose(np.array(goals_list),(1,0,2))
@@ -76,10 +76,8 @@ def train(args, return_early=False):
         action_low_loss = return_vals[:, 1]
         dist_low_entropy = return_vals[:, 2]
         value_high_loss = return_vals[:, 3]
-        decision_high_loss = return_vals[:, 4]
-        waypoint_high_loss = return_vals[:, 5]
-        decision_entropy = return_vals[:, 6]
-        waypoint_entropy = return_vals[:, 7]
+        goal_high_loss = return_vals[:, 4]
+        goal_entropy = return_vals[:, 5]
         master.after_update()
 
         if j%args.save_interval == 0 and not args.test:
@@ -109,12 +107,12 @@ def train(args, return_early=False):
             mean_low_reward = final_rewards.mean(dim=0).cpu().numpy()
             mean_high_reward = final_high_rewards.mean(dim=0).cpu().numpy()
             print("Updates {} | Num timesteps {} | Time {} | FPS {} \
-                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} lowPolicy loss {:.4f} \
-                  \nMean high reward {} Decision Entropy {:.4f} Waypoint Entropy {:.4f} high Value loss {:.4f} high Decision loss {:.4f} high Waypoint loss {:.4f}\n "
+                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} low level loss {:.4f} \
+                  \nMean high reward {} high Entropy {:.4f}  high Value loss {:.4f} high level loss {:.4f}\n "
             .format(j, total_num_steps, str(end-start), int(total_num_steps / seconds), 
                   mean_low_reward, dist_low_entropy[0], value_low_loss[0], action_low_loss[0],
-                  mean_high_reward, decision_entropy[0], waypoint_entropy[0], value_high_loss[0],
-                  decision_high_loss[0], waypoint_high_loss[0]))
+                  mean_high_reward, goal_entropy[0], value_high_loss[0],
+                  goal_high_loss[0]))
             
             if not args.test:
                 for idx in range(n):
@@ -125,10 +123,8 @@ def train(args, return_early=False):
                 writer.add_scalar('all/action_low_loss', action_low_loss[0], j)
                 writer.add_scalar('all/dist_low_entropy', dist_low_entropy[0], j)
                 writer.add_scalar('all/high_value_loss', value_high_loss[0], j)
-                writer.add_scalar('all/decision_high_loss', decision_high_loss[0], j)
-                writer.add_scalar('all/waypoint_high_loss', waypoint_high_loss[0], j)
-                writer.add_scalar('all/decision_entropy', decision_entropy[0], j)
-                writer.add_scalar('all/waypoint_entropy', waypoint_entropy[0], j)
+                writer.add_scalar('all/goal_high_loss', goal_high_loss[0], j)
+                writer.add_scalar('all/goal_entropy', goal_entropy[0], j)
 
         if args.eval_interval is not None and j%args.eval_interval==0:
             ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)
