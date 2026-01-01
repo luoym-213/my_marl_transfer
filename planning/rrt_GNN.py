@@ -141,7 +141,16 @@ class RRT_GNN:
             rnd_node: 随机采样的节点
         """
         if len(self.sample_list) == 0:
-            raise ValueError("sample_list为空，无法采样！请检查voronoi_mask和entropy_map")
+            # raise ValueError("sample_list为空，无法采样！请检查voronoi_mask和entropy_map")
+            print("⚠️ sample_list empty, using random point near start")
+            x = self.start.x + np.random.randint(-10, 10)
+            y = self.start.y + np.random.randint(-10, 10)
+            
+            # 确保在地图范围内
+            x = np.clip(x, 0, self.map_size[0] - 1)
+            y = np.clip(y, 0, self.map_size[1] - 1)
+            
+            return self.Node(x, y)
         
         # 从sample_list中随机选择一个位置
         x, y = random.choice(self.sample_list)
@@ -218,37 +227,53 @@ class RRT_GNN:
         返回:
             top_k_nodes: 包含K个节点信息的列表，每个元素为 [x, y, value]
         """
-        # 初始化起始节点的价值
-        self.start.value = self._calculate_local_entropy(self.start.x, self.start.y)
-        self.node_list = [self.start]
-        
-        # 迭代扩展
-        for i in range(self.max_iterations):
-            # 随机采样一个节点
-            rnd_node = self._get_random_node()
+        try:
+            # 初始化起始节点的价值
+            self.start.value = self._calculate_local_entropy(self.start.x, self.start.y)
+            self.node_list = [self.start]
             
-            # 找到最近的节点
-            nearest_ind = self._get_nearest_node_index(self.node_list, rnd_node)
-            nearest_node = self.node_list[nearest_ind]
+            # 迭代扩展
+            for i in range(self.max_iterations):
+                try:
+                    # 随机采样一个节点
+                    rnd_node = self._get_random_node()
+                    
+                    # 找到最近的节点
+                    nearest_ind = self._get_nearest_node_index(self.node_list, rnd_node)
+                    nearest_node = self.node_list[nearest_ind]
+                    
+                    # 向采样点扩展
+                    new_node = self._steer(nearest_node, rnd_node)
+                    
+                    # 如果新节点有效，添加到节点列表
+                    if new_node is not None:
+                        self.node_list.append(new_node)
+                
+                except ValueError as e:
+                    print(f"采样出错: {e}")
+                    continue
             
-            # 向采样点扩展
-            new_node = self._steer(nearest_node, rnd_node)
+            # 按价值排序，选择Top-K节点
+            sorted_nodes = sorted(self.node_list, key=lambda node: node.value, reverse=True)
+            top_k_nodes = sorted_nodes[:min(self.top_k, len(sorted_nodes))]
             
-            # 如果新节点有效，添加到节点列表
-            if new_node is not None:
-                self.node_list.append(new_node)
+            # 格式化返回结果，value进行归一化  / 1500
+            result = [
+                [node.x, node.y, node.value / 1500]
+                for node in top_k_nodes
+            ]
+            
+            return result
         
-        # 按价值排序，选择Top-K节点
-        sorted_nodes = sorted(self.node_list, key=lambda node: node.value, reverse=True)
-        top_k_nodes = sorted_nodes[:min(self.top_k, len(sorted_nodes))]
-        
-        # 格式化返回结果，value进行归一化  / 1500
-        result = [
-            [node.x, node.y, node.value / 1500]
-            for node in top_k_nodes
-        ]
-        
-        return result
+        except Exception as e:
+            print(f"RRT规划出错: {e}")
+            # 返回智能体周围随机小范围5个节点作为探索节点
+            fallback_nodes = []
+            for _ in range(self.top_k):
+                rand_x = min(max(self.start.x + random.randint(-5, 5), 0), self.map_size[0]-1)
+                rand_y = min(max(self.start.y + random.randint(-5, 5), 0), self.map_size[1]-1)
+                fallback_nodes.append([rand_x, rand_y, 0.0])
+            return fallback_nodes
 
 
 def compute_voronoi_regions(agent_positions: List[Tuple[int, int]], 

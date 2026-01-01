@@ -383,7 +383,7 @@ class Learner(object):
         # === 拼接 === [num_agents, 8]
         return np.concatenate([low_arr, high_arr], axis=1)
     
-    def update_landmark_info(self,prev_landmark_data, prev_landmark_mask, detected_map_list, device, match_threshold=0.1, cleanup_threshold=0.3):
+    def update_landmark_info(self,prev_landmark_data, prev_landmark_mask, detected_map_list, device, match_threshold=0.1, cleanup_threshold=0.06):
         """
         更新地标信息，结合之前的地标数据和当前检测到的地图信息。
         ⭐ 新增：自动清理与当前detected_map不一致的旧landmark

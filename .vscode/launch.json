@@ -8,7 +8,7 @@
             "name": "Python Debugger: Current File with Arguments",
             "type": "debugpy",
             "request": "launch",
-            "program": "${file}",
+            "program": "/Users/ym/Public/codes/marl_transfer/main.py",
             "console": "integratedTerminal",
             "args": "${command:pickArgs}"
         }

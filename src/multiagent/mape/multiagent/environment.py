@@ -182,7 +182,7 @@ class MultiAgentEnv(gym.Env):
         info_n['belief_map'] = self.global_belief_map.belief_grid
         info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos)
-        info_n['distance_fields'] = self.global_belief_map.get_distance_fields(agents_pos, normalize=True)
+        # info_n['distance_fields'] = self.global_belief_map.get_distance_fields(agents_pos, normalize=True)
         info_n['goal_done'] = self._get_goal_dones(self.agents)
         info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap

@@ -39,7 +39,7 @@ def train(args, return_early=False):
     for j in range(args.num_updates):
         for step in range(args.num_steps):
             with torch.no_grad():
-                print("step: ", step)
+                # print("step: ", step)
                 actions_list, goals_list, tasks_list = master.act(step)
             agent_actions = np.transpose(np.array(actions_list),(1,0,2))
             agent_goals = np.transpose(np.array(goals_list),(1,0,2))
