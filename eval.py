@@ -6,9 +6,116 @@ from learner import setup_master
 import time
 import os
 import imageio
+from PIL import Image, ImageDraw, ImageFont
 
 # Global counter to track evaluate function calls
 _evaluate_call_count = 0
+
+def add_text_to_frame(frame_array, step, num_retired, num_agents, num_visited, num_targets, agent_rewards=None):
+    """
+    在numpy数组图像上添加文字信息
+    
+    Args:
+        frame_array: numpy array of shape (H, W, 3)
+        step: 当前时间步
+        num_retired: 已退役智能体数量
+        num_agents: 总智能体数量
+        num_visited: 已访问目标数量
+        num_targets: 总目标数量
+        agent_rewards: 每个智能体当前步的奖励，numpy array of shape (num_agents,)
+    
+    Returns:
+        numpy array with text overlay
+    """
+    # 转换为PIL Image
+    img = Image.fromarray(frame_array)
+    draw = ImageDraw.Draw(img)
+    
+    # 设置字体（如果系统没有，PIL会使用默认字体）
+    try:
+        # macOS字体路径
+        font = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 24)
+        font_small = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 18)
+        font_tiny = ImageFont.truetype("/System/Library/Fonts/Helvetica.ttc", 16)
+    except:
+        try:
+            # 备选字体
+            font = ImageFont.truetype("/System/Library/Fonts/SFNS.ttf", 24)
+            font_small = ImageFont.truetype("/System/Library/Fonts/SFNS.ttf", 18)
+            font_tiny = ImageFont.truetype("/System/Library/Fonts/SFNS.ttf", 16)
+        except:
+            # 使用默认字体
+            font = ImageFont.load_default()
+            font_small = ImageFont.load_default()
+            font_tiny = ImageFont.load_default()
+    
+    # 计算需要的背景框高度（考虑奖励信息）
+    base_height = 110
+    reward_height = 25 * num_agents if agent_rewards is not None else 0
+    total_height = base_height + reward_height
+    
+    # 绘制半透明背景框
+    box_padding = 15
+    box_x1 = img.width - 250
+    box_y1 = 10
+    box_x2 = img.width - 10
+    box_y2 = 10 + total_height
+    
+    # 创建一个带透明度的图层
+    overlay = Image.new('RGBA', img.size, (255, 255, 255, 0))
+    overlay_draw = ImageDraw.Draw(overlay)
+    overlay_draw.rectangle(
+        [(box_x1, box_y1), (box_x2, box_y2)], 
+        fill=(40, 40, 40, 200)  # 半透明深灰色背景
+    )
+    
+    # 将overlay合成到原图
+    img = img.convert('RGBA')
+    img = Image.alpha_composite(img, overlay)
+    img = img.convert('RGB')
+    draw = ImageDraw.Draw(img)
+    
+    # 绘制文字
+    text_x = box_x1 + box_padding
+    text_y = box_y1 + box_padding
+    line_height = 28
+    
+    # Step信息
+    draw.text((text_x, text_y), f"Step: {step}", fill=(255, 255, 255), font=font)
+    
+    # Retired信息
+    draw.text((text_x, text_y + line_height), 
+              f"Retired: {num_retired}/{num_agents}", 
+              fill=(255, 200, 100), font=font_small)
+    
+    # Targets信息
+    draw.text((text_x, text_y + line_height * 2), 
+              f"Targets: {num_visited}/{num_targets}", 
+              fill=(100, 255, 100), font=font_small)
+    
+    # 显示每个智能体的奖励
+    if agent_rewards is not None:
+        reward_y = text_y + line_height * 3
+        draw.text((text_x, reward_y), 
+                  "Rewards:", 
+                  fill=(200, 200, 255), font=font_small)
+        
+        # 显示每个智能体的奖励
+        for i, reward in enumerate(agent_rewards):
+            agent_reward_y = reward_y + 20 + i * 25
+            # 根据奖励正负设置颜色
+            if reward > 0:
+                color = (100, 255, 100)  # 绿色 - 正奖励
+            elif reward < 0:
+                color = (255, 100, 100)  # 红色 - 负奖励
+            else:
+                color = (200, 200, 200)  # 灰色 - 零奖励
+            
+            draw.text((text_x + 10, agent_reward_y), 
+                      f"A{i}: {reward:+.2f}", 
+                      fill=color, font=font_tiny)
+    
+    return np.array(img)
 
 def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, master=None, render_attn=True):
     """
@@ -85,6 +192,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         
         # Initialize frame collection for GIF
         frames = []
+        # Track statistics for each frame
+        frame_stats = []  # List of tuples: (step, num_retired, num_visited)
         
         # Initialize goals to None at the start of each episode，初始化为tensor,0
         goals = torch.zeros((len(obs), 2), dtype=torch.float32, device=args.device)
@@ -106,6 +215,13 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             )
             if render_result:
                 frames.append(render_result[0])
+                # 记录初始统计信息
+                num_retired = sum(env.agents_done) if hasattr(env, 'agents_done') else 0
+                num_visited = sum(env.landmark_visited) if hasattr(env, 'landmark_visited') else 0
+                num_targets = len(env.world.landmarks) if hasattr(env.world, 'landmarks') else args.num_agents
+                # 初始帧没有奖励，使用零数组
+                initial_rewards = np.zeros(args.num_agents)
+                frame_stats.append((0, num_retired, num_visited, num_targets, initial_rewards))
         
         # Show window if render is enabled
         if should_show_window:
@@ -123,11 +239,11 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         while not np.all(done):
             actions = []
             with torch.no_grad():
+                # print("step:", info['world_steps'])
                 actions, goals, tasks, landmark_data, landmark_mask = master.eval_act(obs, env_states, 
                                                                                       goals, tasks, 
                                                                                       landmark_data, 
-                                                                                      landmark_mask, 
-                                                                                      deterministic=True)
+                                                                                      landmark_mask)
             episode_steps += 1
             step_data = {'agents_actions': actions, 'agents_goals': goals, 'agents_tasks': tasks} 
             if isinstance(step_data['agents_goals'], torch.Tensor):
@@ -155,10 +271,18 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                     goals=step_data['agents_goals'],
                     show_voronoi=True,
                     show_uncertainty=True,  # 👈 启用不确定性显示
+                    tasks=step_data['agents_tasks'],
                     info=info
                 )
                 if render_result:
                     frames.append(render_result[0])
+                    # 记录当前步的统计信息和奖励
+                    num_retired = sum(env.agents_done) if hasattr(env, 'agents_done') else 0
+                    num_visited = sum(env.landmark_visited) if hasattr(env, 'landmark_visited') else 0
+                    num_targets = len(env.world.landmarks) if hasattr(env.world, 'landmarks') else args.num_agents
+                    # 记录当前步每个智能体的奖励（high-level）
+                    current_step_rewards = high_reward.cpu().numpy()
+                    frame_stats.append((episode_steps, num_retired, num_visited, num_targets, current_step_rewards))
             
             # Show window if render is enabled
             if should_show_window:
@@ -171,6 +295,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                     goals=step_data['agents_goals'],
                     show_voronoi=True,
                     show_uncertainty=True,  # 👈 启用不确定性显示
+                    tasks=step_data['agents_tasks'],
                     info=info
                 )
                 if args.record_video:
@@ -205,8 +330,23 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             gif_path = os.path.join(eval_folder, gif_filename)
             
             try:
+                # Add text overlay to all frames
+                frames_with_text = []
+                for i, (frame, stats) in enumerate(zip(frames, frame_stats)):
+                    step, num_retired, num_visited, num_targets, agent_rewards = stats
+                    frame_with_text = add_text_to_frame(
+                        frame, 
+                        step, 
+                        num_retired, 
+                        args.num_agents, 
+                        num_visited, 
+                        num_targets,
+                        agent_rewards
+                    )
+                    frames_with_text.append(frame_with_text)
+                
                 # Save frames as GIF using imageio
-                imageio.mimsave(gif_path, frames, duration=0.1)  # 0.1s per frame (10 FPS)
+                imageio.mimsave(gif_path, frames_with_text, duration=0.1)  # 0.1s per frame (10 FPS)
                 print(f"Saved GIF: {gif_path}")
             except Exception as e:
                 print(f"Error saving GIF {gif_path}: {e}")

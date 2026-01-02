@@ -160,9 +160,9 @@ class MultiAgentEnv(gym.Env):
         agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
         agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
         # 到达目标点奖励，需要满足当前当前task = 1，即collect模式，且距离目标点小于阈值
-        agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, self.landmark_positions)
+        goal_dones = self._get_goal_dones(self.agents) # 获取当前step后，智能体是否达到目标点的布尔列表
+        agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, goal_dones)
         total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards)
-        # print(total_high_rewards.shape)
 
         # 根据获取的全局状态更新全局信息图
         if self.enable_exploration_reward:
@@ -209,12 +209,6 @@ class MultiAgentEnv(gym.Env):
 
         # 势能奖励+碰撞惩罚
         all_reward =  reward_n + common_penaltie
-        
-        # 对已退役的智能体，将其奖励设置为0
-        for i in range(len(all_reward)):
-            if self.agents_done[i]:
-                all_reward[i] = 0.0
-                total_high_rewards[i] = 0.0
 
         done['all'] = done_n
         done['agent'] = self.agents_done
@@ -416,12 +410,13 @@ class MultiAgentEnv(gym.Env):
         self.render_geoms_xform = None
 
     # render environment
-    def render(self, mode='human', attn=None, goals=None, show_voronoi=False, info=None, show_uncertainty=True):
+    def render(self, mode='human', attn=None, goals=None, show_voronoi=False, info=None, show_uncertainty=True, tasks=None):
         # attn: matrix of size (num_agents, num_agents)
         # goals: array of shape (num_agents, 2) - goal positions for each agent
         # show_voronoi: bool - whether to show voronoi centroids
         # show_uncertainty: bool - whether to show uncertainty heatmap
         # info: dict - contains voronoi centroids information
+        # tasks: array of shape (num_agents,) - task mode for each agent (0=explore, 1=collect)
 
         for i in range(len(self.viewers)):
             # create viewers (if necessary)
@@ -477,6 +472,43 @@ class MultiAgentEnv(gym.Env):
                 viewer.geoms = []
                 for geom in self.render_geoms:
                     viewer.add_geom(geom)
+    
+        # 🎨 根据任务动态更新智能体颜色
+        if tasks is not None:
+            geom_idx = 0
+            agent_idx = 0
+            
+            # 可调参数：任务颜色配置
+            EXPLORE_COLOR = (0.0, 1.0, 0.0)  # 绿色 - explore模式 (task=0)
+            COLLECT_COLOR = (0.0, 0.0, 1.0)  # 蓝色 - collect模式 (task=1)
+            RETIRED_COLOR = (0.5, 0.5, 0.5)  # 灰色 - 已退役
+            AGENT_ALPHA = 0.8
+            
+            for entity in self.world.entities:
+                # 跳过观察范围圆圈
+                if 'agent' in entity.name and hasattr(self.world, 'mask_obs_dist'):
+                    geom_idx += 1
+                
+                # 更新智能体颜色
+                if 'agent' in entity.name:
+                    # 检查是否已退役
+                    if self.agents_done[agent_idx]:
+                        self.render_geoms[geom_idx].set_color(*RETIRED_COLOR, alpha=0.3)
+                    else:
+                        # 根据任务设置颜色
+                        task_value = tasks[agent_idx][0] if isinstance(tasks[agent_idx], (list, np.ndarray)) else tasks[agent_idx]
+                        
+                        if task_value == 0:  # explore模式
+                            self.render_geoms[geom_idx].set_color(*EXPLORE_COLOR, alpha=AGENT_ALPHA)
+                        elif task_value == 1:  # collect模式
+                            self.render_geoms[geom_idx].set_color(*COLLECT_COLOR, alpha=AGENT_ALPHA)
+                        else:
+                            # 默认颜色（未知任务）
+                            self.render_geoms[geom_idx].set_color(*entity.color, alpha=AGENT_ALPHA)
+                    
+                    agent_idx += 1
+                
+                geom_idx += 1
         
         # 🔧 在每次渲染前，移除viewer中所有临时几何体
         temp_geoms_start_idx = len(self.render_geoms)
@@ -488,36 +520,36 @@ class MultiAgentEnv(gym.Env):
         # 🎨 绘制不确定性热力图（作为最底层背景）
         if show_uncertainty and self.enable_exploration_reward and self.global_belief_map is not None:
             from multiagent import rendering
-            
+                
             # 可调参数：不确定性热力图样式
             UNCERTAINTY_ALPHA = 0.3       # 👈 修改这里：热力图透明度
             CELL_SIZE_SCALE = 1.0         # 👈 修改这里：栅格显示比例（相对于实际cell_size）
-            
+                
             # 获取香农熵地图
             entropy_map = self.global_belief_map.compute_shannon_entropy()
-            
+                
             # 归一化熵值到[0, 1]范围（最大熵为1.0）
             max_entropy = 1.0
             normalized_entropy = entropy_map / max_entropy
-            
+                
             # 获取地图参数
             world_min = self.global_belief_map.world_min
             cell_size = self.global_belief_map.cell_size
             map_dim = self.global_belief_map.map_dim
-            
+                
             # 绘制每个栅格的不确定性
             for i in range(map_dim):
                 for j in range(map_dim):
                     uncertainty = normalized_entropy[i, j]
-                    
+                        
                     # 跳过低不确定性的栅格（优化性能）
                     if uncertainty < 0.05:
                         continue
-                    
+                        
                     # 计算栅格中心的世界坐标
                     x = world_min + (i + 0.5) * cell_size
                     y = world_min + (j + 0.5) * cell_size
-                    
+                        
                     # 使用颜色映射：不确定性越高，颜色越深
                     # 这里使用红色到黄色的渐变
                     # 高不确定性（接近1）-> 深红色 (1, 0, 0)
@@ -525,7 +557,7 @@ class MultiAgentEnv(gym.Env):
                     r = 1.0
                     g = 1.0 - uncertainty  # 不确定性越高，绿色分量越少
                     b = 0.0
-                    
+                        
                     # 创建矩形表示栅格
                     rect_size = cell_size * CELL_SIZE_SCALE
                     rect = rendering.make_polygon([
@@ -536,20 +568,20 @@ class MultiAgentEnv(gym.Env):
                     ])
                     rect.set_color(r, g, b, alpha=UNCERTAINTY_ALPHA * uncertainty)
                     self.render_geoms.append(rect)
-        
+            
         # 绘制Voronoi图边界线
         if show_voronoi and info is not None:
             from multiagent import rendering
-            
+                
             # 获取所有智能体的位置
             agent_positions = np.array([agent.state.p_pos for agent in self.world.agents])
-            
+                
             if len(agent_positions) > 1:
                 # 可调参数：Voronoi边界线样式
                 VORONOI_LINE_WIDTH = 5
                 VORONOI_LINE_COLOR = (0.7, 0.7, 0.7)
                 VORONOI_LINE_ALPHA = 1
-                
+                    
                 # 使用GlobalBeliefMap的方法获取Voronoi边界
                 if self.enable_exploration_reward and self.global_belief_map is not None:
                     voronoi_edges = self.global_belief_map.get_voronoi_edges(agent_positions)
@@ -564,7 +596,7 @@ class MultiAgentEnv(gym.Env):
                         )
                         voronoi_line.set_color(*VORONOI_LINE_COLOR, alpha=VORONOI_LINE_ALPHA)
                         self.render_geoms.append(voronoi_line)
-        
+            
         # 绘制目标点 (goals)
         if goals is not None:
             from multiagent import rendering
@@ -592,37 +624,7 @@ class MultiAgentEnv(gym.Env):
                     )
                     goal_line.set_color(1.0, 0.0, 1.0, alpha=0.3)
                     self.render_geoms.append(goal_line)
-        
-        # 绘制voronoi加权质心
-        if show_voronoi and info is not None and 'map' in info and len(info['map']) > 0:
-            from multiagent import rendering
-            
-            # 可调参数：质心大小和连线宽度
-            CENTROID_MARKER_SIZE = 0.025
-            CENTROID_LINE_WIDTH = 1
-            
-            centroids = info['map'][0]
-            if centroids is not None:
-                for i, centroid in enumerate(centroids):
-                    if centroid is not None and len(centroid) == 2:
-                        # 绘制质心（圆形标记）
-                        centroid_marker = rendering.make_circle(CENTROID_MARKER_SIZE, filled=True)
-                        centroid_marker.set_color(0.0, 1.0, 1.0, alpha=0.8)
-                        xform = rendering.Transform()
-                        xform.set_translation(centroid[0], centroid[1])
-                        centroid_marker.add_attr(xform)
-                        self.render_geoms.append(centroid_marker)
-                        
-                        # 绘制智能体到质心的连线
-                        agent_pos = self.world.agents[i].state.p_pos
-                        centroid_line = rendering.Line(
-                            start=(agent_pos[0], agent_pos[1]),
-                            end=(centroid[0], centroid[1]),
-                            linewidth=CENTROID_LINE_WIDTH
-                        )
-                        centroid_line.set_color(0.0, 1.0, 1.0, alpha=0.3)
-                        self.render_geoms.append(centroid_line)
-        
+    
         # 🔧 将新的临时几何体添加到viewer
         for viewer in self.viewers:
             for geom in self.render_geoms[temp_geoms_start_idx:]:
@@ -642,6 +644,15 @@ class MultiAgentEnv(gym.Env):
             # Update agent/landmark position
             self.render_geoms_xform[geom_idx].set_translation(*entity.state.p_pos)
             geom_idx += 1
+
+        # 🆕 更新窗口标题显示时间步信息
+        num_retired = sum(self.agents_done)
+        num_visited = len(self.visited_landmarks)
+        for viewer in self.viewers:
+            if viewer.window is not None:
+                viewer.window.set_caption(
+                    f"Step: {self.world.steps} | Retired: {num_retired}/{self.n} | Targets: {num_visited}/{len(self.landmark_positions)}"
+                )
 
         results = []
         for i in range(len(self.viewers)):
@@ -722,57 +733,79 @@ class MultiAgentEnv(gym.Env):
     def get_obs(self):
         return [self._get_obs(agent) for agent in self.agents]
     
-    def get_target_reward(self, agents_pos, agents_task, landmarks_pos):
+    def get_target_reward(self, agents_pos, agents_task, goal_dones):
         """
-        首先检查agents_task，只有在collect模式（1）下才计算目标奖励。
-        如果智能体到达目标点，如果这个目标点未访问过，返回一个奖励值，否则返回0。
-        判断准则，距离差小于world.dist_thres
-        当智能体到达目标后，会被标记为退役状态，后续将停止运动并持续返回0奖励。
+        ✨ 改进版：使用 goal_dones 和 task 判断智能体是否到达目标
+        
+        逻辑：
+        1. 只有当 goal_dones[i]=True 且 agents_task[i]=1 (collect模式) 时才判定到达目标
+        2. 判断智能体当前目标点 (agent.state.g_pos) 是否是某个 landmark
+        3. 如果是未访问过的 landmark，给予奖励并标记为已访问，同时退役该智能体
         
         参数:
             agents_pos: 智能体位置数组，shape (n_agents, 2)
-            agents_task: 智能体任务列表，1表示collect模式，0表示explore模式
-            landmarks_pos: 目标点位置列表，每个元素是 (x, y)
+            agents_task: 智能体任务数组，shape (n_agents, 1) 或 (n_agents,)，1=collect，0=explore
+            goal_dones: 布尔列表，shape (n_agents,)，True 表示到达目标点
         
         返回:
             rewards: 列表，每个智能体的目标到达奖励
         """
-        # 初始化已访问目标集合（需要在 __init__ 中定义）
+        # 初始化已访问目标集合
         if not hasattr(self, 'visited_landmarks'):
             self.visited_landmarks = set()
         
         rewards = []
-        TARGET_REWARD = 10.0  # 到达新目标的奖励值
+        TARGET_REWARD = 300.0  # 🔧 可调参数：到达新目标的奖励值
+        LANDMARK_MATCH_THRESHOLD = self.world.dist_thres  # 🔧 可调参数：判断目标是否为 landmark 的距离阈值
         
-        for agent_idx, agent_pos in enumerate(agents_pos):
+        for agent_idx, agent in enumerate(self.agents):
             agent_reward = 0.0
             
-            # 如果智能体已经退役，直接返回0奖励
+            # ========== 1. 快速过滤：已退役智能体直接跳过 ==========
             if self.agents_done[agent_idx]:
                 rewards.append(agent_reward)
                 continue
             
-            # 首先检查该智能体是否处于collect模式（task=1）
+            # ========== 2. 快速过滤：非 collect 模式直接跳过 ==========
             agent_task = agents_task[agent_idx]
-            if agent_task[0] != 1:  # 只有在collect模式下才计算目标奖励
+            task_value = agent_task[0] if isinstance(agent_task, (list, np.ndarray)) else agent_task
+            
+            if task_value != 1:  # 非 collect 模式
                 rewards.append(agent_reward)
                 continue
             
-            # 检查该智能体是否到达任何目标点
-            for landmark_idx, landmark_pos in enumerate(landmarks_pos):
-                # 计算到目标点的距离
-                dist = np.linalg.norm(agent_pos - landmark_pos)
-                
-                # 如果距离小于阈值，认为到达目标
-                if dist < self.world.dist_thres:
-                    # 检查该目标是否已被访问过
-                    if landmark_idx not in self.visited_landmarks:
-                        # 首次访问该目标，给予奖励并标记为已访问
-                        agent_reward = TARGET_REWARD
-                        self.visited_landmarks.add(landmark_idx)
-                        # 标记该智能体为退役状态
-                        self.agents_done[agent_idx] = True
-                        break  # 一个智能体在一个step只能获得一次目标奖励
+            # ========== 3. 快速过滤：未到达目标点直接跳过 ==========
+            if not goal_dones[agent_idx]:
+                rewards.append(agent_reward)
+                continue
+            
+            # ========== 4. 判断目标点是否为 landmark ==========
+            # 此时：task=1 且 goal_done=True，说明智能体到达了分配的目标
+            current_goal = agent.state.g_pos  # 当前目标位置
+            
+            # 遍历所有 landmark，找到与当前目标最接近的那个
+            min_dist = float('inf')
+            matched_landmark_idx = None
+            
+            for landmark_idx, landmark_pos in enumerate(self.landmark_positions):
+                dist = np.linalg.norm(current_goal - landmark_pos)
+                if dist < min_dist:
+                    min_dist = dist
+                    matched_landmark_idx = landmark_idx
+            
+            # ========== 5. 判断是否成功到达 landmark ==========
+            if min_dist < LANDMARK_MATCH_THRESHOLD:
+                # 当前目标确实是某个 landmark
+                if matched_landmark_idx not in self.visited_landmarks:
+                    # ✅ 首次访问该 landmark，给予奖励
+                    agent_reward = TARGET_REWARD
+                    self.visited_landmarks.add(matched_landmark_idx)
+                    
+                    # ✅ 标记该智能体为退役状态
+                    self.agents_done[agent_idx] = True
+                    
+                    # 🎯 调试信息（可选）
+                    # print(f"🎉 Agent {agent_idx} collected landmark {matched_landmark_idx} at step {self.world.steps}")
             
             rewards.append(agent_reward)
         

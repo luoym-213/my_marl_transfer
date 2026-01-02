@@ -286,7 +286,7 @@ class Learner(object):
                             # 找到最近的 landmark
                             min_idx = distances.argmin()
                             if distances[min_idx] < 0.05:  # 匹配阈值 0.05
-                                new_detected[lin_idx, min_idx, 3] = 1.0  # 设置 is_targeted = 1
+                                new_detected[:, min_idx, 3] = 1.0  # 设置 is_targeted = 1
                 
                 # 更新所有智能体的 landmark 数据
                 all_landmark_datas = new_detected
@@ -412,8 +412,6 @@ class Learner(object):
         num_processes = len(detected_map_list)
         num_agents = num_agents_processes // num_processes
         
-        # 3. 重置所有 is_targeted 状态（index=3）
-        updated_landmark_data[:, :, 3] = 0.0
         
         # 4. 遍历每个 process，更新对应的 landmark 数据
         for proc_idx, detected_map in enumerate(detected_map_list):
@@ -428,10 +426,11 @@ class Learner(object):
             current_landmarks = updated_landmark_data[linear_idx]  # [max_landmarks, 4]
             current_mask = updated_landmark_mask[linear_idx]  # [max_landmarks, 1]
             
-            # ========== 新增：清理逻辑 ==========
+            # ========== 清理逻辑 ==========
             # 如果detected_map为空（例如环境reset后），清空所有landmark
             if num_detected == 0:
                 updated_landmark_mask[linear_idx, :, 0] = 0.0
+                updated_landmark_data[linear_idx, :, 3] = 0.0  # is_targeted也清0
                 continue
             
             # 标记哪些旧landmark需要保留（即与detected_map中某个点距离<cleanup_threshold）
@@ -448,18 +447,15 @@ class Learner(object):
                 # 如果最近距离超过cleanup_threshold，说明这个landmark已经不存在了，移除
                 if min_dist > cleanup_threshold:
                     updated_landmark_mask[linear_idx, lm_idx, 0] = 0.0
+                    updated_landmark_data[linear_idx, lm_idx, 3] = 0.0
                 else:
                     valid_landmarks_indices.append(lm_idx)
             
-            # ========== 原有逻辑：遍历检测到的每个位置，进行匹配或新增 ==========
+            # ========== 匹配或新增 landmark ==========
             for det_pos in detected_map:  # det_pos: [2]
                 # 6.1 查找是否匹配现有 landmark
-                matched_idx = self._find_landmark_match(
-                    det_pos, 
-                    current_landmarks, 
-                    current_mask, 
-                    match_threshold
-                )
+                matched_idx = self._find_landmark_match(det_pos, current_landmarks, 
+                    current_mask, match_threshold)
                 
                 if matched_idx is not None:
                     # 6.2 更新已存在的 landmark位置为新旧位置的加权平均（更倾向新位置）
@@ -472,7 +468,7 @@ class Learner(object):
                     
                     if empty_idx is not None:
                         updated_landmark_data[linear_idx, empty_idx, 0:2] = det_pos  # x, y
-                        updated_landmark_data[linear_idx, empty_idx, 2] = 20.0  # utility
+                        updated_landmark_data[linear_idx, empty_idx, 2] = 2.0  # utility
                         updated_landmark_data[linear_idx, empty_idx, 3] = 0.0  # is_targeted
                         updated_landmark_mask[linear_idx, empty_idx, 0] = 1.0  # 激活该槽位
                     else:
@@ -687,7 +683,7 @@ class Learner(object):
         for agent, policy in zip(self.all_agents, policies_list):
             agent.load_model(policy)
 
-    def eval_act(self, obs, env_states, goals, tasks, landmark_data, landmark_mask, deterministic=False):
+    def eval_act(self, obs, env_states, goals, tasks, landmark_data, landmark_mask, deterministic=True):
         # used only while evaluating policies. Assuming that agents are in order of team!
         # goals: 上一步的目标分配 [num_agents, 2]
         # landmark_data: 上一步的地标数据 [num_agents, max_landmarks, 4]
@@ -808,7 +804,8 @@ class Learner(object):
                     batch_landmark_nodes, # List of Tensor shape [L_i, 4], length N
                     batch_landmark_node_masks, # List of Tensor shape [L_i, 1], length N
                     batch_ego_to_landmark_edges, # List of  Tensor shape [L_i, 3], length N
-                    batch_ego_to_landmark_edge_masks # List of Tensor shape [L_i, 1], length N
+                    batch_ego_to_landmark_edge_masks, # List of Tensor shape [L_i, 1], length N
+                    deterministic  = deterministic
                     )  # 需要实现batch版本
                 
                 # 4. 批量更新 all_goals 和 all_tasks
@@ -841,7 +838,9 @@ class Learner(object):
                             # 找到最近的 landmark
                             min_idx = distances.argmin()
                             if distances[min_idx] < 0.05:  # 匹配阈值 0.05
-                                new_detected[lin_idx, min_idx, 3] = 1.0  # 设置 is_targeted = 1
+                                # new_detected[lin_idx, min_idx, 3] = 1.0  # 设置 is_targeted = 1
+                                # 所有agent的障碍物is_targeted同步更新
+                                new_detected[:, min_idx, 3] = 1.0
                 
                 # 更新所有智能体的 landmark_data 和 landmark_mask
                 landmark_data = new_detected
