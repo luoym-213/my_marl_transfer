@@ -162,7 +162,7 @@ class Learner(object):
             num_processes = len(self.envs_info)
             num_agents = len(team)
 
-            # 1. 批量构建 critic map input 和 critic vec input
+            # ⭐ 构建Critic输入
             entropy_maps = torch.stack([torch.from_numpy(np.array(info['entropy_map'])).float() 
                                         for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
             heatmaps = torch.stack([torch.from_numpy(np.array(info['heatmap'])).float() 
@@ -171,101 +171,78 @@ class Learner(object):
                                             for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
             all_critic_map_inp = torch.stack([entropy_maps, heatmaps, landmark_heatmaps], dim=1)  # [num_processes, 3, H, W]
             
-            # 2. 收集所有 goal_done 状态并构建mask
-            goal_done_list = [info['goal_done'] for info in self.envs_info]  # list of lists
-            goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)  # [num_processes, num_agents]
-            # 收集当前的 world_step 信息，并广播为 [num_processes, num_agents,1] 的张量
+            # ⭐ 收集goal_done和battery信息
+            goal_done_list = [info['goal_done'] for info in self.envs_info]
+            goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)
             agent_world_steps = torch.tensor(
                 [info['world_steps'] for info in self.envs_info], 
                 dtype=torch.float32, 
                 device=self.device
-            ).unsqueeze(1).repeat(1, num_agents).unsqueeze(-1)  # [num_processes, num_agents, 1]
-            
-            # 根据 world_step 生成 battery 信息: battery = (50 - step) / 50
-            agent_batterys = (50.0 - agent_world_steps) / 50.0  # [num_processes, num_agents, 1]
+            ).unsqueeze(1).repeat(1, num_agents).unsqueeze(-1)
+            agent_batterys = (50.0 - agent_world_steps) / 50.0
 
-            # 3. 批量生成 landmark node
+            # ⭐ 生成landmark节点
             detected_maps = [torch.from_numpy(np.array(info['map'][1])).float().to(self.device) 
-                            for info in self.envs_info] # [num_processes, x, 2], 不规则形状，每个 process 检测到的目标数量不同
-            
-            new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, all_landmark_masks, detected_maps, self.device) 
-            # [num_agents * num_processes, max_landmarks, 4], [num_agents * num_processes, max_landmarks, 1]
+                            for info in self.envs_info]
+            new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, all_landmark_masks, detected_maps, self.device)
 
-            # 4. 生成动态异构图结构的节点表示
-            # 4.1 输入准备，包括地图输入和向量输入
-            agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)  # [num_processes, num_agents, H, W]
+            # ⭐ 准备智能体节点数据
+            agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)
             voronoi_masks = torch.stack([
                 torch.stack([torch.from_numpy(np.array(info['voronoi_masks'][a])).float() 
                             for a in range(num_agents)]) 
                 for info in self.envs_info
-            ]).to(self.device)  # [num_processes, num_agents, H, W]   
+            ]).to(self.device)
+            agent_positions = all_obs[:, 2:4].view(num_agents, num_processes, 2).transpose(0, 1)
+            agent_vels = all_obs[:, 0:2].view(num_agents, num_processes, 2).transpose(0, 1)
+            agent_goals = all_goals.view(num_agents, num_processes, 2).transpose(0, 1)
+            agent_nodes = torch.cat([agent_positions, agent_goals], dim=-1)
+            ego_nodes = torch.cat([agent_positions, agent_vels, agent_batterys], dim=-1)
 
-            ## 从all_obs批量生成智能体信息（栅格索引） [num_processes, num_agents, 2]
-            agent_positions = all_obs[:, 2:4].view(num_agents, num_processes, 2).transpose(0, 1) # 位置[num_processes, num_agents, 2]
-            agent_vels = all_obs[:, 0:2].view(num_agents, num_processes, 2).transpose(0, 1)      # 速度[num_processes, num_agents, 2]
-            agent_goals = all_goals.view(num_agents, num_processes, 2).transpose(0, 1) # [num_processes, num_agents, 2]
-            ## 拼接成[num_processes, num_agents, 4]
-            agent_nodes = torch.cat([agent_positions, agent_goals], dim=-1)  # [num_processes, num_agents, 4]
-            ego_nodes = torch.cat([agent_positions, agent_vels, agent_batterys], dim=-1)  # [num_processes, num_agents, 5]
-
+            # ⭐ 高层决策（如果需要）
             if goal_done_mask.any():
-                # 获取需要更新的索引 (process_idx, agent_idx)
-                update_indices = torch.nonzero(goal_done_mask, as_tuple=False)  # [N, 2] where N is number of True values                
-                
-                # 选择需要更新的智能体所在环境输入
+                update_indices = torch.nonzero(goal_done_mask, as_tuple=False)
                 proc_indices = update_indices[:, 0]
                 agent_indices = update_indices[:, 1]
                 
                 map_inps = torch.stack([
                     agent_entropy_maps[proc_indices],
                     voronoi_masks[proc_indices]
-                ], dim=0)  # [2, N, num_agents, H, W]
+                ], dim=0)
+                vec_inp_agents = agent_nodes[proc_indices]
                 
-                vec_inp_agents = agent_nodes[proc_indices]  # [N, num_agents, 4]
+                # ⭐ RRT生成探索节点
+                batch_explore_nodes = policy.get_explore_nodes(vec_inp_agents, map_inps, agent_indices)
+                batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])
                 
-                # 4.2 通过RTT生成候选探索点
-                batch_explore_nodes = policy.get_explore_nodes(vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
-                batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])  # [B_pro*B_agents, K, 4]
-                # 4.3 ego nodes
-                batch_ego_nodes = ego_nodes[proc_indices, agent_indices]  # [N, 5]
-                # 4.4 landmark nodes
+                # ⭐ 获取landmark节点
+                batch_ego_nodes = ego_nodes[proc_indices, agent_indices]
                 linear_indices = agent_indices * num_processes + proc_indices
                 batch_landmark_nodes, batch_landmark_node_masks = policy.get_landmark_nodes(
-                    all_obs[:,2:4],  # [num_agents * num_processes, 2]
-                    new_detected,                   # [num_agents * num_processes, max_landmarks, 4]
-                    new_detected_masks,             # [num_agents * num_processes, max_landmarks, 1]
-                    linear_indices                  # [N]
-                )  # List of [L_i, 4], List of [L_i, 1]
+                    all_obs[:,2:4], new_detected, new_detected_masks, linear_indices
+                )
                 
-                # 4.5 edge features
+                # ⭐ 获取边特征
                 batch_ego_to_explore_edges, batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks = policy.get_edge_features(
-                    batch_explore_nodes,    # batch_ego_to_explore_edges: List of [K, 3], 长度为 N
-                    batch_landmark_nodes,   # batch_ego_to_landmark_edges: List of [L_i, 3], 长度为 N
-                    batch_landmark_node_masks   # batch_ego_to_landmark_edge_masks: List of [L_i, 1], 长度为 N
+                    batch_explore_nodes, batch_landmark_nodes, batch_landmark_node_masks
                 )
 
-                # 5. 批量执行高层策略
+                # ⭐ 高层策略决策
                 batch_goals = policy.get_high_level_goal(
                     batch_ego_nodes, # Tensor shape [N, 5]
                     batch_explore_nodes, # Tensor shape [N, K, 4]
-                    batch_ego_to_explore_edges, # List of Tensor shape [K, 3], length N
-                    batch_landmark_nodes, # List of Tensor shape [L_i, 4], length N
-                    batch_landmark_node_masks, # List of Tensor shape [L_i, 1], length N
-                    batch_ego_to_landmark_edges, # List of Tensor shape [L_i, 3], length N
-                    batch_ego_to_landmark_edge_masks # List of Tensor shape [L_i, 1], length N
+                    batch_ego_to_explore_edges, # Tensor [N, K, 3], length N
+                    batch_landmark_nodes, # tensor: [N, Max_L, 4]
+                    batch_landmark_node_masks, # tensor: [N, Max_L, 1]
+                    batch_ego_to_landmark_edges, # Tensor [N, Max_L, 3]
+                    batch_ego_to_landmark_edge_masks # Tensor [N, Max_L, 1]
                 )
                 
-                # 6. 批量更新 all_goals 和 all_tasks
-                # 6.1 计算线性索引: agent_idx * num_processes + process_idx
-                linear_indices = agent_indices * num_processes + proc_indices
+                # ⭐ 更新目标和landmark
+                all_goals[linear_indices] = batch_goals["waypoints"]
+                all_tasks[linear_indices] = batch_goals["action_modes"]
+                all_higoal_log_probs[linear_indices] = batch_goals["node_log_probs"]
                 
-                # 6.2 更新目标和任务
-                all_goals[linear_indices] = batch_goals["waypoints"]  # [N, 2]
-                all_tasks[linear_indices] = batch_goals["action_modes"]  # [N, 1]
-                all_higoal_log_probs[linear_indices] = batch_goals["node_log_probs"]  # [N, 1]
-
-                # 6.3 更新 landmark data 和 mask
-                # 如果智能体选择的任务是 landmark，则更新对应 landmark 的 is_targeted 属性
                 for i, lin_idx in enumerate(linear_indices):
                     if batch_goals["action_modes"][i, 0] == 1:  # 选择的是 landmark
                         # 获取选中的 waypoint（绝对世界坐标）
@@ -292,15 +269,10 @@ class Learner(object):
                 all_landmark_datas = new_detected
                 all_landmark_masks = new_detected_masks
 
-            # 7. 保存全量的graph数据到rollouts中，以便后续PPO更新时使用
-            # 为所有智能体准备图数据（即使没有更新目标的智能体也需要保存当前状态）
-            # 重新生成所有智能体的完整图结构数据
-            all_ego_nodes = ego_nodes.view(num_processes * num_agents, -1)  # [num_agents*num_processes, 5]
-            
-            # explore nodes: 利用已生成的 batch_explore_nodes 填充决策智能体，其他用空节点
-            K = 5  # 候选节点数量
-            all_explore_nodes = torch.zeros(num_processes * num_agents, K, 4, device=self.device)  # [num_agents*num_processes, K, 4]
-            
+            # ⭐ 准备rollout数据
+            all_ego_nodes = ego_nodes.view(num_processes * num_agents, -1)
+            K = 5
+            all_explore_nodes = torch.zeros(num_processes * num_agents, K, 4, device=self.device)
             if goal_done_mask.any():
                 # 将决策智能体的 explore nodes 填充到对应位置
                 all_explore_nodes[linear_indices] = batch_explore_nodes  # batch_explore_nodes: [N, K, 4]
@@ -313,11 +285,10 @@ class Learner(object):
             all_critic_nodes = torch.cat([agent_positions, all_goals.view(num_agents, num_processes, 2).transpose(0, 1)], dim=-1)  # [num_processes, num_agents, 4]
             all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_nodes) # 计算所有process的高层value： [num_processes, num_agents]
 
-            # 低层策略的处理
-            # props = policy.act(all_obs, all_hidden, all_env_state, all_masks, deterministic=False) # a single forward pass
-            props = policy.low_level_act(all_obs, all_goals, deterministic=False) # a single forward pass
+            # ⭐ 底层策略
+            props = policy.low_level_act(all_obs, all_goals, deterministic=False)
 
-            # split all outputs
+            # ⭐ 拆分和存储结果
             n = len(team)
             
             # 拆分图数据
@@ -331,8 +302,8 @@ class Learner(object):
             all_landmark_datas_split = torch.chunk(all_landmark_datas, n)
             all_landmark_masks_split_tensor = torch.chunk(all_landmark_masks, n)
             all_high_value = torch.chunk(all_high_value, n, dim=1)
-
             all_value, all_action, all_action_log_prob = [torch.chunk(x, n) for x in props]
+        
             for i in range(n):
                 # 低层策略
                 team[i].value = all_value[i]
@@ -574,7 +545,6 @@ class Learner(object):
                 dtype=torch.float32, 
                 device=self.device
             ).unsqueeze(1).repeat(1, num_agents).unsqueeze(-1)  # [num_processes, num_agents, 1]
-
             # 根据 world_step 生成 battery 信息: battery = (50 - step) / 50
             agent_batterys = (50.0 - agent_world_steps) / 50.0  # [num_processes, num_agents, 1]
 

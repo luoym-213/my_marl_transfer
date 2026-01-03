@@ -755,7 +755,7 @@ class MultiAgentEnv(gym.Env):
             self.visited_landmarks = set()
         
         rewards = []
-        TARGET_REWARD = 300.0  # 🔧 可调参数：到达新目标的奖励值
+        TARGET_REWARD = 6000.0  # 🔧 可调参数：到达新目标的奖励值
         LANDMARK_MATCH_THRESHOLD = self.world.dist_thres  # 🔧 可调参数：判断目标是否为 landmark 的距离阈值
         
         for agent_idx, agent in enumerate(self.agents):

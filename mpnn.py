@@ -588,7 +588,7 @@ class MPNN(nn.Module):
         voronoi_inp = voronoi_np.reshape(-1, voronoi_np.shape[-2], voronoi_np.shape[-1])  # [B_pro*B_agents, H, W]
         entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])  # [B_pro*B_agents, H, W]
         
-        batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=60, top_k=5)  # [B_pro*B_agents, K, 3]
+        batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=40, top_k=5)  # [B_pro*B_agents, K, 3]
         batch_rtt = torch.tensor(batch_rtt, dtype=torch.long, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
         
         ## 转为世界坐标
@@ -655,38 +655,17 @@ class MPNN(nn.Module):
         # 提取对应智能体的位置 [N, 2]
         ego_positions = agent_positions[linear_indices]  # [N, 2]
 
-        batch_landmark_nodes = []
-        batch_landmark_nodes_masks = []
-
-        for i in range(len(linear_indices)):
-            # 获取有效的 landmarks
-            valid_mask = batch_landmark_mask[i, :, 0] > 0.5  # [max_landmarks]
-            valid_landmarks = batch_landmark_data[i, valid_mask]  # [L_i, 4]，L_i 是该智能体的有效 landmark 数量
-            
-            if valid_landmarks.shape[0] > 0:
-                # 提取 landmark 的世界坐标 [L_i, 2]
-                landmark_world_pos = valid_landmarks[:, :2]
-                
-                # 计算相对位置：landmark_pos - agent_pos
-                # ego_positions[i]: [2]
-                # landmark_world_pos: [L_i, 2]
-                relative_pos = landmark_world_pos - ego_positions[i].unsqueeze(0)  # [L_i, 2]
-                
-                # 拼接相对位置和其他特征（utility, is_targeted）
-                landmark_features = torch.cat([
-                    relative_pos,              # [L_i, 2] - 相对位置
-                    valid_landmarks[:, 2:]     # [L_i, 2] - utility, is_targeted
-                ], dim=-1)  # [L_i, 4]
-                
-                batch_landmark_nodes.append(landmark_features)
-                # 创建全1的mask，表示这些都是有效节点
-                batch_landmark_nodes_masks.append(torch.ones(valid_landmarks.shape[0], 1, device=valid_landmarks.device))
-            else:
-                # 如果没有有效 landmark，添加一个占位符（后续会被mask掉）
-                batch_landmark_nodes.append(torch.zeros(1, 4, device=batch_landmark_data.device))
-                batch_landmark_nodes_masks.append(torch.zeros(1, 1, device=batch_landmark_data.device))
-
-        return batch_landmark_nodes, batch_landmark_nodes_masks
+        # ✅ 批量计算相对位置
+        relative_pos = batch_landmark_data[:, :, :2] - ego_positions.unsqueeze(1)  # [N, max_L, 2]
+        
+        # 更新landmark数据（保留utility和is_targeted）
+        batch_landmark_data_relative = torch.cat([
+            relative_pos,
+            batch_landmark_data[:, :, 2:]  # [N, max_L, 2] - utility和is_targeted
+        ], dim=2)  # [N, max_L, 4]
+        
+        # ✅ 直接返回tensor，而不是list，[N, max_L, 4] 和 [N, max_L, 1]
+        return batch_landmark_data_relative, batch_landmark_mask
 
     def get_edge_features(self, explore_nodes, landmark_nodes, landmark_node_masks, norm=False, max_distance=2.8):
         """
@@ -694,69 +673,54 @@ class MPNN(nn.Module):
         
         Args:
             explore_nodes: [B, K, 4]，候选探索点特征
-            landmark_nodes: List of [L_i, 4]，landmark 特征，每个L不固定
-            landmark_node_masks: List of [L_i, 1]，landmark 有效掩码
+            landmark_nodes: tensor: [B, Max_L, 4]，landmark 特征
+            landmark_node_masks: tensor: [B, Max_L, 1]，landmark 有效掩码
             norm: 是否归一化距离，默认False（不归一化）
             max_distance: 归一化时的最大距离，默认2.8
             
         Returns:
-            batch_ego_to_explore_edges: List of [K, 3]
-            batch_ego_to_landmark_edges: List of [L_i, 3]
-            batch_ego_to_landmark_edge_masks: List of [L_i, 1]
+            batch_ego_to_explore_edges: tensor: [N, K, 3]
+            batch_ego_to_landmark_edges: tensor: [N, Max_L, 3]
+            batch_ego_to_landmark_edge_masks: tensor: [N, Max_L, 1]
         """
-        # 1. ego -> explore nodes 的边特征
-        batch_ego_to_explore_edges = []  # List of [K, 3]
+        """向量化版本 - 批量处理所有样本"""
+        B = explore_nodes.shape[0]
+        K = explore_nodes.shape[1]
+
+        # ✅ 批量计算explore边特征
+        explore_relative_pos = explore_nodes[:, :, :2]  # [B, K, 2]
+        distances = torch.norm(explore_relative_pos, dim=2, keepdim=True)  # [B, K, 1]
+
+        if norm:
+            d_feature = distances / max_distance
+        else:
+            d_feature = distances
         
-        for i in range(explore_nodes.shape[0]):
-            explore_relative_pos = explore_nodes[i, :, :2]  # [K, 2] - 相对位置
-            
-            # 计算距离
-            distances = torch.norm(explore_relative_pos, dim=1, keepdim=True)  # [K, 1]
-            
-            # 根据 norm 选择距离特征
-            if norm:
-                d_feature = torch.clamp(distances / max_distance, max=1.0)  # [K, 1] 归一化
-            else:
-                d_feature = distances  # [K, 1] 原始距离
-            
-            # 计算角度的 cos 和 sin（避免除零）
-            distances_safe = distances.clamp(min=1e-6)
-            cos_theta = explore_relative_pos[:, 0:1] / distances_safe  # [K, 1]
-            sin_theta = explore_relative_pos[:, 1:2] / distances_safe  # [K, 1]
-            
-            # 拼接边特征 [d, cos(θ), sin(θ)]
-            edge_features = torch.cat([d_feature, cos_theta, sin_theta], dim=1)  # [K, 3]
-            batch_ego_to_explore_edges.append(edge_features)
+        distances_safe = distances.clamp(min=1e-6)
+        cos_theta = explore_relative_pos[:, :, 0:1] / distances_safe  # [B, K, 1]
+        sin_theta = explore_relative_pos[:, :, 1:2] / distances_safe  # [B, K, 1]
+
+        # [B, K, 3] - 直接返回tensor而不是list
+        batch_ego_to_explore_edges = torch.cat([d_feature, cos_theta, sin_theta], dim=2)
+
+        # ✅ 批量处理landmark边特征（使用padding）
+        max_L = landmark_nodes.shape[1]
         
-        # batch_ego_to_explore_edges: List of [K, 3], 长度为 N
-        
-        # 2. ego -> landmark nodes 的边特征
-        batch_ego_to_landmark_edges = []  # List of [L_i, 3]
-        batch_ego_to_landmark_edge_masks = []  # List of [L_i, 1]
-        
-        for i in range(len(landmark_nodes)):
-            landmark_relative_pos = landmark_nodes[i][:, :2]  # [L_i, 2] - 相对位置
-            landmark_mask = landmark_node_masks[i]  # [L_i, 1]
-            
-            # 计算距离
-            distances = torch.norm(landmark_relative_pos, dim=1, keepdim=True)  # [L_i, 1]
-            
-            # 根据 norm 选择距离特征
-            if norm:
-                d_feature = torch.clamp(distances / max_distance, max=1.0)  # [L_i, 1] 归一化
-            else:
-                d_feature = distances  # [L_i, 1] 原始距离
-            
-            # 计算角度的 cos 和 sin（避免除零）
-            distances_safe = distances.clamp(min=1e-6)
-            cos_theta = landmark_relative_pos[:, 0:1] / distances_safe  # [L_i, 1]
-            sin_theta = landmark_relative_pos[:, 1:2] / distances_safe  # [L_i, 1]
-            
-            # 拼接边特征 [d, cos(θ), sin(θ)]
-            edge_features = torch.cat([d_feature, cos_theta, sin_theta], dim=1)  # [L_i, 3]
-            
-            batch_ego_to_landmark_edges.append(edge_features)
-            batch_ego_to_landmark_edge_masks.append(landmark_mask)
+        # 构建padded tensor
+        landmark_relative_pos = landmark_nodes[:, :, :2]  # [B, Max_L, 2]
+        distances_landmark = torch.norm(landmark_relative_pos, dim=2, keepdim=True)  # [B, Max_L, 1]
+
+        if norm:
+            d_feature_landmark = distances_landmark / max_distance
+        else:
+            d_feature_landmark = distances_landmark 
+
+        distances_landmark_safe = distances_landmark.clamp(min=1e-6)
+        cos_theta_landmark = landmark_relative_pos[:, :, 0:1] / distances_landmark_safe  # [B, Max_L, 1]
+        sin_theta_landmark = landmark_relative_pos[:, :, 1:2] / distances_landmark_safe  # [B, Max_L, 1]    
+
+        batch_ego_to_landmark_edges = torch.cat([d_feature_landmark, cos_theta_landmark, sin_theta_landmark], dim=2)  # [B, Max_L, 3]
+        batch_ego_to_landmark_edge_masks = landmark_node_masks  # [B, Max_L, 1]
         
         return batch_ego_to_explore_edges, batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
 
@@ -772,10 +736,10 @@ class MPNN(nn.Module):
             batch_ego_nodes: [B, 5] [x, y, vel_x, vel_y, battery]
             batch_explore_nodes: [B, K, 4] [relative_x, relative_y, utility, occupied]
             batch_ego_to_explore_edges: [B, K, 3] [d, cosθ, sinθ]
-            batch_landmark_nodes: List[Tensor], 每个 [L_i, 4] [relative_x, relative_y, utility, is_targeted]
-            batch_landmark_node_masks: List[Tensor], 每个 [L_i, 1] (1=有效, 0=无效)
-            batch_ego_to_landmark_edges: List[Tensor], 每个 [L_i, 3]
-            batch_ego_to_landmark_edge_masks: List[Tensor], 每个 [L_i, 1]
+            batch_landmark_nodes: [B, Max_L, 4] [relative_x, relative_y, utility, is_targeted]
+            batch_landmark_node_masks: [B, Max_L, 1] (1=有效, 0=无效)
+            batch_ego_to_landmark_edges: [B, Max_L, 3]
+            batch_ego_to_landmark_edge_masks: [B, Max_L, 1]
             deterministic: bool
         
         Returns:
@@ -797,25 +761,23 @@ class MPNN(nn.Module):
             batch_explore_nodes.view(B * K, -1)
         ).view(B, K, -1)  # [B, K, 64]
         
-        explore_edges_tensor = torch.stack(batch_ego_to_explore_edges, dim=0) # [B, K, 3]
         explore_edge_feats = self.edge_encoder(
-            explore_edges_tensor.view(B * K, -1)
+            batch_ego_to_explore_edges.view(B * K, -1)
         ).view(B, K, -1)  # [B, K, 32]
         
-        # 1.3 Landmark节点嵌入（可变长度）
-        landmark_node_feats_list = []  # 存储每个样本的 landmark 特征
-        landmark_edge_feats_list = []
-        landmark_lengths = []  # 记录每个样本的有效 landmark 数量
-        
-        for i in range(B):
-            node_feat = self.landmark_node_encoder(batch_landmark_nodes[i])  # [L_i, 64]
-            edge_feat = self.edge_encoder(batch_ego_to_landmark_edges[i])    # [L_i, 32]
-            landmark_node_feats_list.append(node_feat)
-            landmark_edge_feats_list.append(edge_feat)
-            landmark_lengths.append(node_feat.size(0))
-        
-        max_L = max(landmark_lengths) if landmark_lengths else 0
-        
+        # 1.3 Landmark节点嵌入（向量化）
+        max_L = batch_landmark_nodes.size(1)  # [B, Max_L, 4]
+
+        # 一次性编码所有 landmark 节点 [B, Max_L, 4] -> [B, Max_L, 64]
+        landmark_node_feats = self.landmark_node_encoder(
+            batch_landmark_nodes.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, Max_L, 64]
+
+        # 一次性编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
+        landmark_edge_feats = self.edge_encoder(
+            batch_ego_to_landmark_edges.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, Max_L, 32]
+
         # ===== 2. 构建统一的候选节点集合 =====
         # 将 explore 和 landmark 合并为一个统一的节点集
         # 总节点数 = K (explore) + max_L (landmark)
@@ -832,7 +794,7 @@ class MPNN(nn.Module):
         
         # 存储相对坐标用于后续输出
         unified_relative_pos = torch.zeros(B, total_nodes, 2, device=ego_node_feats.device)
-        
+
         # 节点类型标签: 0=explore, 1=landmark
         node_type_labels = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.long)
         
@@ -845,20 +807,23 @@ class MPNN(nn.Module):
         node_type_labels[:, :K] = 0  # explore 类型
         
         # 填充 landmark 节点 (索引 K ~ K+max_L-1)
-        for i in range(B):
-            Li = landmark_lengths[i]
-            if Li > 0:
-                lm_kv = torch.cat([landmark_node_feats_list[i], landmark_edge_feats_list[i]], dim=-1)  # [Li, 96]
-                unified_k[i, K:K+Li, :] = self.k_proj(lm_kv)
-                unified_v[i, K:K+Li, :] = self.v_proj(lm_kv)
-                # 有效的 landmark：必须 mask 有效且未被追踪 (is_targeted=0)
-                valid_mask = batch_landmark_node_masks[i][:, 0] > 0.5
-                not_targeted = batch_landmark_nodes[i][:, 3] < 0.5  # is_targeted 在索引3，<0.5表示未被追踪
-                combined_mask = valid_mask & not_targeted
-                unified_mask[i, K:K+Li] = combined_mask
-                unified_relative_pos[i, K:K+Li, :] = batch_landmark_nodes[i][:, :2]
-                node_type_labels[i, K:K+Li] = 1  # landmark 类型
-        
+        if max_L > 0:
+            # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
+            lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
+            
+            # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
+            unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
+            unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
+            
+            # 构建有效掩码：mask 有效 且 未被追踪
+            valid_mask = batch_landmark_node_masks[:, :, 0] > 0.5  # [B, Max_L]
+            not_targeted = batch_landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
+            combined_mask = valid_mask & not_targeted              # [B, Max_L]
+            
+            unified_mask[:, K:K+max_L] = combined_mask
+            unified_relative_pos[:, K:K+max_L, :] = batch_landmark_nodes[:, :, :2]
+            node_type_labels[:, K:K+max_L] = 1
+
         # ===== 3. 注意力机制 =====
         # 计算注意力分数
         scale = math.sqrt(self.attn_dim)
@@ -1061,9 +1026,9 @@ class MPNN(nn.Module):
         return value, action, action_log_probs
 
     def evaluate_high_actions(self, env_states, obs,
-                              critic_maps, critic_nodes, goals, tasks, 
-                              ego_nodes, explore_nodes, landmark_datas, landmark_masks, 
-                              agent_ids):
+                          critic_maps, critic_nodes, goals, tasks, 
+                          ego_nodes, explore_nodes, landmark_datas, landmark_masks, 
+                          agent_ids):
         """
         评估给定高层动作的log_prob、熵和价值（用于PPO更新）
         
@@ -1121,23 +1086,21 @@ class MPNN(nn.Module):
             explore_nodes.view(B * K, -1)
         ).view(B, K, -1)  # [B, K, 64]
         
-        explore_edges_tensor = torch.stack(ego_to_explore_edges, dim=0)
         explore_edge_feats = self.edge_encoder(
-            explore_edges_tensor.view(B * K, -1)
+            ego_to_explore_edges.view(B * K, -1)
         ).view(B, K, -1)  # [B, K, 32]
         
-        landmark_node_feats_list = []
-        landmark_edge_feats_list = []
-        landmark_lengths = []
-        
-        for i in range(B):
-            node_feat = self.landmark_node_encoder(landmark_nodes[i])
-            edge_feat = self.edge_encoder(ego_to_landmark_edges[i])
-            landmark_node_feats_list.append(node_feat)
-            landmark_edge_feats_list.append(edge_feat)
-            landmark_lengths.append(node_feat.size(0))
-        
-        max_L = max(landmark_lengths) if landmark_lengths else 0
+        max_L = landmark_nodes.size(1)  # [B, Max_L, 4]
+
+        # 一次性编码所有 landmark 节点 [B, Max_L, 4] -> [B, Max_L, 64]
+        landmark_node_feats = self.landmark_node_encoder(
+            landmark_nodes.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, Max_L, 64]
+
+        # 一次性编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
+        landmark_edge_feats = self.edge_encoder(
+            ego_to_landmark_edges.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, Max_L, 32]
         
         # 2.2 构建统一的候选节点集合
         total_nodes = K + max_L
@@ -1148,37 +1111,54 @@ class MPNN(nn.Module):
         unified_v = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
         unified_mask = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.bool)
         unified_relative_pos = torch.zeros(B, total_nodes, 2, device=ego_node_feats.device)
+
+        # 节点类型标签: 0=explore, 1=landmark
+        node_type_labels = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.long)
         
         # 填充 explore 节点
         explore_kv = torch.cat([explore_node_feats, explore_edge_feats], dim=-1)
         unified_k[:, :K, :] = self.k_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
         unified_v[:, :K, :] = self.v_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
-        unified_mask[:, :K] = True
-        unified_relative_pos[:, :K, :] = explore_nodes[:, :, :2]
+        unified_mask[:, :K] = True  # explore 节点全部有效
+        unified_relative_pos[:, :K, :] = explore_nodes[:, :, :2]  # 相对坐标
+        node_type_labels[:, :K] = 0  # explore 类型
         
-        # 填充 landmark 节点
-        for i in range(B):
-            Li = landmark_lengths[i]
-            if Li > 0:
-                lm_kv = torch.cat([landmark_node_feats_list[i], landmark_edge_feats_list[i]], dim=-1)
-                unified_k[i, K:K+Li, :] = self.k_proj(lm_kv)
-                unified_v[i, K:K+Li, :] = self.v_proj(lm_kv)
-                valid_mask = landmark_node_masks[i][:, 0] > 0.5
-                not_targeted = landmark_nodes[i][:, 3] < 0.5
-                combined_mask = valid_mask & not_targeted
-                unified_mask[i, K:K+Li] = combined_mask
-                unified_relative_pos[i, K:K+Li, :] = landmark_nodes[i][:, :2]
+        # 填充 landmark 节点 (索引 K ~ K+max_L-1)
+        if max_L > 0:
+            # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
+            lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
+            
+            # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
+            unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
+            unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
+            
+            # 构建有效掩码：mask 有效 且 未被追踪
+            valid_mask = landmark_node_masks[:, :, 0] > 0.5  # [B, Max_L]
+            not_targeted = landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
+            combined_mask = valid_mask & not_targeted              # [B, Max_L]
+            
+            unified_mask[:, K:K+max_L] = combined_mask
+            unified_relative_pos[:, K:K+max_L, :] = landmark_nodes[:, :, :2]
+            node_type_labels[:, K:K+max_L] = 1
         
         # 2.3 注意力机制
         scale = math.sqrt(self.attn_dim)
         attn_scores = (q @ unified_k.transpose(1, 2)) / scale
         attn_scores = attn_scores.masked_fill(~unified_mask.unsqueeze(1), -1e9)
-        attn_weights = torch.softmax(attn_scores, dim=-1)
-        context = (attn_weights @ unified_v).squeeze(1)
+        
+        # Softmax 得到注意力权重
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, 1, total_nodes]
+        
+        # 注意力加权求和
+        context = (attn_weights @ unified_v).squeeze(1)  # [B, 64]
         
         # 2.4 节点选择分布
         selection_logits = self.node_selection_head(unified_v).squeeze(-1)  # [B, total_nodes]
+        
+        # 应用 mask
         selection_logits = selection_logits.masked_fill(~unified_mask, -1e9)
+        
+        # 构建分类分布
         node_dist = TorchCategorical(logits=selection_logits)
         
         # =====================================================
