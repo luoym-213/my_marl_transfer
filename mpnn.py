@@ -554,7 +554,7 @@ class MPNN(nn.Module):
     def attn_dim(self):
         return 64
 
-    def get_explore_nodes(self, vec_inp, map_inp, agent_indices=None, deterministic=False):
+    def get_explore_nodes(self, top_k, rrt_max_iter, vec_inp, map_inp, agent_indices=None, deterministic=False):
         """
         vec_inp: [Batch, num_agents, 4]，世界坐标：[x_pos, y_pos, x_goal, y_goal]
         map_inp: [2, Batch, num_agents, H, W], (0: entropy, 1: voronoi_mask)
@@ -588,7 +588,7 @@ class MPNN(nn.Module):
         voronoi_inp = voronoi_np.reshape(-1, voronoi_np.shape[-2], voronoi_np.shape[-1])  # [B_pro*B_agents, H, W]
         entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])  # [B_pro*B_agents, H, W]
         
-        batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=40, top_k=5)  # [B_pro*B_agents, K, 3]
+        batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=rrt_max_iter, top_k=top_k)  # [B_pro*B_agents, K, 3]
         batch_rtt = torch.tensor(batch_rtt, dtype=torch.long, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
         
         ## 转为世界坐标
@@ -619,7 +619,7 @@ class MPNN(nn.Module):
             mask[batch_idx, 0, :, agent_indices] = False
         else:
             diag_mask = torch.eye(B_agents, device=vec_inp.device).bool()
-            mask = ~diag_mask.view(1, B_agents, 1, B_agents).expand(B_pro, B_agents, 5, B_agents)
+            mask = ~diag_mask.view(1, B_agents, 1, B_agents).expand(B_pro, B_agents, top_k, B_agents)
 
         dists = torch.where(mask, dists, torch.tensor(float('inf'), device=dists.device))
 
@@ -928,34 +928,6 @@ class MPNN(nn.Module):
 
     def _low_policy(self, x): # h_dim -> h_dim
         return self.policy_head(x)
-    
-    def vec_inp_generator(self, env_state, detected_map):
-        # 生成智能体向量流，得到vec_inp [num_agents, 5]，<x_pos, y_pos, B_candidate, x_target, y_target>
-        # 使用匈牙利算法为每个智能体分配最近的已发现目标点作为目标位置，已发现目标点可能小于智能体数量
-        # 如果没分配到，默认<x_pos, y_pos, 0, 0, 0>，否则<x_pos, y_pos, 1, x_target, y_target>
-        # 提取智能体当前位置, [num_agents, 2]
-        agents_pos = env_state[self.num_agents * 2:self.num_agents * 4].view(self.num_agents, 2) 
-
-        # 提取已发现目标点位置, [num_detected, 2]
-        detected_pos = detected_map.view(-1, 2)
-
-        # 计算智能体到已发现目标点的距离
-        cost_matrix = torch.cdist(agents_pos, detected_pos, p=2)  # [num_agents, num_detected]
-
-        # 使用匈牙利算法进行最优分配
-        cost_np = cost_matrix.cpu().numpy()
-        row_ind, col_ind = linear_sum_assignment(cost_np)
-
-        # 生成最终的向量流，首先用智能体当前位置初始化
-        vec_inp = torch.zeros((self.num_agents, 5), device=env_state.device)
-        vec_inp[:, :2] = agents_pos
-
-        # 对于被分配到目标的智能体，更新其备选点标记和目标位置
-        for agent_idx, target_idx in zip(row_ind, col_ind):
-            vec_inp[agent_idx, 2] = 1.0  # 备选点标记
-            vec_inp[agent_idx, 3:5] = detected_pos[target_idx]  # 目标位置
-
-        return vec_inp
 
     def data_processing_low_level(self, inp, goals):
         # inp: [num_agents*batch_size, dim_o]

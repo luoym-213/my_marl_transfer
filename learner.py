@@ -116,6 +116,9 @@ class Learner(object):
         self.envs_info = None
         self.high_level_interval = args.high_level_interval
 
+        self.top_k = args.top_k
+        self.rrt_max_iter = args.rrt_max_iter
+
     @property
     def all_policies(self):
         return [agent.actor_critic.state_dict() for agent in self.all_agents]
@@ -212,7 +215,7 @@ class Learner(object):
                 vec_inp_agents = agent_nodes[proc_indices]
                 
                 # ⭐ RRT生成探索节点
-                batch_explore_nodes = policy.get_explore_nodes(vec_inp_agents, map_inps, agent_indices)
+                batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])
                 
                 # ⭐ 获取landmark节点
@@ -271,7 +274,7 @@ class Learner(object):
 
             # ⭐ 准备rollout数据
             all_ego_nodes = ego_nodes.view(num_processes * num_agents, -1)
-            K = 5
+            K = self.top_k
             all_explore_nodes = torch.zeros(num_processes * num_agents, K, 4, device=self.device)
             if goal_done_mask.any():
                 # 将决策智能体的 explore nodes 填充到对应位置
@@ -588,7 +591,7 @@ class Learner(object):
                 vec_inp_agents = agent_nodes[proc_indices]  # [N, num_agents, 4]
 
                 # 4.2 通过RTT生成候选探索点
-                batch_explore_nodes = policy.get_explore_nodes(vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
+                batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])  # [B_pro*B_agents, K, 4]
                 # 4.3 ego nodes
                 batch_ego_nodes = ego_nodes[proc_indices, agent_indices]  # [N, 5]
@@ -746,7 +749,7 @@ class Learner(object):
                 vec_inp_agents = agent_nodes[proc_indices]  # [N, num_agents, 4]
 
                 # 2.2. 通过RTT生成候选探索点
-                batch_explore_nodes = policy.get_explore_nodes(vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
+                batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])  # [B_pro*B_agents, K, 4]
                 # 2.3. ego nodes
                 batch_ego_nodes = ego_nodes[proc_indices, agent_indices]  # [N, 5]

@@ -19,6 +19,14 @@ def get_args():
     parser.add_argument('--entity-mp', action='store_true', help='enable entity message passing')
     parser.add_argument('--identity-size', default=0, type=int, help='size of identity vector')
 
+    # RRT
+    #parser.add_argument('--num-rrt-nodes', type=int, default=50, help='number of RRT nodes to sample')
+    #parser.add_argument('--rrt-step-size', type=float, default=0.2, help='step size for RRT extension')
+    #parser.add_argument('--rrt-goal-sample-rate', type=float, default=0.2, help='goal sampling rate for RRT')
+    parser.add_argument('--rrt-max-iter', type=int, default=40, help='maximum number of iterations for RRT')
+    #parser.add_argument('--rrt-search-radius', type=float, default=0.5, help='search radius for RRT rewiring')
+    parser.add_argument('--top-k', type=int, default=5, help='top k paths to consider for action selection')
+
     # training 
     parser.add_argument('--seed', type=int, default=None, help='random seed (default: None)')
     parser.add_argument('--num-processes', type=int, default=32, help='how many training CPU processes to use (default: 32)')

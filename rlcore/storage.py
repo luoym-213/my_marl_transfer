@@ -7,7 +7,7 @@ def _flatten_helper(T, N, _tensor):
 
 
 class RolloutStorage(object):
-    def __init__(self, num_steps, num_processes, obs_shape, action_space, num_agent, recurrent_hidden_state_size):
+    def __init__(self, num_steps, num_processes, obs_shape, action_space, num_agent, recurrent_hidden_state_size, top_k=5):
         # 环境基础信息
         self.obs = torch.zeros(num_steps + 1, num_processes, *obs_shape)
         self.recurrent_hidden_states = torch.zeros(num_steps + 1, num_processes, recurrent_hidden_state_size)
@@ -36,7 +36,7 @@ class RolloutStorage(object):
         self.goal_dones = torch.zeros(num_steps + 1, num_processes, 1) # 当前是否是决策点，yes=1, no=0
         self.goal_dones[0].fill_(1.0) # 初始化第一步为1，因为需要执行高层策略来分配初始目标
         self.ego_nodes = torch.zeros(num_steps, num_processes, 5)  # Ego节点特征存储: [num_steps, num_processes, 5]
-        self.explore_nodes = torch.zeros(num_steps, num_processes, 5, 4)  # Explore节点特征存储: [num_steps, num_processes, K, 4]
+        self.explore_nodes = torch.zeros(num_steps, num_processes, top_k, 4)  # Explore节点特征存储: [num_steps, num_processes, K, 4]
 
         # ==================== Landmark 存储（张量形式）====================
         self.max_landmarks = num_agent

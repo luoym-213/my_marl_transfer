@@ -267,7 +267,7 @@ class RRT_GNN:
         
         except Exception as e:
             print(f"RRT规划出错: {e}")
-            # 返回智能体周围随机小范围5个节点作为探索节点
+            # 返回智能体周围随机小范围k个节点作为探索节点
             fallback_nodes = []
             for _ in range(self.top_k):
                 rand_x = min(max(self.start.x + random.randint(-5, 5), 0), self.map_size[0]-1)
