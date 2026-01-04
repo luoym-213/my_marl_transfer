@@ -211,7 +211,11 @@ class MultiAgentEnv(gym.Env):
         all_reward =  reward_n + common_penaltie
 
         done['all'] = done_n
-        done['agent'] = self.agents_done
+        # 如果done_n全为True，则表示episode结束，则设置done['agent']全为True
+        if np.all(done_n):
+            done['agent'] = [True] * self.n
+        else:
+            done['agent'] = self.agents_done
 
         return obs_n, all_reward, total_high_rewards, done, info_n, state
 

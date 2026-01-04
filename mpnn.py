@@ -819,6 +819,12 @@ class MPNN(nn.Module):
             valid_mask = batch_landmark_node_masks[:, :, 0] > 0.5  # [B, Max_L]
             not_targeted = batch_landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
             combined_mask = valid_mask & not_targeted              # [B, Max_L]
+
+            # 如果valid_mask某行全部有效，则说明已经找到全部landmark，则该样本不需要探索节点
+            all_landmarks_found = valid_mask.all(dim=1)  # [B] bool tensor
+            if all_landmarks_found.any():
+                unified_mask[all_landmarks_found, :K] = False
+
             
             unified_mask[:, K:K+max_L] = combined_mask
             unified_relative_pos[:, K:K+max_L, :] = batch_landmark_nodes[:, :, :2]
