@@ -664,6 +664,17 @@ class Learner(object):
         obs1 = []
         obs2 = []
         all_obs = []
+
+        graph_data = {
+            'ego_nodes': [],           # 自我节点位置 [num_agents, 2]
+            'explore_nodes': [],       # 探索节点 [num_agents, K, 2]
+            'landmark_nodes': [],      # landmark节点 [num_agents, L, 2]
+            'ego_to_explore_edges': [], # 自我到探索节点的边
+            'ego_to_landmark_edges': [], # 自我到landmark的边
+            'selected_goal_idx': [],   # 选中的目标索引
+            'selected_task': []        # 选中的任务类型
+        }
+
         for i in range(len(obs)):
             agent = self.env.world.policy_agents[i]
             if hasattr(agent, 'adversary') and agent.adversary:
@@ -751,6 +762,7 @@ class Learner(object):
                 # 2.2. 通过RTT生成候选探索点
                 batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])  # [B_pro*B_agents, K, 4]
+                print("batch_explore_nodes:", batch_explore_nodes)
                 # 2.3. ego nodes
                 batch_ego_nodes = ego_nodes[proc_indices, agent_indices]  # [N, 5]
                 # 2.4. landmark nodes
@@ -773,11 +785,11 @@ class Learner(object):
                 batch_goals = policy.get_high_level_goal(
                     batch_ego_nodes, # Tensor shape [N, 5]
                     batch_explore_nodes, # Tensor shape [N, K, 4]
-                    batch_ego_to_explore_edges, # List of Tensor shape [K, 3], length N
-                    batch_landmark_nodes, # List of Tensor shape [L_i, 4], length N
-                    batch_landmark_node_masks, # List of Tensor shape [L_i, 1], length N
-                    batch_ego_to_landmark_edges, # List of  Tensor shape [L_i, 3], length N
-                    batch_ego_to_landmark_edge_masks, # List of Tensor shape [L_i, 1], length N
+                    batch_ego_to_explore_edges, # Tensor [N, K, 3]
+                    batch_landmark_nodes, # Tensor: [N, Max_L, 4]
+                    batch_landmark_node_masks, # Tensor: [N, Max_L, 1]
+                    batch_ego_to_landmark_edges, # Tensor [N, Max_L, 3]
+                    batch_ego_to_landmark_edge_masks, # Tensor [N, Max_L, 1]
                     deterministic  = deterministic
                     )  # 需要实现batch版本
                 
@@ -814,6 +826,46 @@ class Learner(object):
                                 # new_detected[lin_idx, min_idx, 3] = 1.0  # 设置 is_targeted = 1
                                 # 所有agent的障碍物is_targeted同步更新
                                 new_detected[:, min_idx, 3] = 1.0
+                    
+                    # 自我节点（世界坐标）
+                    ego_pos = batch_ego_nodes[i, :2].cpu().numpy()
+                    graph_data['ego_nodes'].append(ego_pos)
+                    print("ego_pos:", ego_pos)
+                    
+                    # 探索节点（转换为世界坐标）
+                    explore_nodes_local = batch_explore_nodes[i].cpu().numpy()  # [K, 4], 最后2维是相对坐标
+                    explore_nodes_world = explore_nodes_local[:, :2] + ego_pos  # 转换为世界坐标
+                    print("explore_nodes_world:", explore_nodes_world)
+                    graph_data['explore_nodes'].append(explore_nodes_world)
+                    
+                    # Landmark节点（已经是世界坐标）
+                    landmark_nodes_local = batch_landmark_nodes[i][:, :2].cpu().numpy()  # [L, 2]
+                    landmark_nodes_world = landmark_nodes_local + ego_pos  # 转换为世界坐标
+                    print("landmark_nodes_world:", landmark_nodes_world)
+                    graph_data['landmark_nodes'].append(landmark_nodes_world)
+                    
+                    # 边的信息（距离、角度等）
+                    graph_data['ego_to_explore_edges'].append(
+                        batch_ego_to_explore_edges[i].cpu().numpy()
+                    )
+                    graph_data['ego_to_landmark_edges'].append(
+                        batch_ego_to_landmark_edges[i].cpu().numpy()
+                    )
+                    # 选中的目标和任务
+                    selected_task = batch_goals["action_modes"][i, 0].item()
+                    graph_data['selected_task'].append(selected_task)
+                    
+                    # 根据任务类型确定选中的节点索引
+                    if selected_task == 0:  # 探索节点
+                        selected_waypoint = batch_goals["waypoints"][i].cpu().numpy()
+                        distances = np.linalg.norm(explore_nodes_world - selected_waypoint, axis=1)
+                        selected_idx = int(np.argmin(distances))
+                    else:  # landmark节点
+                        selected_waypoint = batch_goals["waypoints"][i].cpu().numpy()
+                        distances = np.linalg.norm(landmark_nodes_world - selected_waypoint, axis=1)
+                        selected_idx = int(np.argmin(distances))
+                    
+                    graph_data['selected_goal_idx'].append(selected_idx)
                 
                 # 更新所有智能体的 landmark_data 和 landmark_mask
                 landmark_data = new_detected
@@ -823,7 +875,7 @@ class Learner(object):
                 _,action,_ = policy.low_level_act(obs_tensor, all_goals, deterministic=True)
                 actions.append(action.squeeze(1).cpu().numpy())
 
-        return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask
+        return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask, graph_data
 
     def eval_reward_choose(self, all_rewards, task):
         n,dim = task.shape

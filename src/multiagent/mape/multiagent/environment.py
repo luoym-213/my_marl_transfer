@@ -410,7 +410,7 @@ class MultiAgentEnv(gym.Env):
         self.render_geoms_xform = None
 
     # render environment
-    def render(self, mode='human', attn=None, goals=None, show_voronoi=False, info=None, show_uncertainty=True, tasks=None):
+    def render(self, mode='human', attn=None, goals=None, show_voronoi=False, info=None, show_uncertainty=True, tasks=None, graph_data=None):
         # attn: matrix of size (num_agents, num_agents)
         # goals: array of shape (num_agents, 2) - goal positions for each agent
         # show_voronoi: bool - whether to show voronoi centroids
@@ -668,14 +668,99 @@ class MultiAgentEnv(gym.Env):
                     cam_range = cam_range * 1.0
                 pos = self.agents[i].state.p_pos
                 self.viewers[i].set_bounds(pos[0]-cam_range,pos[0]+cam_range,pos[1]-cam_range,pos[1]+cam_range)
+
+            if graph_data is not None and len(graph_data['ego_nodes']) > 0:
+                self._render_graph_structure(self.viewers[i], graph_data)
+                
             # render to display or array
             results.append(self.viewers[i].render(return_rgb_array = mode=='rgb_array'))
+
+
         
         # 🔧 清理临时几何体
         if temp_geoms_start_idx < len(self.render_geoms):
             self.render_geoms = self.render_geoms[:temp_geoms_start_idx]
 
         return results
+    
+    def _render_graph_structure(self, viewer, graph_data):
+        """渲染图结构：节点和边"""
+        from multiagent import rendering
+        
+        # 定义颜色
+        EXPLORE_NODE_COLOR = (0.3, 0.7, 1.0)  # 浅蓝色 - 探索节点
+        LANDMARK_NODE_COLOR = (1.0, 0.5, 0.0)  # 橙色 - landmark节点
+        EDGE_COLOR = (0.5, 0.5, 0.5, 0.3)  # 半透明灰色 - 边
+        SELECTED_EDGE_COLOR = (0.0, 1.0, 0.0, 0.8)  # 绿色 - 选中的边
+        
+        node_size = 0.03  # 节点大小
+        
+        for i in range(len(graph_data['ego_nodes'])):
+            ego_pos = graph_data['ego_nodes'][i]
+            explore_nodes = graph_data['explore_nodes'][i]
+            landmark_nodes = graph_data['landmark_nodes'][i]
+            selected_idx = graph_data['selected_goal_idx'][i]
+            selected_task = graph_data['selected_task'][i]
+
+            # 1. 渲染探索节点
+            for idx, node_pos in enumerate(explore_nodes):
+                # 绘制边
+                is_selected = (selected_task == 0 and idx == selected_idx)
+                edge_color = SELECTED_EDGE_COLOR if is_selected else EDGE_COLOR
+                
+                line = rendering.Line(
+                    (ego_pos[0], ego_pos[1]),
+                    (node_pos[0], node_pos[1]),
+                    linewidth=3 if is_selected else 1
+                )
+                line.set_color(*edge_color[:3], alpha=edge_color[3])
+                viewer.add_onetime(line)
+                
+                # 绘制节点
+                circle = rendering.make_circle(node_size)
+                xform = rendering.Transform()
+                circle.add_attr(xform)
+                xform.set_translation(node_pos[0], node_pos[1])
+                
+                if is_selected:
+                    circle.set_color(0.0, 1.0, 0.0)  # 选中的节点为绿色
+                else:
+                    circle.set_color(*EXPLORE_NODE_COLOR)
+                
+                viewer.add_onetime(circle)
+            
+            # 2. 渲染landmark节点
+            for idx, node_pos in enumerate(landmark_nodes):
+                # 绘制边
+                is_selected = (selected_task == 1 and idx == selected_idx)
+                edge_color = SELECTED_EDGE_COLOR if is_selected else EDGE_COLOR
+                
+                line = rendering.Line(
+                    (ego_pos[0], ego_pos[1]),
+                    (node_pos[0], node_pos[1]),
+                    linewidth=3 if is_selected else 1
+                )
+                line.set_color(*edge_color[:3], alpha=edge_color[3])
+                viewer.add_onetime(line)
+                
+                # 绘制节点（正方形表示landmark）
+                square_size = node_size * 1.2
+                square = rendering.make_polygon([
+                    (-square_size, -square_size),
+                    (square_size, -square_size),
+                    (square_size, square_size),
+                    (-square_size, square_size)
+                ])
+                xform = rendering.Transform()
+                square.add_attr(xform)
+                xform.set_translation(node_pos[0], node_pos[1])
+                
+                if is_selected:
+                    square.set_color(0.0, 1.0, 0.0)  # 选中的节点为绿色
+                else:
+                    square.set_color(*LANDMARK_NODE_COLOR)
+                
+                viewer.add_onetime(square)
 
     def _add_lines(self, attn):
         k = self.render_count

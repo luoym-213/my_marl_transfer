@@ -239,13 +239,13 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         while not np.all(done):
             actions = []
             with torch.no_grad():
-                # print("step:", info['world_steps'])
-                actions, goals, tasks, landmark_data, landmark_mask = master.eval_act(obs, env_states, 
+                print("step:", info['world_steps'])
+                actions, goals, tasks, landmark_data, landmark_mask, graph_data = master.eval_act(obs, env_states, 
                                                                                       goals, tasks, 
                                                                                       landmark_data, 
                                                                                       landmark_mask)
             episode_steps += 1
-            step_data = {'agents_actions': actions, 'agents_goals': goals, 'agents_tasks': tasks} 
+            step_data = {'agents_actions': actions, 'agents_goals': goals, 'agents_tasks': tasks, 'graph_data': graph_data} 
             if isinstance(step_data['agents_goals'], torch.Tensor):
                 step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
             if isinstance(step_data['agents_tasks'], torch.Tensor):
@@ -272,7 +272,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                     show_voronoi=True,
                     show_uncertainty=True,  # 👈 启用不确定性显示
                     tasks=step_data['agents_tasks'],
-                    info=info
+                    info=info,
+                    graph_data=step_data.get('graph_data')  # 传递图数据
                 )
                 if render_result:
                     frames.append(render_result[0])
