@@ -86,17 +86,17 @@ class Scenario(BaseScenario):
         return default_obs
 
     def done(self, agent, world):
-         # 计算所有智能体到所有landmark的距离
-        dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in world.landmarks]for a in world.agents])
-        # 匈牙利算法分配
-        self.min_dists = self._bipartite_min_dists(dists)
-        # 判断是否成功
-        self.is_success = np.all(self.min_dists < world.dist_thres)
+        #  # 计算所有智能体到所有landmark的距离
+        # dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in world.landmarks]for a in world.agents])
+        # # 匈牙利算法分配
+        # self.min_dists = self._bipartite_min_dists(dists)
+        # # 判断是否成功
+        # self.is_success = np.all(self.min_dists < world.dist_thres)
 
         condition1 = world.steps >= world.max_steps_episode
-        self.is_success = np.all(self.min_dists < world.dist_thres)
-        world.min_dists = self.min_dists
-        return condition1 or self.is_success
+        # self.is_success = np.all(self.min_dists < world.dist_thres)
+        # world.min_dists = self.min_dists
+        return condition1
     
     def _bipartite_min_dists(self, dists):
         ri, ci = linear_sum_assignment(dists)
