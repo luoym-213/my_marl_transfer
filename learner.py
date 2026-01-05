@@ -165,6 +165,10 @@ class Learner(object):
             num_processes = len(self.envs_info)
             num_agents = len(team)
 
+            # 从all_masks中提取env_done信息，全0表示当前process的episode结束
+            episode_dones = all_masks.view(num_agents, num_processes).transpose(0, 1)
+            env_dones = (episode_dones.sum(dim=1) == 0)  # [num_processes]，True表示该process的episode结束
+
             # ⭐ 构建Critic输入
             entropy_maps = torch.stack([torch.from_numpy(np.array(info['entropy_map'])).float() 
                                         for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
@@ -186,8 +190,8 @@ class Learner(object):
 
             # ⭐ 生成landmark节点
             detected_maps = [torch.from_numpy(np.array(info['map'][1])).float().to(self.device) 
-                            for info in self.envs_info]
-            new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, all_landmark_masks, detected_maps, self.device)
+                            for info in self.envs_info] # num_processes list of Tensor [num_detected, 2]
+            new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, all_landmark_masks, detected_maps, self.device, env_dones)
 
             # ⭐ 准备智能体节点数据
             agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)
@@ -357,7 +361,7 @@ class Learner(object):
         # === 拼接 === [num_agents, 8]
         return np.concatenate([low_arr, high_arr], axis=1)
     
-    def update_landmark_info(self,prev_landmark_data, prev_landmark_mask, detected_map_list, device, match_threshold=0.1, cleanup_threshold=0.06):
+    def update_landmark_info(self,prev_landmark_data, prev_landmark_mask, detected_map_list, device, env_dones = None, match_threshold=0.1, cleanup_threshold=0.06):
         """
         更新地标信息，结合之前的地标数据和当前检测到的地图信息。
         ⭐ 新增：自动清理与当前detected_map不一致的旧landmark
@@ -372,6 +376,7 @@ class Learner(object):
         - device: 设备（CPU 或 GPU）
         - match_threshold: landmark 匹配的距离阈值
         - cleanup_threshold: 清理旧landmark的距离阈值（如果landmark与所有detected点的距离都超过此值，则移除）
+        - env_dones: Tensor shape [num_processes]，表示哪些process的episode结束
         
         返回:
         - updated_landmark_data: 更新后的地标数据，形状同 prev_landmark_data[num_agents * num_processes, max_landmarks, 4]
@@ -385,6 +390,24 @@ class Learner(object):
         num_agents_processes, max_landmarks, _ = prev_landmark_data.shape
         num_processes = len(detected_map_list)
         num_agents = num_agents_processes // num_processes
+
+        # 3. 处理 episode 结束的 process，清空其 landmark 数据
+        if env_dones is not None and env_dones.any():
+            # 使用广播机制一次性处理所有完成的 episodes
+            # env_dones: [num_processes]，True 表示该 process 的 episode 结束
+            
+            # 生成需要清空的索引：对于 done 的 process，所有 agent 都需要清空
+            # 使用 meshgrid 创建索引
+            proc_indices = torch.arange(num_processes, device=self.device)[env_dones]
+            agent_indices = torch.arange(num_agents, device=self.device)
+            
+            # 生成笛卡尔积索引 [num_done_procs * num_agents]
+            proc_mesh, agent_mesh = torch.meshgrid(proc_indices, agent_indices, indexing='ij')
+            linear_indices = agent_mesh.flatten() * num_processes + proc_mesh.flatten()
+            
+            # 一次性清空所有需要重置的 landmark 数据
+            updated_landmark_mask[linear_indices, :, 0] = 0.0
+            updated_landmark_data[linear_indices, :, :] = 0.0
         
         
         # 4. 遍历每个 process，更新对应的 landmark 数据
@@ -404,7 +427,7 @@ class Learner(object):
             # 如果detected_map为空（例如环境reset后），清空所有landmark
             if num_detected == 0:
                 updated_landmark_mask[linear_idx, :, 0] = 0.0
-                updated_landmark_data[linear_idx, :, 3] = 0.0  # is_targeted也清0
+                updated_landmark_data[linear_idx, :, :] = 0.0  # is_targeted也清0
                 continue
             
             # 标记哪些旧landmark需要保留（即与detected_map中某个点距离<cleanup_threshold）
@@ -514,6 +537,7 @@ class Learner(object):
         # 因此需要计算128步的goals，也只需要新goals
         for team, policy in zip(self.teams_list,self.policies_list):
             last_obs = torch.cat([agent.rollouts.obs[-1] for agent in team])
+            last_masks = torch.cat([agent.rollouts.masks[-1] for agent in team])
             last_env_state = torch.cat([agent.rollouts.env_states[-1] for agent in team])
 
             # 默认采取之前的目标分配，[num_agents * num_processes, 2]
@@ -528,6 +552,10 @@ class Learner(object):
             ## 批量处理所有环境
             num_processes = len(self.envs_info)
             num_agents = len(team)
+
+            # 从all_masks中提取env_done信息，全0表示当前process的episode结束
+            episode_dones = last_masks.view(num_agents, num_processes).transpose(0, 1)
+            env_dones = (episode_dones.sum(dim=1) == 0)  # [num_processes]，True表示该process的episode结束
 
             # 1. 批量构建 critic map input 和 critic vec input
             entropy_maps = torch.stack([torch.from_numpy(np.array(info['entropy_map'])).float() 
@@ -555,7 +583,7 @@ class Learner(object):
             detected_maps = [torch.from_numpy(np.array(info['map'][1])).float().to(self.device) 
                             for info in self.envs_info] # [num_processes, x, 2], 不规则形状，每个 process 检测到的目标数量不同
             
-            new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, all_landmark_masks, detected_maps, self.device) 
+            new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, all_landmark_masks, detected_maps, self.device, env_dones) 
             # [num_agents * num_processes, max_landmarks, 4], [num_agents * num_processes, max_landmarks, 1]
 
             # 4. 批量通过RTT生成K个候选目标点
