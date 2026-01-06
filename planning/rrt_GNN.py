@@ -325,11 +325,25 @@ def main():
     
     # 随机生成3个智能体的位置
     n_agents = 3
-    agent_positions = [
-        (25, 30),  # 智能体1
-        (70, 50),  # 智能体2
-        (45, 75),  # 智能体3
-    ]
+    agent_positions = []
+    min_distance = 20  # 智能体之间的最小距离
+
+    for i in range(n_agents):
+        attempts = 0
+        while attempts < 100:  # 最多尝试100次
+            x = np.random.randint(10, 90)  # 避免边界
+            y = np.random.randint(10, 90)
+            
+            # 检查与已有智能体的距离
+            if all(np.hypot(x - pos[0], y - pos[1]) >= min_distance for pos in agent_positions):
+                agent_positions.append((x, y))
+                break
+            attempts += 1
+        
+        # 如果尝试失败，使用随机位置
+        if len(agent_positions) <= i:
+            agent_positions.append((np.random.randint(10, 90), np.random.randint(10, 90)))
+
     agent_colors = ['green', 'blue', 'purple']  # 每个智能体的颜色
     
     print(f"\n智能体位置:")
@@ -343,15 +357,19 @@ def main():
     for i, mask in enumerate(voronoi_masks):
         print(f"  智能体{i+1}的Voronoi区域大小: {np.sum(mask)} 个栅格")
     
-    # 创建熵值分布（多个高斯峰）
+    # 创建熵值分布（随机生成多个高斯峰）
     x_grid, y_grid = np.meshgrid(np.arange(100), np.arange(100), indexing='ij')
     entropy_map = np.zeros((100, 100))
-    
-    # 添加多个高熵值区域
-    peaks = [(30, 40, 0.9), (60, 50, 0.95), (45, 65, 0.85), 
-             (20, 20, 0.88), (75, 75, 0.92), (80, 30, 0.87)]
-    for px, py, peak_val in peaks:
-        gaussian = np.exp(-((x_grid - px)**2 + (y_grid - py)**2) / (2 * 10**2))
+
+    # 随机生成高熵值区域
+    n_peaks = np.random.randint(4, 8)  # 随机生成4-7个峰值
+    for _ in range(n_peaks):
+        px = np.random.randint(10, 90)  # 随机x坐标，避免边界
+        py = np.random.randint(10, 90)  # 随机y坐标，避免边界
+        peak_val = np.random.uniform(0.8, 1.0)  # 随机峰值强度
+        sigma = np.random.uniform(8, 12)  # 随机高斯宽度
+        
+        gaussian = np.exp(-((x_grid - px)**2 + (y_grid - py)**2) / (2 * sigma**2))
         entropy_map += peak_val * gaussian
     
     # 添加一些噪声
@@ -409,7 +427,7 @@ def main():
         
         # 使用contour在边界处绘制线条
         contour = ax.contour(voronoi_mask.T, levels=[0.5], colors=color, 
-                           linewidths=2.5, origin='lower', alpha=0.8)
+                           linewidths=2.5, origin='lower', alpha=0.5)
         
         # 添加区域标签
         # 找到区域中心
@@ -438,7 +456,7 @@ def main():
         for node in rrt.node_list:
             if node.parent is not None:
                 ax.plot([node.x, node.parent.x], [node.y, node.parent.y], 
-                       color=color, alpha=0.15, linewidth=0.5, zorder=1)
+                       color=color, alpha=0.7, linewidth=0.5, zorder=1)
         
         # 标记Top-K候选点
         for j, node_info in enumerate(top_k_nodes):
@@ -454,10 +472,10 @@ def main():
             else:
                 ax.plot(pos[0], pos[1], 'o', color=color, markersize=8, 
                        markeredgecolor='white', markeredgewidth=1, zorder=8)
-                ax.text(pos[0]+2, pos[1]+2, f'#{j+1}', 
-                       color='white', fontsize=7,
-                       bbox=dict(boxstyle='round', facecolor=color, alpha=0.7),
-                       zorder=9)
+                # ax.text(pos[0]+2, pos[1]+2, f'#{j+1}', 
+                #        color='white', fontsize=3,
+                #        bbox=dict(boxstyle='round', facecolor=color, alpha=0.4),
+                #        zorder=9)
     
     # 添加图例
     from matplotlib.lines import Line2D
