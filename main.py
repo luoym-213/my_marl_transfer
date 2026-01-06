@@ -110,10 +110,10 @@ def train(args, return_early=False):
             seconds = (end-start).total_seconds()
             mean_low_reward = final_rewards.mean(dim=0).cpu().numpy()
             mean_high_reward = final_high_rewards.mean(dim=0).cpu().numpy()
-            mean_get_goal_num = get_goal_num*1./args.log_interval
+            mean_get_goal_num = get_goal_num*1./args.log_interval/args.num_processes/args.num_agents
             get_goal_num = 0
             print("Updates {} | Num timesteps {} | Time {} | FPS {} \
-                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} lowPolicy loss {:.4f} Mean low get goal {:.4f}\
+                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} lowPolicy loss {:.4f} Mean low get goal {:.4f}(single agent in 128steps)\
                   \nMean high reward {} Decision Entropy {:.4f} Waypoint Entropy {:.4f} high Value loss {:.4f} high Decision loss {:.4f} high Waypoint loss {:.4f}\n "
             .format(j, total_num_steps, str(end-start), int(total_num_steps / seconds), 
                   mean_low_reward, dist_low_entropy[0], value_low_loss[0], action_low_loss[0],mean_get_goal_num,
