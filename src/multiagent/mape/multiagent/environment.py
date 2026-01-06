@@ -254,8 +254,8 @@ class MultiAgentEnv(gym.Env):
         penalties = np.zeros(num_agents)
         
         # 超参数
-        SAFE_DISTANCE = 0.15  # 安全距离
-        COLLISION_COEF = -20.0  # 碰撞惩罚系数
+        SAFE_DISTANCE = 0.13  # 安全距离
+        COLLISION_COEF = -10.0  # 碰撞惩罚系数
         BOUNDARY_PENALTY = -2.0  # 边界惩罚
         
         # 获取所有智能体的位置
@@ -275,7 +275,7 @@ class MultiAgentEnv(gym.Env):
         
         # 2. 计算边界惩罚
         # 边界范围是 [-world_size/2, world_size/2]
-        boundary = self.world_size / 2.0  # 默认是 2.0/2.0 = 1.0
+        boundary = self.world_size / 2.0 + 0.1  # 默认是 2.0/2.0 + 0.1 = 1.1
         
         for i in range(num_agents):
             x, y = agent_positions[i]
