@@ -190,7 +190,7 @@ class GlobalBeliefMap:
         """返回熵地图的副本"""
         return self.compute_shannon_entropy()
     
-    def compute_voronoi_regions(self, agent_positions):
+    def compute_voronoi_regions(self, agent_positions, agent_dones=None):
         """
         基于智能体位置计算Voronoi区域划分（向量化优化版本）
         """
@@ -221,9 +221,13 @@ class GlobalBeliefMap:
         
         # 🚀 向量化优化：为每个智能体计算到所有栅格的距离
         voronoi_map = np.zeros((self.map_dim, self.map_dim), dtype=np.int32)
+        voronoi_map = np.full((self.map_dim, self.map_dim), -1, dtype=np.int32)
         min_dist_map = np.full((self.map_dim, self.map_dim), np.inf)
         
         for agent_idx, (ai, aj) in enumerate(agent_grids):
+            if agent_dones is not None and agent_dones[agent_idx]:
+               continue
+
             # 向量化距离计算
             dist_map = np.sqrt((grid_i - ai)**2 + (grid_j - aj)**2)
             
@@ -234,43 +238,129 @@ class GlobalBeliefMap:
         
         return voronoi_map
     
-    def compute_entropy_weighted_centroids(self, agent_positions):
+    def get_voronoi_edges(self, agent_positions, agent_dones=None):
         """
-        计算每个智能体Voronoi区域的香农熵加权质心（向量化优化版本）
+        获取Voronoi图的边界线段，用于可视化
+        
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            agent_dones: 智能体完成状态列表 [bool, bool, ...] (可选)
+        
+        返回:
+            edges: 边界线段列表 [((x1, y1), (x2, y2)), ...]
+        """
+        if len(agent_positions) < 2:
+            return []
+        
+        from scipy.spatial import Voronoi
+        
+        agent_positions = np.array(agent_positions)
+        
+        # 过滤掉已完成的智能体
+        if agent_dones is not None:
+            agent_dones = np.array(agent_dones)
+            active_mask = ~agent_dones  # 未完成的智能体
+            active_positions = agent_positions[active_mask]
+            
+            # 如果活跃智能体少于2个，无法形成Voronoi图
+            if len(active_positions) < 2:
+                return []
+        else:
+            active_positions = agent_positions
+        
+        boundary = self.world_size / 2.0
+        
+        # 添加镜像点以获得有限的Voronoi单元
+        mirror_points = []
+        
+        # 添加四个角的镜像点
+        corners = [
+            [-boundary*3, -boundary*3],
+            [-boundary*3, boundary*3],
+            [boundary*3, -boundary*3],
+            [boundary*3, boundary*3]
+        ]
+        mirror_points.extend(corners)
+        
+        # 添加边界上的镜像点（只为活跃智能体添加）
+        for pos in active_positions:
+            mirror_points.extend([
+                [pos[0], boundary*3],      # 上
+                [pos[0], -boundary*3],     # 下
+                [boundary*3, pos[1]],      # 右
+                [-boundary*3, pos[1]]      # 左
+            ])
+        
+        # 合并活跃智能体和镜像点
+        all_points = np.vstack([active_positions, mirror_points])
+        
+        try:
+            # 计算Voronoi图
+            vor = Voronoi(all_points)
+            
+            edges = []
+            
+            # 提取Voronoi边界线段
+            for ridge_points, ridge_vertices in zip(vor.ridge_points, vor.ridge_vertices):
+                # 只处理有限的边（不包含无穷远点）
+                if -1 not in ridge_vertices:
+                    # 检查是否至少有一个点是原始活跃智能体
+                    if ridge_points[0] < len(active_positions) or ridge_points[1] < len(active_positions):
+                        v0 = vor.vertices[ridge_vertices[0]]
+                        v1 = vor.vertices[ridge_vertices[1]]
+                        
+                        # 裁剪到世界边界内
+                        v0_clipped = np.clip(v0, -boundary, boundary)
+                        v1_clipped = np.clip(v1, -boundary, boundary)
+                        
+                        # 检查线段是否在边界内
+                        if (abs(v0_clipped[0]) <= boundary and abs(v0_clipped[1]) <= boundary and
+                            abs(v1_clipped[0]) <= boundary and abs(v1_clipped[1]) <= boundary):
+                            
+                            edges.append((
+                                (float(v0_clipped[0]), float(v0_clipped[1])),
+                                (float(v1_clipped[0]), float(v1_clipped[1]))
+                            ))
+        
+            return edges
+            
+        except Exception as e:
+            # 如果Voronoi计算失败，返回空列表
+            return []
+    
+    def get_voronoi_region_masks(self, agent_positions, agents_dones=None):
+        """
+        为每个智能体生成其 Voronoi 区域的二值掩码
+    
+        参数:
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            agent_dones: 智能体完成状态列表 [bool, bool, ...] (可选)
+    
+        返回:
+            masks: 列表，每个元素是一个 (map_dim, map_dim) 的布尔数组
+                   masks[i] 表示第 i 个智能体的 Voronoi 区域掩码
+                   区域内的栅格为 True，其他为 False
         """
         if len(agent_positions) == 0:
             return []
-        
-        voronoi_map = self.compute_voronoi_regions(agent_positions)
-        entropy_map = self.compute_shannon_entropy()
-        
-        centroids = []
-        
-        for agent_idx in range(len(agent_positions)):
-            region_mask = (voronoi_map == agent_idx)
-            
-            # 🚀 向量化优化：直接使用预计算的世界坐标数组
-            region_world_x = self.cell_world_x[region_mask]
-            region_world_y = self.cell_world_y[region_mask]
-            region_entropies = entropy_map[region_mask]
-            
-            if len(region_entropies) == 0:
-                centroids.append(agent_positions[agent_idx])
-                continue
-            
-            total_entropy = np.sum(region_entropies)
-            
-            if total_entropy < self.epsilon:
-                centroids.append(agent_positions[agent_idx])
-                continue
-            
-            # 🚀 向量化优化：一次性计算加权质心
-            centroid_x = np.sum(region_world_x * region_entropies) / total_entropy
-            centroid_y = np.sum(region_world_y * region_entropies) / total_entropy
-            
-            centroids.append((float(centroid_x), float(centroid_y)))
     
-        return centroids
+        # 计算 Voronoi 区域划分
+        voronoi_map = self.compute_voronoi_regions(agent_positions, agents_dones)
+    
+        if voronoi_map is None:
+            return []
+    
+        # 为每个智能体生成独立的掩码
+        masks = []
+        for agent_idx in range(len(agent_positions)):
+            # 如果智能体已完成,返回空掩码
+            if agents_dones is not None and agents_dones[agent_idx]:
+                masks.append(np.zeros((self.map_dim, self.map_dim), dtype=bool))
+            else:
+                mask = (voronoi_map == agent_idx)
+                masks.append(mask)
+    
+        return masks
     
     def get_voronoi_region_stats(self, agent_positions):
         """获取每个智能体Voronoi区域的统计信息"""
@@ -385,257 +475,6 @@ class GlobalBeliefMap:
         }
         
         return summary
-    
-    def get_voronoi_edges(self, agent_positions):
-        """
-        获取Voronoi图的边界线段，用于可视化
-        
-        参数:
-            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
-        
-        返回:
-            edges: 边界线段列表 [((x1, y1), (x2, y2)), ...]
-        """
-        if len(agent_positions) < 2:
-            return []
-        
-        from scipy.spatial import Voronoi
-        
-        agent_positions = np.array(agent_positions)
-        boundary = self.world_size / 2.0
-        
-        # 添加镜像点以获得有限的Voronoi单元
-        mirror_points = []
-        
-        # 添加四个角的镜像点
-        corners = [
-            [-boundary*3, -boundary*3],
-            [-boundary*3, boundary*3],
-            [boundary*3, -boundary*3],
-            [boundary*3, boundary*3]
-        ]
-        mirror_points.extend(corners)
-        
-        # 添加边界上的镜像点
-        for pos in agent_positions:
-            mirror_points.extend([
-                [pos[0], boundary*3],      # 上
-                [pos[0], -boundary*3],     # 下
-                [boundary*3, pos[1]],      # 右
-                [-boundary*3, pos[1]]      # 左
-            ])
-        
-        # 合并原始点和镜像点
-        all_points = np.vstack([agent_positions, mirror_points])
-        
-        try:
-            # 计算Voronoi图
-            vor = Voronoi(all_points)
-            
-            edges = []
-            
-            # 提取Voronoi边界线段
-            for ridge_points, ridge_vertices in zip(vor.ridge_points, vor.ridge_vertices):
-                # 只处理有限的边（不包含无穷远点）
-                if -1 not in ridge_vertices:
-                    # 检查是否至少有一个点是原始智能体
-                    if ridge_points[0] < len(agent_positions) or ridge_points[1] < len(agent_positions):
-                        v0 = vor.vertices[ridge_vertices[0]]
-                        v1 = vor.vertices[ridge_vertices[1]]
-                        
-                        # 裁剪到世界边界内
-                        v0_clipped = np.clip(v0, -boundary, boundary)
-                        v1_clipped = np.clip(v1, -boundary, boundary)
-                        
-                        # 检查线段是否在边界内
-                        if (abs(v0_clipped[0]) <= boundary and abs(v0_clipped[1]) <= boundary and
-                            abs(v1_clipped[0]) <= boundary and abs(v1_clipped[1]) <= boundary):
-                            
-                            edges.append((
-                                (float(v0_clipped[0]), float(v0_clipped[1])),
-                                (float(v1_clipped[0]), float(v1_clipped[1]))
-                            ))
-            
-            return edges
-            
-        except Exception as e:
-            # 如果Voronoi计算失败，返回空列表
-            return []
-    
-    def get_voronoi_region_masks(self, agent_positions):
-        """
-        为每个智能体生成其 Voronoi 区域的二值掩码
-    
-        参数:
-            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
-    
-        返回:
-            masks: 列表，每个元素是一个 (map_dim, map_dim) 的布尔数组
-                   masks[i] 表示第 i 个智能体的 Voronoi 区域掩码
-                   区域内的栅格为 True，其他为 False
-        """
-        if len(agent_positions) == 0:
-            return []
-    
-        # 计算 Voronoi 区域划分
-        voronoi_map = self.compute_voronoi_regions(agent_positions)
-    
-        if voronoi_map is None:
-            return []
-    
-        # 为每个智能体生成独立的掩码
-        masks = []
-        for agent_idx in range(len(agent_positions)):
-            mask = (voronoi_map == agent_idx)
-            masks.append(mask)
-    
-        return masks
-
-    def get_voronoi_region_mask(self, agent_positions, agent_idx):
-        """
-        获取指定智能体的 Voronoi 区域掩码
-
-        参数:
-            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
-            agent_idx: 智能体索引
-
-        返回:
-            mask: (map_dim, map_dim) 的布尔数组,该智能体的 Voronoi 区域内为 True
-        """
-        if agent_idx < 0 or agent_idx >= len(agent_positions):
-            return np.zeros((self.map_dim, self.map_dim), dtype=bool)
-        
-        voronoi_map = self.compute_voronoi_regions(agent_positions)
-        
-        if voronoi_map is None:
-            return np.zeros((self.map_dim, self.map_dim), dtype=bool)
-        
-        return (voronoi_map == agent_idx)
-
-    def get_distance_field(self, agent_pos, normalize=True, max_distance=None):
-        """
-        为单个智能体生成相对距离场图
-    
-        参数:
-            agent_pos: 智能体位置 (x, y)
-            normalize: 是否归一化距离场 (True: 0-1范围, False: 实际距离)
-            max_distance: 最大距离值，用于归一化。如果为None，使用地图对角线长度
-    
-        返回:
-            distance_field: (map_dim, map_dim) 的浮点数组
-                           normalize=True时: 智能体位置为1，越远越接近0
-                           normalize=False时: 实际欧氏距离
-        """
-        x, y = agent_pos
-        
-        # 计算每个栅格中心到智能体的距离
-        dist_x = self.cell_world_x - x
-        dist_y = self.cell_world_y - y
-        distance_field = np.sqrt(dist_x**2 + dist_y**2)
-        
-        if normalize:
-            # 确定最大距离用于归一化
-            if max_distance is None:
-                # 使用地图对角线长度作为最大距离
-                max_distance = np.sqrt(2) * self.world_size
-            
-            # 归一化: 距离越近值越大 (智能体位置为1，最远处为0)
-            distance_field = 1.0 - np.clip(distance_field / max_distance, 0.0, 1.0)
-        
-        return distance_field
-
-    def get_distance_fields(self, agent_positions, normalize=True, max_distance=None):
-        """
-        为所有智能体生成相对距离场图
-    
-        参数:
-            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
-            normalize: 是否归一化距离场 (True: 0-1范围, False: 实际距离)
-            max_distance: 最大距离值，用于归一化。如果为None，使用地图对角线长度
-    
-        返回:
-            distance_fields: 列表，每个元素是一个 (map_dim, map_dim) 的浮点数组
-                            distance_fields[i] 表示第 i 个智能体的距离场
-                            normalize=True时: 智能体位置为1，越远越接近0
-                            normalize=False时: 实际欧氏距离
-        """
-        if len(agent_positions) == 0:
-            return []
-        
-        # 确定最大距离用于归一化
-        if normalize and max_distance is None:
-            max_distance = np.sqrt(2) * self.world_size
-        
-        distance_fields = []
-        
-        for agent_pos in agent_positions:
-            distance_field = self.get_distance_field(
-                agent_pos, 
-                normalize=normalize, 
-                max_distance=max_distance
-            )
-            distance_fields.append(distance_field)
-        
-        return distance_fields
-
-    def get_relative_distance_field(self, agent_positions, agent_idx, normalize=True, max_distance=None):
-        """
-        获取指定智能体的相对距离场图
-    
-        参数:
-            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
-            agent_idx: 智能体索引
-            normalize: 是否归一化距离场
-            max_distance: 最大距离值，用于归一化
-    
-        返回:
-            distance_field: (map_dim, map_dim) 的浮点数组
-        """
-        if agent_idx < 0 or agent_idx >= len(agent_positions):
-            return np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
-        
-        return self.get_distance_field(
-            agent_positions[agent_idx], 
-            normalize=normalize, 
-            max_distance=max_distance
-        )
-
-    def get_distance_field_in_voronoi_region(self, agent_positions, agent_idx, 
-                                         normalize=True, max_distance=None, 
-                                         outside_value=0.0):
-        """
-        获取智能体在其Voronoi区域内的相对距离场图
-        (区域外的值设为指定值)
-    
-        参数:
-            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
-            agent_idx: 智能体索引
-            normalize: 是否归一化距离场
-            max_distance: 最大距离值，用于归一化
-            outside_value: Voronoi区域外的栅格值
-    
-        返回:
-            distance_field: (map_dim, map_dim) 的浮点数组
-                           区域内为距离场值，区域外为 outside_value
-        """
-        if agent_idx < 0 or agent_idx >= len(agent_positions):
-            return np.zeros((self.map_dim, self.map_dim), dtype=np.float32)
-        
-        # 获取距离场
-        distance_field = self.get_distance_field(
-            agent_positions[agent_idx], 
-            normalize=normalize, 
-            max_distance=max_distance
-        )
-        
-        # 获取Voronoi区域掩码
-        voronoi_mask = self.get_voronoi_region_mask(agent_positions, agent_idx)
-        
-        # 区域外的值设为指定值
-        distance_field = distance_field.copy()
-        distance_field[~voronoi_mask] = outside_value
-        
-        return distance_field
     
     def get_agents_heatmap(self, agent_positions, radius, sigma=None, clip_outside=True):
         """

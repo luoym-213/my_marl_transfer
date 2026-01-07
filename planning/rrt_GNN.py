@@ -48,7 +48,10 @@ class RRT_GNN:
                  radius: int = 2,
                  expand_dis: int = 2,
                  max_iterations: int = 500,
-                 top_k: int = 10):
+                 top_k: int = 10,
+                 temperature: float = 1.0,
+                 uniform_ratio: float = 0.3,  # 新增：均匀采样的比例
+                 decay_radius: int = 3):  # 新增：采样后概率衰减半径
         """
         初始化RRT_GNN
 
@@ -61,6 +64,9 @@ class RRT_GNN:
             expand_dis: RRT扩展距离/生长步长（栅格单位）
             max_iterations: 最大迭代次数
             top_k: 返回价值最高的K个节点
+            temperature: softmax温度参数，越小越集中在高熵区域，越大越均匀，默认1.0
+            uniform_ratio: 均匀随机采样的比例（0-1），用于增加探索性
+            decay_radius: 采样后周围区域的概率衰减半径
         """
         self.start = self.Node(start[0], start[1])
         self.voronoi_mask = voronoi_mask
@@ -70,17 +76,23 @@ class RRT_GNN:
         self.expand_dis = expand_dis
         self.max_iterations = max_iterations
         self.top_k = top_k
+        self.temperature = temperature
+        self.decay_radius = decay_radius  # 新增
+        self.uniform_ratio = uniform_ratio
         
-        # 生成采样列表：Voronoi区域内高熵值区域的索引
-        self.sample_list = self._generate_sample_list()
+        # 生成采样列表和初始概率分布
+        self.sample_list, self.sample_probs = self._generate_sample_distribution()
         
+        # 新增：记录采样历史，用于动态调整概率
+        self.sample_counts = np.zeros(len(self.sample_list))  # 每个点被采样的次数
+    
         # 节点列表
         self.node_list = []
         
         # 地图尺寸
         self.map_size = entropy_map.shape
 
-        # 新增：预计算“半径内熵累计和”整图（O(H*W*r^2) 一次，后面查询 O(1)）
+        # 预计算"半径内熵累计和"整图
         self._disk_kernel = self._make_disk_kernel(self.radius)
         self.local_entropy_map = convolve(
             self.entropy_map.astype(np.float32),
@@ -101,47 +113,93 @@ class RRT_GNN:
         kernel = mask.astype(np.float32)
         return kernel
 
-    def _generate_sample_list(self) -> List[Tuple[int, int]]:
+    def _generate_sample_distribution(self) -> Tuple[List[Tuple[int, int]], np.ndarray]:
         """
-        生成采样列表：Voronoi区域内香农熵大于阈值的栅格索引 + Voronoi区域内随机100个索引
+        生成采样列表和对应的概率分布（基于熵值的softmax）
 
         返回:
-            sample_list: [(x1, y1), (x2, y2), ...] 索引列表
+            sample_list: [(x1, y1), (x2, y2), ...] Voronoi区域内的栅格索引列表
+            sample_probs: 对应的采样概率数组，和为1
         """
-        # 找到满足条件的索引：在Voronoi区域内且熵值大于阈值
-        high_entropy_mask = (self.voronoi_mask) & (self.entropy_map > self.entropy_threshold)
-        high_entropy_indices = np.argwhere(high_entropy_mask)
+        # 找到Voronoi区域内的所有栅格
+        voronoi_indices = np.argwhere(self.voronoi_mask)
+        
+        if len(voronoi_indices) == 0:
+            # 如果Voronoi区域为空，返回起点附近的点
+            print("⚠️ Voronoi区域为空，使用起点附近采样")
+            nearby_points = []
+            for dx in range(-5, 6):
+                for dy in range(-5, 6):
+                    x = np.clip(self.start.x + dx, 0, self.map_size[0] - 1)
+                    y = np.clip(self.start.y + dy, 0, self.map_size[1] - 1)
+                    nearby_points.append((int(x), int(y)))
+            sample_list = list(set(nearby_points))
+            sample_probs = np.ones(len(sample_list)) / len(sample_list)
+            return sample_list, sample_probs
         
         # 转换为列表 [(x, y), ...]
-        sample_list = [(int(idx[0]), int(idx[1])) for idx in high_entropy_indices]
+        sample_list = [(int(idx[0]), int(idx[1])) for idx in voronoi_indices]
         
-        # 额外在Voronoi区域内随机选择100个索引
-        voronoi_indices = np.argwhere(self.voronoi_mask)
-        if len(voronoi_indices) > 0:
-            # 随机选择最多100个索引（如果区域小于100，就全选）
-            n_random = min(100, len(voronoi_indices))
-            random_idx = np.random.choice(len(voronoi_indices), size=n_random, replace=False)
-            random_samples = [(int(voronoi_indices[i][0]), int(voronoi_indices[i][1])) 
-                            for i in random_idx]
+        # 获取每个栅格的熵值
+        entropy_values = np.array([self.entropy_map[x, y] for x, y in sample_list])
+        
+        # 过滤掉熵值过低的点（可选，保留一定的探索性）
+        # # 如果想完全基于熵值采样，可以注释掉这部分
+        # valid_mask = entropy_values > self.entropy_threshold
+        # if np.sum(valid_mask) > 0:
+        #     # 优先保留高熵值区域，但也保留一些低熵值区域作为探索
+        #     # 策略：高熵值区域全保留，低熵值区域随机保留10%
+        #     low_entropy_indices = np.where(~valid_mask)[0]
+        #     if len(low_entropy_indices) > 0:
+        #         n_keep = max(1, int(len(low_entropy_indices) * 0.1))
+        #         keep_indices = np.random.choice(low_entropy_indices, size=n_keep, replace=False)
+        #         valid_mask[keep_indices] = True
             
-            # 合并两部分（去重）
-            sample_list = list(set(sample_list + random_samples))
+        #     sample_list = [sample_list[i] for i in range(len(sample_list)) if valid_mask[i]]
+        #     entropy_values = entropy_values[valid_mask]
         
-        return sample_list
+        # 使用softmax计算采样概率
+        # p_i = exp(entropy_i / T) / Σ exp(entropy_j / T)
+        exp_values = np.exp(entropy_values / self.temperature)
+        sample_probs = exp_values / np.sum(exp_values)
+        
+        # 确保概率和为1（数值稳定性）
+        sample_probs = sample_probs / np.sum(sample_probs)
+        
+        return sample_list, sample_probs
 
-    def _calculate_local_entropy(self, x: int, y: int) -> float:
-        """O(1) 查询：直接查表，而不是每次遍历半径邻域。"""
-        return float(self.local_entropy_map[x, y])
+    def _update_sample_probs(self, sampled_point: Tuple[int, int]):
+        """
+        更新采样概率分布：降低已采样点附近区域的概率
+        
+        参数:
+            sampled_point: 刚采样的点 (x, y)
+        """
+        sx, sy = sampled_point
+        
+        # 找到采样点周围decay_radius内的所有候选点
+        for i, (x, y) in enumerate(self.sample_list):
+            dist = np.sqrt((x - sx)**2 + (y - sy)**2)
+            if dist <= self.decay_radius:
+                # 距离越近，衰减越多
+                decay_factor = 1.0 - (1.0 - dist / self.decay_radius) * 0.5  # 最多衰减50%
+                self.sample_probs[i] *= decay_factor
+    
+        # 重新归一化
+        if np.sum(self.sample_probs) > 0:
+            self.sample_probs /= np.sum(self.sample_probs)
+        else:
+            # 如果所有概率都衰减到0，重置为均匀分布
+            self.sample_probs = np.ones(len(self.sample_list)) / len(self.sample_list)
 
     def _get_random_node(self) -> 'RRT_GNN.Node':
         """
-        从sample_list中随机采样一个节点
+        基于熵值概率分布采样一个节点
 
         返回:
-            rnd_node: 随机采样的节点
+            rnd_node: 采样的节点
         """
         if len(self.sample_list) == 0:
-            # raise ValueError("sample_list为空，无法采样！请检查voronoi_mask和entropy_map")
             print("⚠️ sample_list empty, using random point near start")
             x = self.start.x + np.random.randint(-10, 10)
             y = self.start.y + np.random.randint(-10, 10)
@@ -152,11 +210,25 @@ class RRT_GNN:
             
             return self.Node(x, y)
         
-        # 从sample_list中随机选择一个位置
-        x, y = random.choice(self.sample_list)
+        # 以一定概率进行均匀采样
+        if np.random.random() < self.uniform_ratio:
+            # 均匀随机采样
+            idx = np.random.randint(0, len(self.sample_list))
+        else:
+            # 基于熵值概率采样
+            idx = np.random.choice(len(self.sample_list), p=self.sample_probs)
+
+        x, y = self.sample_list[idx]
         rnd_node = self.Node(x, y)
         
+        # 更新采样概率（降低该点周围的概率）
+        # self._update_sample_probs((x, y))
+        
         return rnd_node
+
+    def _calculate_local_entropy(self, x: int, y: int) -> float:
+        """O(1) 查询：直接查表，而不是每次遍历半径邻域。"""
+        return float(self.local_entropy_map[x, y])
 
     def _get_nearest_node_index(self, node_list: List['RRT_GNN.Node'], 
                                  rnd_node: 'RRT_GNN.Node') -> int:
