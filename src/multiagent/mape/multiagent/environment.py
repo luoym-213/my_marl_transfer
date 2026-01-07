@@ -169,7 +169,7 @@ class MultiAgentEnv(gym.Env):
             self.global_belief_map.update_beliefs(agents_pos, self.world.mask_obs_dist)
 
         # 获取step更新后的voronoi加权质心以及目标位置
-        centroids = self.global_belief_map.compute_entropy_weighted_centroids(agents_pos) if self.enable_exploration_reward else None
+        centroids = []
         target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
 
         # 添加world_steps到info_n中
@@ -181,8 +181,7 @@ class MultiAgentEnv(gym.Env):
         # 将高层策略需要的通道图、是否达到目标点分别加入
         info_n['belief_map'] = self.global_belief_map.belief_grid
         info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
-        info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos)
-        # info_n['distance_fields'] = self.global_belief_map.get_distance_fields(agents_pos, normalize=True)
+        info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos, self.agents_done)
         info_n['goal_done'] = self._get_goal_dones(self.agents)
         info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
@@ -249,7 +248,7 @@ class MultiAgentEnv(gym.Env):
         # 获取当前智能体的位置，[num_agents, 2]
         agent_positions = np.array([agent.state.p_pos for agent in self.agents])
         # 获取reset后的voronoi加权质心以及目标位置
-        centroids = self.global_belief_map.compute_entropy_weighted_centroids(agent_positions) if self.enable_exploration_reward else None
+        centroids = []
         target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
         reset_info['map'].append(centroids)
         reset_info['map'].append(target_positions)
@@ -259,7 +258,6 @@ class MultiAgentEnv(gym.Env):
         reset_info['belief_map'] = self.global_belief_map.belief_grid
         reset_info['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         reset_info['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agent_positions)
-        reset_info['distance_fields'] = self.global_belief_map.get_distance_fields(agent_positions, normalize=True)
         reset_info['heatmap'] = self.global_belief_map.get_agents_heatmap(agent_positions, 0.05)
         reset_info['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
         # reset下，goal_done全部为True
