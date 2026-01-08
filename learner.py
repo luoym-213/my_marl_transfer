@@ -226,7 +226,7 @@ class Learner(object):
                 batch_ego_nodes = ego_nodes[proc_indices, agent_indices]
                 linear_indices = agent_indices * num_processes + proc_indices
                 batch_landmark_nodes, batch_landmark_node_masks = policy.get_landmark_nodes(
-                    all_obs[:,2:4], new_detected, new_detected_masks, linear_indices
+                    all_obs[:,2:4], new_detected, new_detected_masks, linear_indices, all_masks
                 )
                 
                 # ⭐ 获取边特征

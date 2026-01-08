@@ -241,7 +241,7 @@ class JointPPO():
                 # 评估高层动作（全部数据都forward）
                 (high_values, new_higoal_log_probs, higoal_dist_entropy) = \
                     self.actor_critic.evaluate_high_actions(
-                        env_states_batch, obs_batch,
+                        env_states_batch, obs_batch, masks_batch,
                         critic_maps_batch, critic_nodes_batch,
                         goals_batch, tasks_batch,
                         ego_nodes_batch, explore_nodes_batch,
