@@ -68,7 +68,7 @@ class RRT_GNN:
             uniform_ratio: 均匀随机采样的比例（0-1），用于增加探索性
             decay_radius: 采样后周围区域的概率衰减半径
         """
-        self.start = self.Node(start[0], start[1])
+        self.start = self.Node(int(start[0]), int(start[1]))
         self.voronoi_mask = voronoi_mask
         self.entropy_map = entropy_map
         self.entropy_threshold = entropy_threshold
@@ -82,7 +82,7 @@ class RRT_GNN:
         
         # 地图尺寸
         self.map_size = entropy_map.shape
-        
+
         # 生成采样列表和初始概率分布
         self.sample_list, self.sample_probs = self._generate_sample_distribution()
         
