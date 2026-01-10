@@ -1,4 +1,3 @@
-from turtle import update
 import numpy as np
 import torch
 from rlcore.algo import IPPO, JointPPO

@@ -77,8 +77,11 @@ class RRT_GNN:
         self.max_iterations = max_iterations
         self.top_k = top_k
         self.temperature = temperature
-        self.decay_radius = decay_radius  # 新增
+        self.decay_radius = decay_radius
         self.uniform_ratio = uniform_ratio
+        
+        # 地图尺寸
+        self.map_size = entropy_map.shape
         
         # 生成采样列表和初始概率分布
         self.sample_list, self.sample_probs = self._generate_sample_distribution()
@@ -88,9 +91,6 @@ class RRT_GNN:
     
         # 节点列表
         self.node_list = []
-        
-        # 地图尺寸
-        self.map_size = entropy_map.shape
 
         # 预计算"半径内熵累计和"整图
         self._disk_kernel = self._make_disk_kernel(self.radius)
