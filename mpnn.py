@@ -135,6 +135,14 @@ class MPNN(nn.Module):
                 nn.Linear(32, 64),
                 nn.ReLU()
             ),
+
+            # teammate节点编码器 [5] -> [64]
+            'teammate_node_encoder': nn.Sequential(
+                nn.Linear(5, 32),
+                nn.ReLU(),
+                nn.Linear(32, 64),
+                nn.ReLU()
+            ),
             
             # Explore节点编码器 [4] -> [64]
             'explore_node_encoder': nn.Sequential(
@@ -531,6 +539,10 @@ class MPNN(nn.Module):
         return self.modules_dict['high_level']['ego_node_encoder']
     
     @property
+    def teammate_node_encoder(self):
+        return self.modules_dict['high_level']['teammate_node_encoder']
+    
+    @property
     def explore_node_encoder(self):
         return self.modules_dict['high_level']['explore_node_encoder']
     
@@ -716,9 +728,12 @@ class MPNN(nn.Module):
             untargeted_and_valid = (is_targeted < 0.5) & valid_landmark_mask  # [N, max_L]
             
             # 6. 更新效用值（广播 num_retired_agents [N] 到 [N, max_L]）
-            for i in range(batch_landmark_data_relative.size(0)):
-                mask_i = untargeted_and_valid[i]  # [max_L]
-                batch_landmark_data_relative[i, mask_i, 2] = float(num_retired_agents[i]+2)
+            vals = (num_retired_agents + 2).float().unsqueeze(1)  # [N, 1]
+            batch_landmark_data_relative[:, :, 2] = torch.where(
+                untargeted_and_valid,
+                vals,
+                batch_landmark_data_relative[:, :, 2]
+            )
         
         # ===== 效用值调整完成 =====
         
@@ -781,8 +796,103 @@ class MPNN(nn.Module):
         batch_ego_to_landmark_edge_masks = landmark_node_masks  # [B, Max_L, 1]
         
         return batch_ego_to_explore_edges, batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
+    
+    def landmark_team_gat(self, batch_ego_pos, batch_teammate_nodes, batch_teammate_masks,
+                           batch_landmark_nodes, batch_landmark_node_masks,
+                           landmark_node_feats):
+        """
+        使用队友节点对 landmark 节点进行 GAT 聚合
+        Args:
+            batch_ego_pos: [B, 2] ego 位置，用于计算相对位置
+            batch_teammate_nodes: [B, num_agents, 5] 队友节点特征,[x, y, vel_x, vel_y, dist_to_goal]
+            batch_teammate_masks: [B, num_agents, 1] 队友节点掩码
+            batch_landmark_nodes: [B, Max_L, 4] landmark 节点特征 (相对ego的位置)
+            batch_landmark_node_masks: [B, Max_L, 1] landmark 节点掩码
+            landmark_node_feats: [B, Max_L, 64] landmark 节点嵌入特征
+        Returns:
+            landmark_node_agg_feats: [B, Max_L, 64] 聚合后的 landmark 节点特征
+        """
+        B = batch_landmark_nodes.size(0)
+        max_L = batch_landmark_nodes.size(1)
+        num_agents = batch_teammate_nodes.size(1)
+
+        # 1. 计算landmark的绝对世界坐标
+        # batch_landmark_nodes[:, :, :2] 是相对于ego的位置 [B, Max_L, 2]
+        # batch_ego_pos [B, 2] -> [B, 1, 2]
+        landmark_abs_pos = batch_ego_pos.unsqueeze(1) + batch_landmark_nodes[:, :, :2]  # [B, Max_L, 2]
+        
+        # 2. 提取队友的绝对位置
+        teammate_abs_pos = batch_teammate_nodes[:, :, :2]  # [B, num_agents, 2]
+        
+        # 3. 计算队友相对于每个landmark的位置
+        # teammate_abs_pos [B, 1, num_agents, 2] - landmark_abs_pos [B, Max_L, 1, 2]
+        # => [B, Max_L, num_agents, 2]
+        teammate_relative_to_landmark = teammate_abs_pos.unsqueeze(1) - landmark_abs_pos.unsqueeze(2)  # [B, Max_L, num_agents, 2]
+        
+        # 4. 拼接其他特征（速度和距离目标）
+        # batch_teammate_nodes[:, :, 2:] [B, num_agents, 3] -> [B, 1, num_agents, 3]
+        teammate_other_feats = batch_teammate_nodes[:, :, 2:].unsqueeze(1).expand(B, max_L, num_agents, 3)  # [B, Max_L, num_agents, 3]
+        
+        # 5. 组合成完整的队友节点特征 [B, Max_L, num_agents, 5]
+        teammate_nodes_per_landmark = torch.cat([
+            teammate_relative_to_landmark,  # [B, Max_L, num_agents, 2]
+            teammate_other_feats            # [B, Max_L, num_agents, 3]
+        ], dim=-1)  # [B, Max_L, num_agents, 5]
+
+        # 6. 编码队友节点特征
+        teammate_node_feats = self.teammate_node_encoder(
+            teammate_nodes_per_landmark.contiguous().view(B * max_L * num_agents, -1)
+        ).view(B, max_L, num_agents, -1)  # [B, Max_L, num_agents, 64]
+
+        # 7. 通过多头注意力机制对landmark节点进行聚合
+        # landmark节点作为Query，队友节点作为Key和Value
+        
+        # 7.1 准备Query：landmark节点特征 [B, Max_L, 64] -> [B, Max_L, 1, 64]
+        landmark_query = landmark_node_feats.unsqueeze(2)  # [B, Max_L, 1, 64]
+        
+        # 7.2 准备Key和Value：队友节点特征 [B, Max_L, num_agents, 64]
+        teammate_key = teammate_node_feats  # [B, Max_L, num_agents, 64]
+        teammate_value = teammate_node_feats  # [B, Max_L, num_agents, 64]
+        
+        # 7.3 计算注意力分数
+        scale = math.sqrt(64)  # attn_dim = 64
+        attn_scores = torch.matmul(landmark_query, teammate_key.transpose(-2, -1)) / scale  # [B, Max_L, 1, num_agents]
+        
+        # 7.4 应用队友节点mask（将无效队友的注意力分数设为-inf）
+        # batch_teammate_masks: [B, num_agents, 1] -> [B, 1, 1, num_agents]
+        teammate_mask_expanded = batch_teammate_masks.transpose(1, 2).unsqueeze(1)  # [B, 1, 1, num_agents]
+        teammate_mask_expanded = teammate_mask_expanded.expand(B, max_L, 1, num_agents)  # [B, Max_L, 1, num_agents]
+        attn_scores = attn_scores.masked_fill(teammate_mask_expanded < 0.5, -1e9)
+        
+        # 7.5 应用landmark节点mask（无效的landmark不计算注意力）
+        # batch_landmark_node_masks: [B, Max_L, 1] -> [B, Max_L, 1, 1]
+        landmark_mask_expanded = batch_landmark_node_masks.unsqueeze(-1)  # [B, Max_L, 1, 1]
+        attn_scores = attn_scores.masked_fill(landmark_mask_expanded < 0.5, -1e9)
+        
+        # 7.6 Softmax得到注意力权重
+        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, Max_L, 1, num_agents]
+
+        # 更严谨的做法：重新应用 Mask 到 weights 上，确保被 mask 的权重绝对为 0
+        attn_weights = attn_weights * teammate_mask_expanded
+        
+        # 7.7 加权求和得到聚合特征
+        landmark_aggregated = torch.matmul(attn_weights, teammate_value).squeeze(2)  # [B, Max_L, 64]
+
+        # 构造一个聚合 Mask：如果在该维度上所有 teammate 都被 mask，则该 aggregate 无效
+        # teammate_mask_expanded: [B, Max_L, 1, num_agents]
+        # valid_context_mask: [B, Max_L, 1] -> True 表示至少有一个队友
+        valid_context_mask = (teammate_mask_expanded.sum(dim=-1) > 0).float() # [B, Max_L, 1]
+        
+        # 强制清零无效的聚合
+        landmark_aggregated = landmark_aggregated * valid_context_mask
+        
+        # 7.8 残差连接：聚合特征 + 原始landmark特征
+        landmark_node_agg_feats = landmark_node_feats + landmark_aggregated  # [B, Max_L, 64]
+        
+        return landmark_node_agg_feats
 
     def get_high_level_goal(self, batch_ego_nodes, 
+                            batch_teammate_nodes, batch_teammate_masks,
                             batch_explore_nodes, batch_ego_to_explore_edges, 
                             batch_landmark_nodes, batch_landmark_node_masks, 
                             batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks, 
@@ -792,6 +902,8 @@ class MPNN(nn.Module):
         
         Args:
             batch_ego_nodes: [B, 5] [x, y, vel_x, vel_y, battery]
+            batch_teammate_nodes: [B, num_agents, 5] [x, y, vel_x, vel_y, dist_to_goal]
+            batch_teammate_masks: [B, num_agents, 1] (1=有效, 0=无效)
             batch_explore_nodes: [B, K, 4] [relative_x, relative_y, utility, occupied]
             batch_ego_to_explore_edges: [B, K, 3] [d, cosθ, sinθ]
             batch_landmark_nodes: [B, Max_L, 4] [relative_x, relative_y, utility, is_targeted]
@@ -818,12 +930,8 @@ class MPNN(nn.Module):
         explore_node_feats = self.explore_node_encoder(
             batch_explore_nodes.view(B * K, -1)
         ).view(B, K, -1)  # [B, K, 64]
-        
-        explore_edge_feats = self.edge_encoder(
-            batch_ego_to_explore_edges.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 32]
-        
-        # 1.3 Landmark节点嵌入（向量化）
+ 
+        # 1.3 Landmark节点GAT聚合
         max_L = batch_landmark_nodes.size(1)  # [B, Max_L, 4]
 
         # 一次性编码所有 landmark 节点 [B, Max_L, 4] -> [B, Max_L, 64]
@@ -831,10 +939,35 @@ class MPNN(nn.Module):
             batch_landmark_nodes.view(B * max_L, -1)
         ).view(B, max_L, -1)  # [B, Max_L, 64]
 
-        # 一次性编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
+        # landmark 和 队友节点进行聚合
+        landmark_node_agg_feats = self.landmark_team_gat(
+            batch_ego_nodes[:, :2],  # 只传递 ego 的位置用于计算相对位置
+            batch_teammate_nodes, batch_teammate_masks,
+            batch_landmark_nodes, batch_landmark_node_masks, landmark_node_feats
+        )  # [B, Max_L, 64]
+
+        # 1.4 对explore和landmark节点特征进行线性变换和LayerNorm
+        explore_node_feats = self.explore_node_linear(
+            explore_node_feats.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 64]
+
+        explore_node_feats = self.linear_ln(explore_node_feats)  # LayerNorm
+
+        landmark_node_feats = self.landmark_node_linear(
+            landmark_node_agg_feats.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, Max_L, 64]
+
+        landmark_node_feats = self.linear_ln(landmark_node_feats)  # LayerNorm
+
+        # 1.5 编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
         landmark_edge_feats = self.edge_encoder(
             batch_ego_to_landmark_edges.view(B * max_L, -1)
         ).view(B, max_L, -1)  # [B, Max_L, 32]
+
+        # 编码 explore 边 [B, K, 3] -> [B, K, 32]
+        explore_edge_feats = self.edge_encoder(
+            batch_ego_to_explore_edges.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 32]
 
         # ===== 2. 构建统一的候选节点集合 =====
         # 将 explore 和 landmark 合并为一个统一的节点集
@@ -865,28 +998,25 @@ class MPNN(nn.Module):
         node_type_labels[:, :K] = 0  # explore 类型
         
         # 填充 landmark 节点 (索引 K ~ K+max_L-1)
-        if max_L > 0:
-            # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
-            lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
-            
-            # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
-            unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-            unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-            
-            # 构建有效掩码：mask 有效 且 未被追踪
-            valid_mask = batch_landmark_node_masks[:, :, 0] > 0.5  # [B, Max_L]
-            not_targeted = batch_landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
-            combined_mask = valid_mask & not_targeted              # [B, Max_L]
+        # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
+        lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
+        # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
+        unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
+        unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
+        
+        # 构建有效掩码：mask 有效 且 未被追踪
+        valid_mask = batch_landmark_node_masks[:, :, 0] > 0.5  # [B, Max_L]
+        not_targeted = batch_landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
+        combined_mask = valid_mask & not_targeted              # [B, Max_L]
 
-            # 如果valid_mask某行全部有效，则说明已经找到全部landmark，则该样本不需要探索节点
-            all_landmarks_found = valid_mask.all(dim=1)  # [B] bool tensor
-            if all_landmarks_found.any():
-                unified_mask[all_landmarks_found, :K] = False
-
-            
-            unified_mask[:, K:K+max_L] = combined_mask
-            unified_relative_pos[:, K:K+max_L, :] = batch_landmark_nodes[:, :, :2]
-            node_type_labels[:, K:K+max_L] = 1
+        # 如果valid_mask某行全部有效，则说明已经找到全部landmark，则该样本不需要探索节点
+        all_landmarks_found = valid_mask.all(dim=1)  # [B] bool tensor
+        if all_landmarks_found.any():
+            unified_mask[all_landmarks_found, :K] = False
+        
+        unified_mask[:, K:K+max_L] = combined_mask
+        unified_relative_pos[:, K:K+max_L, :] = batch_landmark_nodes[:, :, :2]
+        node_type_labels[:, K:K+max_L] = 1
 
         # ===== 3. 注意力机制 =====
         # 计算注意力分数
@@ -1063,12 +1193,14 @@ class MPNN(nn.Module):
 
     def evaluate_high_actions(self, env_states, obs, masks_batch,
                           critic_maps, critic_nodes, goals, tasks, 
-                          ego_nodes, explore_nodes, landmark_datas, landmark_masks, 
+                          ego_nodes, explore_nodes, 
+                          landmark_datas, landmark_masks, landmark_nodes,
+                          teammate_nodes, teammate_masks,
                           agent_ids):
         """
         评估给定高层动作的log_prob、熵和价值（用于PPO更新）
         
-        Input:
+        Args:
             env_states: [batch, env_dim]
             obs: [batch, obs_dim] - 用于提取智能体位置
             masks_batch: [batch, 1] - 动作掩码
@@ -1080,6 +1212,9 @@ class MPNN(nn.Module):
             explore_nodes: [batch, K, 4]
             landmark_datas: [batch, num_landmarks, 4]
             landmark_masks: [batch, num_landmarks, 1]
+            landmark_nodes: [batch, Max_L, 4]
+            teammate_nodes: [batch, num_agents, 5]
+            teammate_masks: [batch, num_agents, 1]
             agent_ids: [batch, 1] - 智能体ID
             
         Returns:
@@ -1094,20 +1229,12 @@ class MPNN(nn.Module):
         # =====================================================
         # 1. 重建Graph nodes和Edges
         # =====================================================
-        # 获取 landmark nodes 和 masks
-        landmark_nodes, landmark_node_masks = self.get_landmark_nodes(
-            agent_positions=obs[:, 2:4],  # 提取智能体当前位置
-            detected=landmark_datas,    
-            detected_mask=landmark_masks,
-            linear_indices=torch.arange(batch_size, device=env_states.device),
-            all_masks=masks_batch
-        )
 
         # 计算边特征
         ego_to_explore_edges, ego_to_landmark_edges, ego_to_landmark_edge_masks = self.get_edge_features(
             explore_nodes=explore_nodes,
             landmark_nodes=landmark_nodes,
-            landmark_node_masks=landmark_node_masks,
+            landmark_node_masks=landmark_masks,
             norm=False,
             max_distance=2.8
         )
@@ -1120,14 +1247,12 @@ class MPNN(nn.Module):
         # 2.1 节点和边的特征嵌入
         ego_node_feats = self.ego_node_encoder(ego_nodes)  # [B, 64]
         
+        # 2.2 Explore节点嵌入
         explore_node_feats = self.explore_node_encoder(
             explore_nodes.view(B * K, -1)
         ).view(B, K, -1)  # [B, K, 64]
         
-        explore_edge_feats = self.edge_encoder(
-            ego_to_explore_edges.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 32]
-        
+        # 2.3 Landmark节点GAT聚合
         max_L = landmark_nodes.size(1)  # [B, Max_L, 4]
 
         # 一次性编码所有 landmark 节点 [B, Max_L, 4] -> [B, Max_L, 64]
@@ -1135,10 +1260,34 @@ class MPNN(nn.Module):
             landmark_nodes.view(B * max_L, -1)
         ).view(B, max_L, -1)  # [B, Max_L, 64]
 
-        # 一次性编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
+        # landmark 和 队友节点进行聚合
+        landmark_node_agg_feats = self.landmark_team_gat(
+            ego_nodes[:, :2],  # 只传递 ego 的位置用于计算相对位置
+            teammate_nodes, teammate_masks,
+            landmark_nodes, landmark_masks, landmark_node_feats
+        )  # [B, Max_L, 64]
+
+        # 2.4 对explore和landmark节点特征进行线性变换和LayerNorm
+        explore_node_feats = self.explore_node_linear(
+            explore_node_feats.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 64]
+
+        explore_node_feats = self.linear_ln(explore_node_feats)  # LayerNorm
+
+        landmark_node_feats = self.landmark_node_linear(
+            landmark_node_agg_feats.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, Max_L, 64]
+
+        landmark_node_feats = self.linear_ln(landmark_node_feats)  # LayerNorm
+
+        # 2.5 一次性编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
         landmark_edge_feats = self.edge_encoder(
             ego_to_landmark_edges.view(B * max_L, -1)
         ).view(B, max_L, -1)  # [B, Max_L, 32]
+
+        explore_edge_feats = self.edge_encoder(
+            ego_to_explore_edges.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 32]
         
         # 2.2 构建统一的候选节点集合
         total_nodes = K + max_L
@@ -1162,24 +1311,27 @@ class MPNN(nn.Module):
         node_type_labels[:, :K] = 0  # explore 类型
         
         # 填充 landmark 节点 (索引 K ~ K+max_L-1)
-        if max_L > 0:
-            # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
-            lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
-            
-            # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
-            unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-            unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-            
-            # 构建有效掩码：mask 有效 且 未被追踪
-            valid_mask = landmark_node_masks[:, :, 0] > 0.5  # [B, Max_L]
-            not_targeted = landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
-            combined_mask = valid_mask & not_targeted              # [B, Max_L]
-            
-            unified_mask[:, K:K+max_L] = combined_mask
-            unified_relative_pos[:, K:K+max_L, :] = landmark_nodes[:, :, :2]
-            node_type_labels[:, K:K+max_L] = 1
+        # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
+        lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
+        # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
+        unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
+        unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
         
-        # 2.3 注意力机制
+        # 构建有效掩码：mask 有效 且 未被追踪
+        valid_mask = landmark_masks[:, :, 0] > 0.5  # [B, Max_L]
+        not_targeted = landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
+        combined_mask = valid_mask & not_targeted    # [B, Max_L]
+        
+        # 如果valid_mask某行全部有效，则说明已经找到全部landmark，则该样本不需要探索节点
+        all_landmarks_found = valid_mask.all(dim=1)  # [B] bool tensor
+        if all_landmarks_found.any():
+            unified_mask[all_landmarks_found, :K] = False          
+        
+        unified_mask[:, K:K+max_L] = combined_mask
+        unified_relative_pos[:, K:K+max_L, :] = landmark_nodes[:, :, :2]
+        node_type_labels[:, K:K+max_L] = 1
+        
+        # 3. 注意力机制
         scale = math.sqrt(self.attn_dim)
         attn_scores = (q @ unified_k.transpose(1, 2)) / scale
         attn_scores = attn_scores.masked_fill(~unified_mask.unsqueeze(1), -1e9)

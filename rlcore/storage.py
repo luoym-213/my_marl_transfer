@@ -37,12 +37,17 @@ class RolloutStorage(object):
         self.goal_dones[0].fill_(1.0) # 初始化第一步为1，因为需要执行高层策略来分配初始目标
         self.ego_nodes = torch.zeros(num_steps, num_processes, 5)  # Ego节点特征存储: [num_steps, num_processes, 5]
         self.explore_nodes = torch.zeros(num_steps, num_processes, top_k, 4)  # Explore节点特征存储: [num_steps, num_processes, K, 4]
+        self.teammate_nodes = torch.zeros(num_steps, num_processes, num_agent, 5)  # Teammate节点特征存储: [num_steps, num_processes, num_agent, 5]
+        self.teammate_masks = torch.zeros(num_steps, num_processes, num_agent, 1)  # Teammate节点掩码存储: [num_steps, num_processes, num_agent, 1]
 
         # ==================== Landmark 存储（张量形式）====================
         self.max_landmarks = num_agent
         # Landmark 数据: [num_steps+1, num_processes, max_landmarks, 4]
         # 每个 landmark 包含: [x, y, utility, is_targeted]
         self.landmark_datas = torch.zeros(num_steps + 1, num_processes, self.max_landmarks, 4)
+
+        # save landmark node
+        self.landmark_nodes = torch.zeros(num_steps, num_processes, self.max_landmarks, 4)
         
         # Landmark 有效性掩码: [num_steps+1, num_processes, max_landmarks, 1]
         # 1 表示该位置有有效的 landmark，0 表示该位置为空
@@ -76,13 +81,17 @@ class RolloutStorage(object):
         self.explore_nodes = self.explore_nodes.to(device)
         self.landmark_datas = self.landmark_datas.to(device)
         self.landmark_masks = self.landmark_masks.to(device)
+        self.landmark_nodes = self.landmark_nodes.to(device)
+        self.teammate_nodes = self.teammate_nodes.to(device)
+        self.teammate_masks = self.teammate_masks.to(device)
 
     def insert(self, obs, actions, action_log_probs, value_preds, 
                rewards, high_rewards, masks, env_states, 
                 critic_maps, critic_nodes, goals, task,
                higoal_log_probs, high_values, 
                 ego_nodes, explore_nodes,
-                landmark_data, landmark_mask,
+                landmark_data, landmark_mask, landmark_nodes,
+                teammate_nodes, teammate_masks,
                goal_dones):
         # 环境基础信息
         self.obs[self.step + 1].copy_(obs)
@@ -109,6 +118,9 @@ class RolloutStorage(object):
         self.explore_nodes[self.step].copy_(explore_nodes)
         self.landmark_datas[self.step + 1].copy_(landmark_data)
         self.landmark_masks[self.step + 1].copy_(landmark_mask)
+        self.landmark_nodes[self.step].copy_(landmark_nodes)
+        self.teammate_nodes[self.step].copy_(teammate_nodes)
+        self.teammate_masks[self.step].copy_(teammate_masks)
 
         self.step = (self.step + 1) % self.num_steps
 

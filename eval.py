@@ -180,6 +180,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size, device=args.device)
         obs = normalize_obs(obs, obs_mean, obs_std)
         done = [False]*env.n
+        masks = torch.ones(env.n, 1, device=args.device)
         episode_rewards = np.full(env.n, 0.0)
         episode_high_rewards = np.full(env.n, 0.0)
         episode_steps = 0
@@ -240,7 +241,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             actions = []
             with torch.no_grad():
                 # print("step:", info['world_steps'])
-                actions, goals, tasks, landmark_data, landmark_mask = master.eval_act(obs, env_states, 
+                actions, goals, tasks, landmark_data, landmark_mask = master.eval_act(obs, env_states, masks,
                                                                                       goals, tasks, 
                                                                                       landmark_data, 
                                                                                       landmark_mask)
@@ -252,8 +253,9 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                 step_data['agents_tasks'] = step_data['agents_tasks'].cpu().numpy()
             obs, reward, high_reward, done_info, info, env_states = env.step(step_data)
             done = done_info['all']
-            done_agent = done_info['agent']
+            done_agent = np.array(done_info['agent'])
             high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
+            masks = torch.FloatTensor(1-1.0*done_agent).to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             obs = normalize_obs(obs, obs_mean, obs_std)
             master.envs_info = info

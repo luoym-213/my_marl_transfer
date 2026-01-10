@@ -29,6 +29,9 @@ class Neo(object):
     self.landmark_data = None
     self.landmark_mask = None
     self.critic_nodes = None
+    self.teammate_nodes = None
+    self.teammate_masks = None
+    self.landmark_nodes = None
 
   def load_model(self, policy_state):
       self.actor_critic.load_state_dict(policy_state)
@@ -47,7 +50,8 @@ class Neo(object):
                          self.critic_map, self.critic_nodes, self.goal, self.task,
                          self.higoal_log_prob, self.high_value, 
                          self.ego_nodes, self.explore_nodes, 
-                         self.landmark_data, self.landmark_mask,
+                         self.landmark_data, self.landmark_mask, self.landmark_nodes,
+                         self.teammate_nodes, self.teammate_masks,
                          goal_dones)
 
   def act(self, step, deterministic=False):
