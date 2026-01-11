@@ -621,10 +621,10 @@ class MPNN(nn.Module):
         entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])  # [B_pro*B_agents, H, W]
         
         batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=rrt_max_iter, top_k=top_k)  # [B_pro*B_agents, K, 3]
-        batch_rtt = torch.tensor(batch_rtt, dtype=torch.long, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
+        batch_rtt = torch.tensor(batch_rtt, dtype=torch.float32, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
         
         ## 转为世界坐标
-        explore_nodes_world = self._grid_to_world_torch(batch_rtt[..., :2].float(), H=100, W=100)  # [B_pro, B_agents, K, 2]
+        explore_nodes_world = self._grid_to_world_torch(batch_rtt[..., :2], H=100, W=100)  # [B_pro, B_agents, K, 2]
         
         # update_nodes: [B_pro, B_agents, 4]，前两维是 ego 的位置
         ego_positions = update_nodes[..., :2]  # [B_pro, B_agents, 2]
@@ -633,7 +633,7 @@ class MPNN(nn.Module):
         relative_explore_positions = explore_nodes_world - ego_positions.unsqueeze(2)  # [B_pro, B_agents, K, 2]
         
         ## 拼接成候选点特征（现在前两维是相对位置）
-        explore_nodes = torch.cat([relative_explore_positions, batch_rtt[..., 2:3].float()], dim=-1)  # [B_pro, B_agents, K, 3]
+        explore_nodes = torch.cat([relative_explore_positions, batch_rtt[..., 2:3]], dim=-1)  # [B_pro, B_agents, K, 3]
 
         ## 补充候选点节点特征 - Occupied Feature
         d0 = 0.3
