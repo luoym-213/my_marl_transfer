@@ -560,9 +560,9 @@ def plan_batch(
     voronoi_masks: np.ndarray,
     entropy_maps: np.ndarray,
     entropy_threshold: float = 0.8,
-    radius: int = 5,
-    expand_dis: int = 3,
-    max_iterations: int = 500,
+    radius: int = 2,
+    expand_dis: int = 4,
+    max_iterations: int = 50,
     top_k: int = 10,
 ) -> List[List[List[float]]]:
     """
