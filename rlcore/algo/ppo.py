@@ -226,7 +226,8 @@ class JointPPO():
                  high_value_preds_batch, high_return_batch,
                  masks_batch, goal_dones_batch, high_adv_targ,
                  agent_ids_batch, ego_nodes_batch, explore_nodes_batch,
-                 landmark_datas_batch, landmark_masks_batch) = sample
+                 landmark_datas_batch, landmark_masks_batch, landmark_nodes_batch,
+                 teammate_nodes_batch, teammate_masks_batch) = sample
                 
                 # === 1. 提取各种mask ===
                 decision_mask = goal_dones_batch.squeeze(-1) > 0.5  # [batch_size] - 是否是决策点
@@ -245,7 +246,8 @@ class JointPPO():
                         critic_maps_batch, critic_nodes_batch,
                         goals_batch, tasks_batch,
                         ego_nodes_batch, explore_nodes_batch,
-                        landmark_datas_batch, landmark_masks_batch,
+                        landmark_datas_batch, landmark_masks_batch, landmark_nodes_batch,
+                        teammate_nodes_batch, teammate_masks_batch,
                         agent_ids=agent_ids_batch   # ⭐ 传入智能体ID
                     )
                 
@@ -262,41 +264,29 @@ class JointPPO():
                 else:
                     decision_entropy_masked = torch.tensor(0.0, device=high_values.device)
 
-                # === 4. Critic Loss（密集更新：所有点）===
-                if dense_critic:
-                    # 密集 Critic：使用全部数据
+                # === 4. Critic Loss (稀疏更新) ===
+                # 仅在决策点上计算Value Loss，因为high_return_batch是稀疏的
+                if num_decisions > 0:
+                    # 筛选出决策点的数据
+                    high_values_at_decision = high_values[decision_mask]
+                    high_return_batch_at_decision = high_return_batch[decision_mask]
+                    high_value_preds_batch_at_decision = high_value_preds_batch[decision_mask]
+
                     if self.use_clipped_value_loss:
-                        value_pred_clipped = high_value_preds_batch + \
-                            (high_values - high_value_preds_batch).clamp(
+                        value_pred_clipped = high_value_preds_batch_at_decision + \
+                            (high_values_at_decision - high_value_preds_batch_at_decision).clamp(
                                 -self.clip_param, self.clip_param)
-                        value_losses = (high_values - high_return_batch).pow(2)
-                        value_losses_clipped = (value_pred_clipped - high_return_batch).pow(2)
-                        # 需要在masks_batch上计算loss
-                        value_loss = (0.5 * torch.max(value_losses, value_losses_clipped) * masks_batch).sum() / masks_batch.sum()
-                        # value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
+                        value_losses = (high_values_at_decision - high_return_batch_at_decision).pow(2)
+                        value_losses_clipped = (value_pred_clipped - high_return_batch_at_decision).pow(2)
+                        value_loss = 0.5 * torch.max(value_losses, value_losses_clipped).mean()
                     else:
-                        value_loss = 0.5 * F.mse_loss(high_return_batch, high_values)
+                        value_loss = 0.5 * F.mse_loss(
+                            high_return_batch_at_decision,
+                            high_values_at_decision
+                        )
                 else:
-                    # 稀疏 Critic：只在决策点更新
-                    if num_decisions > 0:
-                        if self.use_clipped_value_loss:
-                            value_pred_clipped = high_value_preds_batch[decision_mask] + \
-                                (high_values[decision_mask] - 
-                                 high_value_preds_batch[decision_mask]).clamp(
-                                    -self.clip_param, self.clip_param)
-                            value_losses = (high_values[decision_mask] - 
-                                          high_return_batch[decision_mask]).pow(2)
-                            value_losses_clipped = (value_pred_clipped - 
-                                                   high_return_batch[decision_mask]).pow(2)
-                            value_loss = 0.5 * torch.max(value_losses, 
-                                                        value_losses_clipped).mean()
-                        else:
-                            value_loss = 0.5 * F.mse_loss(
-                                high_return_batch[decision_mask], 
-                                high_values[decision_mask]
-                            )
-                    else:
-                        value_loss = torch.tensor(0.0, device=high_values.device)
+                    # 如果这个batch里没有决策点，则value loss为0
+                    value_loss = torch.tensor(0.0, device=high_values.device)
 
                 # === 5. Actor Loss - 决策头（所有决策点）===
                 if num_decisions > 0:
@@ -320,10 +310,11 @@ class JointPPO():
 
                 # === 7. 反向传播和优化 ===
                 self.optimizer.zero_grad()
-                total_loss.backward()
-
-                nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-                self.optimizer.step()
+                
+                if total_loss.requires_grad:
+                    total_loss.backward()
+                    nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                    self.optimizer.step()
 
                 # 统计loss
                 value_loss_epoch += value_loss.item()
@@ -388,6 +379,9 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     all_explore_nodes = []
     all_landmark_datas = []
     all_landmark_masks = []
+    all_landmark_nodes = []
+    all_teammate_nodes = []
+    all_teammate_masks = []
 
     for agent_id, (rollout, advantages) in enumerate(zip(rollouts_list, advantages_list)):
         batch_size = num_steps * num_processes
@@ -405,13 +399,15 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         all_masks.append(rollout.masks[:-1].view(-1, 1))
         all_goal_dones.append(rollout.goal_dones[:-1].view(-1, 1))
         all_advantages.append(advantages.view(-1, 1))
-        # ⭐ 记录智能体ID
-        agent_ids = torch.full((batch_size,), agent_id, dtype=torch.long)
+        agent_ids = torch.full((batch_size,), agent_id, dtype=torch.long)        # ⭐ 记录智能体ID
         all_agent_ids.append(agent_ids)
         all_ego_nodes.append(rollout.ego_nodes.view(-1, rollout.ego_nodes.size(-1)))
         all_explore_nodes.append(rollout.explore_nodes.view(-1, *rollout.explore_nodes.size()[2:])) # [N, K, 4]
         all_landmark_datas.append(rollout.landmark_datas[:-1].view(-1, *rollout.landmark_datas.size()[2:])) # [N, M, landmark_dim]
         all_landmark_masks.append(rollout.landmark_masks[:-1].view(-1, *rollout.landmark_masks.size()[2:])) # [N, M, 1]
+        all_landmark_nodes.append(rollout.landmark_nodes.view(-1, *rollout.landmark_nodes.size()[2:]))  # [N, M, 4]
+        all_teammate_nodes.append(rollout.teammate_nodes.view(-1, *rollout.teammate_nodes.size()[2:]))  # [N, num_agents, 5]
+        all_teammate_masks.append(rollout.teammate_masks.view(-1, *rollout.teammate_masks.size()[2:]))  # [N, num_agents, 1]
     
     # 拼接所有agent的数据
     env_states_all = torch.cat(all_env_states, 0)  # [num_agents * num_steps * num_processes, env_state_dim]
@@ -431,6 +427,9 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     explore_nodes_all = torch.cat(all_explore_nodes, 0)
     landmark_datas_all = torch.cat(all_landmark_datas, 0)
     landmark_masks_all = torch.cat(all_landmark_masks, 0)
+    teammate_nodes_all = torch.cat(all_teammate_nodes, 0)
+    teammate_masks_all = torch.cat(all_teammate_masks, 0)
+    landmark_nodes_all = torch.cat(all_landmark_nodes, 0)  # [N, M, 4]
     
     # === 关键改进：Advantage 归一化只在决策点上进行 ===
     decision_mask = (goal_dones_all.squeeze(-1) > 0.5)
@@ -474,19 +473,22 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         masks_batch = masks_all[indices]
         goal_dones_batch = goal_dones_all[indices]  # ← 关键：yield mask
         adv_targ = advantages_all[indices]
-        agent_ids_batch = agent_ids_all[indices].to(high_value_preds_batch.device)  # ⭐ 提取智能体ID batch
+        agent_ids_batch = agent_ids_all[indices].to(high_value_preds_batch.device)
         ego_nodes_batch = ego_nodes_all[indices]
         explore_nodes_batch = explore_nodes_all[indices]
         landmark_datas_batch = landmark_datas_all[indices]
         landmark_masks_batch = landmark_masks_all[indices]
-        
+        landmark_nodes_batch = landmark_nodes_all[indices]
+        teammate_nodes_batch = teammate_nodes_all[indices]
+        teammate_masks_batch = teammate_masks_all[indices]
         yield (env_states_batch, obs_batch, critic_maps_batch, critic_nodes_batch,
                goals_batch, tasks_batch,
                higoal_log_probs_batch,
                high_value_preds_batch, high_return_batch, 
                masks_batch, goal_dones_batch, adv_targ,
                agent_ids_batch, ego_nodes_batch, explore_nodes_batch,
-               landmark_datas_batch, landmark_masks_batch)  # ⭐ 返回智能体ID batch
+               landmark_datas_batch, landmark_masks_batch, landmark_nodes_batch,
+               teammate_nodes_batch, teammate_masks_batch)
         
 def recurrent_feed_foward_generator(rollouts_list, advantages_list, num_mini_batch, seq_length=30):
     """
