@@ -151,6 +151,14 @@ class MPNN(nn.Module):
                 nn.Linear(32, 64),
                 nn.ReLU()
             ),
+
+            # explore线性映射层 [64] -> [64]
+            'explore_node_linear': nn.Linear(64, 64),
+
+            # landmark线性映射层 [64] -> [64]
+            'landmark_node_linear': nn.Linear(64, 64),
+
+            'linear_ln': nn.LayerNorm(64),
             
             # 边编码器 [3] -> [32]
             'edge_encoder': nn.Sequential(
@@ -531,6 +539,18 @@ class MPNN(nn.Module):
         return self.modules_dict['high_level']['landmark_node_encoder']
     
     @property
+    def explore_node_linear(self):
+        return self.modules_dict['high_level']['explore_node_linear']
+    
+    @property
+    def landmark_node_linear(self):
+        return self.modules_dict['high_level']['landmark_node_linear']
+    
+    @property
+    def linear_ln(self):
+        return self.modules_dict['high_level']['linear_ln']
+    
+    @property
     def edge_encoder(self):
         return self.modules_dict['high_level']['edge_encoder']
     
@@ -635,12 +655,13 @@ class MPNN(nn.Module):
 
         return explore_nodes
 
-    def get_landmark_nodes(self, agent_positions, detected, detected_mask, linear_indices):
+    def get_landmark_nodes(self, agent_positions, detected, detected_mask, linear_indices, all_masks=None):
         """
         agent_positions: [num_agents * num_processes, 2]，世界坐标
         detected: [num_agents * num_processes, max_landmarks, 4]，landmark特征 [x, y, utility, is_targeted]
         detected_mask: [num_agents * num_processes, max_landmarks, 1]，候选点有效掩码
         linear_indices: [N]，需要决策的智能体的线性索引
+        all_masks: [num_agents * num_processes, 1] 可选，智能体有效掩码
 
         return:
             batch_landmark_nodes: List of Tensors, 每个 Tensor 形状为 [L_i, 4]，一共Batch个需要决策智能体
@@ -657,12 +678,49 @@ class MPNN(nn.Module):
 
         # ✅ 批量计算相对位置
         relative_pos = batch_landmark_data[:, :, :2] - ego_positions.unsqueeze(1)  # [N, max_L, 2]
+
+        # 根据其他智能体是否已经被发现，判定当前的landmark效用值
         
         # 更新landmark数据（保留utility和is_targeted）
         batch_landmark_data_relative = torch.cat([
             relative_pos,
             batch_landmark_data[:, :, 2:]  # [N, max_L, 2] - utility和is_targeted
         ], dim=2)  # [N, max_L, 4]
+        
+        # ===== 动态调整 landmark 效用值（基于同环境中的退休智能体数量）=====
+        if all_masks is not None:
+            # 1. 计算每个智能体所在的环境索引
+            # linear_indices: [N]，范围 [0, num_agents * num_processes)
+            # 数据组织方式：[agent0_env0, agent0_env1, ..., agent0_env(P-1), agent1_env0, ...]
+            # 环境索引 = linear_indices % num_processes
+            num_processes = all_masks.size(0) // self.num_agents
+            env_indices = linear_indices % num_processes  # [N]
+            
+            # 2. 为每个样本计算其所在环境中的退休智能体数量
+            # all_masks: [num_agents * num_processes, 1]
+            # 重塑为 [num_agents, num_processes] 然后转置为 [num_processes, num_agents]
+            all_masks_reshaped = all_masks.view(self.num_agents, num_processes).t()  # [P, A]
+            
+            # 对于每个环境，统计无效（已退休）智能体数量
+            # mask=1 表示有效，mask=0 表示已退休
+            retired_counts_per_env = (all_masks_reshaped < 0.5).sum(dim=1)  # [P]
+            
+            # 3. 根据环境索引获取对应的退休智能体数量
+            num_retired_agents = retired_counts_per_env[env_indices]  # [N]
+            
+            # 4. 提取 is_targeted 和 landmark 有效性掩码
+            is_targeted = batch_landmark_data_relative[:, :, 3]  # [N, max_L]
+            valid_landmark_mask = batch_landmark_mask.squeeze(-1) > 0.5  # [N, max_L]
+            
+            # 5. 对于有效且尚未被追踪的 landmark，设置效用值为该环境中的退休智能体数量
+            untargeted_and_valid = (is_targeted < 0.5) & valid_landmark_mask  # [N, max_L]
+            
+            # 6. 更新效用值（广播 num_retired_agents [N] 到 [N, max_L]）
+            for i in range(batch_landmark_data_relative.size(0)):
+                mask_i = untargeted_and_valid[i]  # [max_L]
+                batch_landmark_data_relative[i, mask_i, 2] = float(num_retired_agents[i]+2)
+        
+        # ===== 效用值调整完成 =====
         
         # ✅ 直接返回tensor，而不是list，[N, max_L, 4] 和 [N, max_L, 1]
         return batch_landmark_data_relative, batch_landmark_mask
@@ -1003,7 +1061,7 @@ class MPNN(nn.Module):
 
         return value, action, action_log_probs
 
-    def evaluate_high_actions(self, env_states, obs,
+    def evaluate_high_actions(self, env_states, obs, masks_batch,
                           critic_maps, critic_nodes, goals, tasks, 
                           ego_nodes, explore_nodes, landmark_datas, landmark_masks, 
                           agent_ids):
@@ -1013,6 +1071,7 @@ class MPNN(nn.Module):
         Input:
             env_states: [batch, env_dim]
             obs: [batch, obs_dim] - 用于提取智能体位置
+            masks_batch: [batch, 1] - 动作掩码
             critic_maps: [batch, 3, H, W] - 用于critic
             critic_nodes: [batch, num_agents, 4] - 用于critic
             goals: [batch, 2] - 已选择的目标位置（世界坐标）
@@ -1040,7 +1099,8 @@ class MPNN(nn.Module):
             agent_positions=obs[:, 2:4],  # 提取智能体当前位置
             detected=landmark_datas,    
             detected_mask=landmark_masks,
-            linear_indices=torch.arange(batch_size, device=env_states.device)
+            linear_indices=torch.arange(batch_size, device=env_states.device),
+            all_masks=masks_batch
         )
 
         # 计算边特征

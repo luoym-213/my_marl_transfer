@@ -846,7 +846,7 @@ class MultiAgentEnv(gym.Env):
             self.visited_landmarks = set()
         
         rewards = []
-        TARGET_REWARD = 6000.0  # 🔧 可调参数：到达新目标的奖励值
+        TARGET_REWARD = 600.0  # 🔧 可调参数：到达新目标的奖励值
         LANDMARK_MATCH_THRESHOLD = self.world.dist_thres  # 🔧 可调参数：判断目标是否为 landmark 的距离阈值
         
         for agent_idx, agent in enumerate(self.agents):
@@ -888,15 +888,19 @@ class MultiAgentEnv(gym.Env):
             if min_dist < LANDMARK_MATCH_THRESHOLD:
                 # 当前目标确实是某个 landmark
                 if matched_landmark_idx not in self.visited_landmarks:
-                    # ✅ 首次访问该 landmark，给予奖励
-                    agent_reward = TARGET_REWARD
+                    # ✅ 首次访问该 landmark，给予递增奖励
+                    # 奖励倍数 = (已退休智能体数量 + 1)，即当前是第几个发现的landmark
+                    num_retired = sum(self.agents_done)
+                    reward_multiplier = num_retired + 1
+                    agent_reward = TARGET_REWARD * reward_multiplier
+                    
                     self.visited_landmarks.add(matched_landmark_idx)
                     
                     # ✅ 标记该智能体为退役状态
                     self.agents_done[agent_idx] = True
                     
                     # 🎯 调试信息（可选）
-                    # print(f"🎉 Agent {agent_idx} collected landmark {matched_landmark_idx} at step {self.world.steps}")
+                    # print(f"🎉 Agent {agent_idx} collected landmark {matched_landmark_idx} (#{reward_multiplier}) at step {self.world.steps}, reward={agent_reward}")
             
             rewards.append(agent_reward)
         
