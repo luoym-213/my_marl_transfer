@@ -252,7 +252,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             if isinstance(step_data['agents_tasks'], torch.Tensor):
                 step_data['agents_tasks'] = step_data['agents_tasks'].cpu().numpy()
             obs, reward, high_reward, done_info, info, env_states = env.step(step_data)
-            done = done_info['all']
+            done = done_info['agent']
             done_agent = np.array(done_info['agent'])
             high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             masks = torch.FloatTensor(1-1.0*done_agent).to(args.device)
@@ -305,11 +305,11 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
 
         per_step_rewards[t] = episode_rewards/episode_steps
         per_high_step_rewards[t] = episode_high_rewards/episode_steps
-        num_success += info['n'][0]['is_success']
+        num_success += info['is_success']
         episode_length = (episode_length*t + info['n'][0]['world_steps'])/(t+1)
         
         # 更新成功回合的统计数据
-        if info['n'][0]['is_success']:
+        if info['is_success']:
             successful_steps_total += info['n'][0]['world_steps']
             successful_episodes_count += 1
 
@@ -320,7 +320,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             final_min_dists.append(env.world.dists)
 
         if should_show_window:
-            print("Ep {} | Success: {} \n Av per-step reward: {:.2f} | Ep Length {}".format(t,info['n'][0]['is_success'],
+            print("Ep {} | Success: {} \n Av per-step reward: {:.2f} | Ep Length {}".format(t,info['is_success'],
                 per_step_rewards[t][0],info['n'][0]['world_steps']))
         all_episode_rewards[t, :] = episode_rewards # all_episode_rewards shape: num_eval_episodes x num agents
         all_high_episode_rewards[t, :] = episode_high_rewards # all_episode_rewards shape: num_eval_episodes x num agents

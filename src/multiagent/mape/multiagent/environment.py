@@ -216,6 +216,8 @@ class MultiAgentEnv(gym.Env):
         else:
             done['agent'] = self.agents_done
 
+        info_n['is_success'] = np.all(self.agents_done)
+        
         return obs_n, all_reward, total_high_rewards, done, info_n, state
 
     def reset(self):
