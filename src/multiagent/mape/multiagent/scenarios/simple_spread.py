@@ -96,6 +96,7 @@ class Scenario(BaseScenario):
         dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in world.landmarks]for a in world.agents])
         # 匈牙利算法分配
         self.min_dists = self._bipartite_min_dists(dists)
+        print("min_dist:",self.min_dists)
         # 判断是否成功
         self.is_success = np.all(self.min_dists < world.dist_thres)
 

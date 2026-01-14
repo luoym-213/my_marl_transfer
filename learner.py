@@ -880,7 +880,6 @@ class Learner(object):
                 # 2.2. 通过RTT生成候选探索点
                 batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])  # [B_pro*B_agents, K, 4]
-                print("batch_explore_nodes:", batch_explore_nodes)
                 # 2.3. ego nodes
                 batch_ego_nodes = ego_nodes[proc_indices, agent_indices]  # [N, 5]
                 # 2.4. landmark nodes
@@ -951,18 +950,15 @@ class Learner(object):
                     # 自我节点（世界坐标）
                     ego_pos = batch_ego_nodes[i, :2].cpu().numpy()
                     graph_data['ego_nodes'].append(ego_pos)
-                    print("ego_pos:", ego_pos)
                     
                     # 探索节点（转换为世界坐标）
                     explore_nodes_local = batch_explore_nodes[i].cpu().numpy()  # [K, 4], 最后2维是相对坐标
                     explore_nodes_world = explore_nodes_local[:, :2] + ego_pos  # 转换为世界坐标
-                    print("explore_nodes_world:", explore_nodes_world)
                     graph_data['explore_nodes'].append(explore_nodes_world)
                     
                     # Landmark节点（已经是世界坐标）
                     landmark_nodes_local = batch_landmark_nodes[i][:, :2].cpu().numpy()  # [L, 2]
                     landmark_nodes_world = landmark_nodes_local + ego_pos  # 转换为世界坐标
-                    print("landmark_nodes_world:", landmark_nodes_world)
                     graph_data['landmark_nodes'].append(landmark_nodes_world)
                     
                     # 边的信息（距离、角度等）
