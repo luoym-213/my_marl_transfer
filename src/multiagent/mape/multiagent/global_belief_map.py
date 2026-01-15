@@ -11,7 +11,7 @@ class GlobalBeliefMap:
     基于贝叶斯更新的全局信念地图，用于跟踪团队对环境的信念状态。
     """
     
-    def __init__(self, world_size=2.0, cell_size=0.02, initial_belief=0.5, sensor_fidelity=0.8, landmark_positions=None, landmark_radius=0.05):
+    def __init__(self, world_size=2.0, cell_size=0.02, initial_belief=0.5, sensor_fidelity=0.8, landmark_positions=None, landmark_radius=0.05, obs_radius=0.3):
         self.world_size = world_size
         self.cell_size = cell_size
         self.initial_belief = initial_belief
@@ -38,6 +38,65 @@ class GlobalBeliefMap:
 
         # 目标发现阈值
         self.belief_threshold = 0.95
+
+        # 设置动态探索奖励归一化分母：根据观测半径、传感器可靠度和地图尺寸预估最大熵值
+        # 1. 计算FOV覆盖的栅格数量
+        # 使用离散计数代替几何面积，以匹配实际更新的栅格数
+        dummy_mask = self.get_fov_mask((0, 0), obs_radius)
+        fov_area = np.sum(dummy_mask)
+        
+        # 2. 计算单次观测单个栅格的最大熵增量
+        p_s = self.sensor_fidelity
+        
+        # 动态计算最大熵减：模拟贝叶斯更新序列，找到最大的单步熵减
+        # 解释：熵减在 p=0.5 时不是最大的，通常在 p=0.8 左右进行下一次更新时达到峰值
+        max_drop = 0.0
+        curr_p = self.initial_belief
+        for _ in range(10): # 模拟10次更新足以覆盖峰值
+            # 计算当前熵
+            h_curr = -(curr_p * np.log2(curr_p) + (1 - curr_p) * np.log2(1 - curr_p))
+            
+            # 贝叶斯更新
+            num = p_s * curr_p
+            den = p_s * curr_p + (1 - p_s) * (1 - curr_p)
+            next_p = num / den
+            
+            # 计算更新后熵
+            h_next = -(next_p * np.log2(next_p) + (1 - next_p) * np.log2(1 - next_p))
+            
+            drop = h_curr - h_next
+            if drop > max_drop:
+                max_drop = drop
+            
+            curr_p = next_p
+            
+        max_entropy_increase = max_drop
+        # 3. 估计最大可能熵值
+        max_possible_entropy = max_entropy_increase * fov_area
+        self.explore_reward_normalization = max_possible_entropy if max_possible_entropy > 0 else 1.0
+
+        # 4. 计算最大可能信念增量 (发现奖励归一化)
+        # 寻找 max(Bayes(b) - b)，即单格最大可能的信念提升
+        self.max_belief_delta = 0.0
+        for b in np.linspace(0, 1, 101): # 遍历可能的信念值
+            num = p_s * b
+            den = p_s * b + (1 - p_s) * (1 - b)
+            if den > 1e-10:
+                new_b = num / den
+                delta = new_b - b
+                if delta > self.max_belief_delta:
+                    self.max_belief_delta = delta
+        
+        self._update_discover_normalization()
+
+    def _update_discover_normalization(self):
+        """根据当前地图中的landmark总面积更新发现奖励的归一化系数"""
+        total_landmark_cells = np.sum(self.landmark_map)
+        # 如果没有landmark，使用1.0避免除零（此时奖励也为0）
+        normalization_area = total_landmark_cells if total_landmark_cells > 0 else 1.0
+        
+        max_possible_discover = self.max_belief_delta * normalization_area
+        self.discover_reward_normalization = max_possible_discover if max_possible_discover > 0 else 1.0
         
     def _precompute_cell_centers(self):
         """预计算每个栅格中心点的世界坐标"""
@@ -626,14 +685,14 @@ class GlobalBeliefMap:
             updated_entropy_map = self.compute_shannon_entropy()
             updated_total_entropy = np.sum(updated_entropy_map)
             explore_reward = original_total_entropy - updated_total_entropy
-            explore_rewards.append(float(explore_reward))
+            explore_rewards.append(float(explore_reward / self.explore_reward_normalization) * 2)
             
             # 5. 计算发现目标奖励（信念正向增量）
             delta_belief = self.belief_grid - original_belief_grid
             positive_delta = np.maximum(0, delta_belief[fov_mask])
             total_discover = np.sum(positive_delta)
             discover_reward = total_discover * discover_reward_scale
-            discover_rewards.append(float(discover_reward))
+            discover_rewards.append(float(discover_reward / self.discover_reward_normalization) * 5)
         
         # 恢复原始地图状态
         self.belief_grid = original_belief_grid

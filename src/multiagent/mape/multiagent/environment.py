@@ -90,6 +90,8 @@ class MultiAgentEnv(gym.Env):
             self.observation_space.append(spaces.Box(low=-np.inf, high=+np.inf, shape=(obs_dim,), dtype=np.float32))
             agent.action.c = np.zeros(self.world.dim_c)
 
+            self.time_penalty = 0.2  # 每步时间惩罚
+
         # rendering
         self.cam_range = cam_range
         self.shared_viewer = shared_viewer
@@ -104,7 +106,7 @@ class MultiAgentEnv(gym.Env):
         if self.enable_exploration_reward:
             self.world_size = 2
             self.cell_size = 0.02
-            self.global_belief_map = GlobalBeliefMap(world_size=self.world_size, cell_size=self.cell_size, landmark_positions=self.landmark_positions, landmark_radius=0.05)
+            self.global_belief_map = GlobalBeliefMap(world_size=self.world_size, cell_size=self.cell_size, landmark_positions=self.landmark_positions, landmark_radius=0.05, obs_radius=self.world.mask_obs_dist)
         else:
             self.global_belief_map = None
 
@@ -162,7 +164,9 @@ class MultiAgentEnv(gym.Env):
         # 到达目标点奖励，需要满足当前当前task = 1，即collect模式，且距离目标点小于阈值
         goal_dones = self._get_goal_dones(self.agents) # 获取当前step后，智能体是否达到目标点的布尔列表
         agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, goal_dones)
-        total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards)
+
+        # 总高层奖励
+        total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards) - self.time_penalty
 
         # 根据获取的全局状态更新全局信息图
         if self.enable_exploration_reward:
@@ -235,7 +239,7 @@ class MultiAgentEnv(gym.Env):
         # 根据智能体初始位置，预先更新地图
         if self.enable_exploration_reward:
             self.global_belief_map.reset(self.landmark_positions)
-            self.global_belief_map.update_beliefs(np.array([a.state.p_pos for a in self.world.policy_agents]), self.world.mask_obs_dist)
+            # self.global_belief_map.update_beliefs(np.array([a.state.p_pos for a in self.world.policy_agents]), self.world.mask_obs_dist)
 
         # reset renderer
         self._reset_render()
@@ -759,7 +763,7 @@ class MultiAgentEnv(gym.Env):
             self.visited_landmarks = set()
         
         rewards = []
-        TARGET_REWARD = 600.0  # 🔧 可调参数：到达新目标的奖励值
+        TARGET_REWARD = 10.0  # 🔧 可调参数：到达新目标的奖励值
         LANDMARK_MATCH_THRESHOLD = self.world.dist_thres  # 🔧 可调参数：判断目标是否为 landmark 的距离阈值
         
         for agent_idx, agent in enumerate(self.agents):

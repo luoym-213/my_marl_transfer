@@ -50,17 +50,23 @@ class MultiAgentVecNormalize(VecEnvWrapper):
     """
     Vectorized environment base class
     """
-    def __init__(self, venv, ob=True, ret=True, clipob=10., cliprew=10., high_ret=True, cliphighrew=50., gamma=0.99, epsilon=1e-8):
+    def __init__(self, venv, 
+                 ob=True, ret=True, clipob=10., cliprew=10., 
+                 high_ret=False, cliphighrew=50.,   # high reward normalization not used in practice
+                 gamma=0.99, epsilon=1e-8):
         VecEnvWrapper.__init__(self, venv)
         self.n = len(self.observation_space)
         self.ob_rms = [RunningMeanStd(shape=x.shape) for x in self.observation_space] if ob else None
         self.ret_rms = RunningMeanStd(shape=(self.n,)) if ret else None
         self.high_ret_rms = RunningMeanStd(shape=(self.n,)) if high_ret else None
+
         self.clipob = clipob
         self.cliprew = cliprew
         self.cliphighrew = cliphighrew
+
         self.ret = np.zeros((self.num_envs, self.n))
         self.highret = np.zeros((self.num_envs, self.n))
+
         self.gamma = gamma
         self.epsilon = epsilon
         
@@ -70,14 +76,19 @@ class MultiAgentVecNormalize(VecEnvWrapper):
         Apply sequence of actions to sequence of environments
         actions -> (observations, rewards, news)
 
-        where 'news' is a boolean vector indicating whether each element is new.
+        where 'news' is a dict:
+            news['agent'] is a boolean vector indicating whether each element is new.
         """
         obs, rews, high_rews, news, infos, sta = self.venv.step_wait()
+        
         # 更新累计折扣回报
         self.ret = self.ret * self.gamma + rews
-        self.highret = self.highret * self.gamma + high_rews
+        if self.high_ret_rms:
+            self.highret = self.highret * self.gamma + high_rews
+        
         # 归一化观测
         obs = self._obfilt(obs)
+        
         # 归一化奖励
         if self.ret_rms:
             self.ret_rms.update(self.ret)
@@ -85,20 +96,24 @@ class MultiAgentVecNormalize(VecEnvWrapper):
         if self.high_ret_rms:
             self.high_ret_rms.update(self.highret)
             high_rews = np.clip(high_rews / np.sqrt(self.high_ret_rms.var + self.epsilon), -self.cliphighrew, self.cliphighrew)
+        
+        # 🔥 重要修复：检测episode结束并重置累计回报
+        # news['agent'] 是每个环境中每个智能体的done状态
+        # shape: (num_envs, n_agents) 或 list of lists
+        agent_dones = None
+        if isinstance(news, dict) and 'agent' in news:
+            agent_dones = np.array(news['agent'])
+        elif isinstance(news, (list, np.ndarray)) and len(news) > 0 and isinstance(news[0], dict) and 'agent' in news[0]:
+            agent_dones = np.array([d['agent'] for d in news])
 
-        # # ⭐ 重置已完成环境的累计回报
-        # # 如果任一 agent done，重置该环境的所有 agent 的 ret
-        # if obs.ndim >= 2:
-        #     # 如果是多智能体，检查每个环境的所有智能体
-        #     done_envs = np.any(news['all'], axis=1, keepdims=True)  # (num_envs, 1)
-        #     done_mask = np.repeat(done_envs, self.n, axis=1)  # (num_envs, n)
-        # else:
-        #     # 单智能体情况
-        #     done_mask = news.reshape(-1, 1)
-
-        # # 清零已完成环境的累计回报
-        # self.ret = self.ret * (1 - done_mask)
-        # self.highret = self.highret * (1 - done_mask)
+        if agent_dones is not None:
+            # 判断每个环境是否所有智能体都结束
+            # all(axis=1) 表示对每个环境检查是否所有智能体都为True
+            episode_dones = np.all(agent_dones, axis=1)  # shape: (num_envs,)
+            
+            # 对于完全结束的环境，重置累计回报
+            self.ret[episode_dones] = 0.0
+            self.highret[episode_dones] = 0.0
         
         return obs, rews, high_rews, news, infos, sta
 
