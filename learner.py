@@ -76,6 +76,23 @@ def setup_master(args, env=None, return_env=False):
             # 如果有 policy2 (Friendly)，加载
             if policy2 is not None:
                 policy2.load_pretrained_low_level(args.load_low_level_path, freeze=True)
+        
+        # ================== 新增：加载预训练高层网络 ==================
+        if hasattr(args, 'load_high_level_path') and args.load_high_level_path is not None:
+            print(f"🔄 Loading pretrained high-level model from: {args.load_high_level_path}")
+            
+            if policy1 is not None:
+                policy1.load_pretrained_high_level(args.load_high_level_path, freeze=False)
+            if policy2 is not None:
+                policy2.load_pretrained_high_level(args.load_high_level_path, freeze=False)
+        
+        if hasattr(args, 'load_high_critic_path') and args.load_high_critic_path is not None:
+            print(f"🔄 Loading pretrained high-level critic from: {args.load_high_critic_path}")
+            
+            if policy1 is not None:
+                policy1.load_pretrained_high_level(args.load_high_critic_path, freeze=False)
+            if policy2 is not None:
+                policy2.load_pretrained_high_level(args.load_high_critic_path, freeze=False)
         # ============================================================
         
     master = Learner(args, [team1, team2], [policy1, policy2], env=env) # 传入并行环境

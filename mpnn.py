@@ -424,6 +424,48 @@ class MPNN(nn.Module):
         """
         # return self.load_module_checkpoint('low_level', path, strict=False, freeze=freeze)
 
+    def load_pretrained_high_level(self, path, freeze=False):
+        """
+        加载预训练的高层策略（Actor + Critic）
+        """
+        print(f"🔄 Loading high-level params from {path}...")
+        checkpoint = torch.load(path, map_location='cpu')
+        
+        high_level_state_dict = {}
+        high_critic_state_dict = {}
+        
+        # === 情况 A: 模块化 Checkpoint ===
+        if 'state_dict' in checkpoint:
+            module_name = checkpoint.get('module_name', None)
+            if module_name == 'high_level':
+                high_level_state_dict = checkpoint['state_dict']
+            elif module_name == 'high_critic':
+                high_critic_state_dict = checkpoint['state_dict']
+
+        # === 情况 B: 完整 Checkpoint ===
+        elif 'models' in checkpoint:
+            print("  Type: Full Training Checkpoint (extracting high-level params...)")
+            full_state_dict = checkpoint['models'][0]
+            
+            for key, value in full_state_dict.items():
+                if 'modules_dict.high_level.' in key:
+                    new_key = key.replace('modules_dict.high_level.', '')
+                    high_level_state_dict[new_key] = value
+                elif 'modules_dict.high_critic.' in key:
+                    new_key = key.replace('modules_dict.high_critic.', '')
+                    high_critic_state_dict[new_key] = value
+        
+        # 执行加载
+        if high_level_state_dict:
+            m, u = self.modules_dict['high_level'].load_state_dict(high_level_state_dict, strict=False)
+            print(f"  ✅ High-Level Actor loaded. Missing: {len(m)}, Unexpected: {len(u)}")
+            if freeze: self.freeze_module('high_level')
+            
+        if high_critic_state_dict:
+            m, u = self.modules_dict['high_critic'].load_state_dict(high_critic_state_dict, strict=False)
+            print(f"  ✅ High-Level Critic loaded. Missing: {len(m)}, Unexpected: {len(u)}")
+            if freeze: self.freeze_module('high_critic')
+
     def get_trainable_params_by_modules(self, module_names, learning_rates=None):
         """
         获取多个模块的参数组（用于优化器）
