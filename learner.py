@@ -977,3 +977,99 @@ class Learner(object):
     def set_train_mode(self):
         for agent in self.all_agents:
             agent.actor_critic.train()
+
+    def eval_base_act(self, obs, env_states, masks, goals, tasks, landmark_data, landmark_mask, deterministic=True):
+        # used only while evaluating policies. Assuming that agents are in order of team!
+        # goals: 上一步的目标分配 [num_agents, 2]
+        # landmark_data: 上一步的地标数据 [num_agents, max_landmarks, 4]
+        # landmark_mask: 上一步的地标掩码 [num_agents, max_landmarks, 1]
+        # 构造当前发现的landmark信息
+        # 直接按照贪婪策略执行底层策略
+        obs1 = []
+        obs2 = []
+        all_obs = []
+        for i in range(len(obs)):
+            agent = self.env.world.policy_agents[i]
+            if hasattr(agent, 'adversary') and agent.adversary:
+                obs1.append(torch.as_tensor(obs[i],dtype=torch.float,device=self.device).view(1,-1))
+            else:
+                obs2.append(torch.as_tensor(obs[i],dtype=torch.float,device=self.device).view(1,-1))
+        if len(obs1)!=0:
+            all_obs.append(obs1)
+        if len(obs2)!=0:
+            all_obs.append(obs2)
+
+        actions = []
+        # 这里需要对env_states进行处理，因为它是(env_state_dim)的形状，需要复制成(num_agent, env_state_dim)
+        env_states = torch.from_numpy(env_states).float().to(self.device)
+        for team,policy,obs in zip(self.teams_list,self.policies_list,all_obs):
+            # 默认采取之前的目标分配，[num_agents, 2]
+            all_goals = goals
+            all_tasks = tasks
+
+            num_agents = len(team)
+
+            # 1. 收集数据
+            obs_tensor = torch.cat(obs, dim=0).to(self.device) # [num_agents, obs_dim]  
+
+            # 1.4. 收集 landmark data 和 mask
+            detected_map = torch.from_numpy(np.array(self.envs_info['map'][1])).float().to(self.device)
+
+            new_detected, new_detected_masks = self.update_landmark_info(
+                landmark_data, 
+                landmark_mask, 
+                [detected_map], 
+                self.device
+            )  # [num_agents * 1, max_landmarks, 4], [num_agents * 1, max_landmarks, 1]
+
+            # 2. 生成动态异构图结构的节点表示
+            # 2.1. 输入准备，包括地图输入和向量输入
+
+            ## 从all_obs批量生成智能体信息（栅格索引） [num_processes, num_agents, 2]
+            agent_positions = obs_tensor[:, 2:4].view(1, num_agents, 2) # 位置[1, num_agents, 2]
+
+            # 根据 new_detected, new_detected_masks 进行目标分配
+            # 筛选原则：new_detected_masks 中有效的 landmark 且 is_targeted == 0
+            # 分配策略：遍历每个landmark，为其找到最近的空闲agent (task==0)
+            
+            # 记录已分配的agents，避免一个agent被分配多个landmarks
+            assigned_agents = set()
+            
+            # 遍历每个landmark，为其找到最近的空闲agent
+            for lm_idx in range(new_detected.shape[1]):  # max_landmarks
+                # 检查landmark是否有效且未被分配
+                if new_detected_masks[0, lm_idx, 0] > 0.5 and new_detected[0, lm_idx, 3] < 0.5:
+                    lm_pos = new_detected[0, lm_idx, :2]  # landmark位置 [2]
+                    
+                    # 找到最近的空闲agent
+                    min_dist = float('inf')
+                    best_agent_idx = None
+                    
+                    for agent_idx in range(num_agents):
+                        # 检查agent是否空闲 (task==0) 且未被分配
+                        if all_tasks[agent_idx, 0] < 0.5 and agent_idx not in assigned_agents:
+                            agent_pos = agent_positions[0, agent_idx]  # [2]
+                            dist = torch.norm(agent_pos - lm_pos)
+                            
+                            if dist < min_dist:
+                                min_dist = dist
+                                best_agent_idx = agent_idx
+                    
+                    # 如果找到合适的agent，进行分配
+                    if best_agent_idx is not None:
+                        all_goals[best_agent_idx] = lm_pos
+                        all_tasks[best_agent_idx, 0] = 1.0  # 设置为landmark任务
+                        # 标记该landmark为已分配（所有智能体同步更新）
+                        new_detected[:, lm_idx, 3] = 1.0
+                        # 标记该agent为已分配
+                        assigned_agents.add(best_agent_idx)
+
+            # 更新landmark数据
+            landmark_data = new_detected
+            landmark_mask = new_detected_masks
+
+            if len(obs)!=0:
+                _,action,_ = policy.low_level_act(obs_tensor, all_goals, deterministic=True)
+                actions.append(action.squeeze(1).cpu().numpy())
+
+        return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask
