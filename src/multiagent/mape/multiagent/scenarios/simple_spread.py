@@ -52,7 +52,7 @@ class Scenario(BaseScenario):
         
         # set random initial states
         for agent in world.agents:
-            agent.state.p_pos = np.random.uniform(-self.arena_size,self.arena_size,world.dim_p)
+            agent.state.p_pos = np.random.uniform(-self.arena_size+0.1, self.arena_size-0.1, world.dim_p)
             agent.state.p_vel = np.zeros(world.dim_p)
             agent.state.c = np.zeros(world.dim_c)
 
@@ -96,7 +96,6 @@ class Scenario(BaseScenario):
         dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in world.landmarks]for a in world.agents])
         # 匈牙利算法分配
         self.min_dists = self._bipartite_min_dists(dists)
-        print("min_dist:",self.min_dists)
         # 判断是否成功
         self.is_success = np.all(self.min_dists < world.dist_thres)
 

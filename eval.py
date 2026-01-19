@@ -165,6 +165,12 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     # 新增变量，用于计算成功回合的平均步数
     successful_steps_total = 0
     successful_episodes_count = 0
+    
+    # ⭐ 新增指标统计
+    all_time_to_cover_1 = []  # 覆盖第1个landmark的时间
+    all_time_to_cover_2 = []  # 覆盖第2个landmark的时间
+    all_time_to_cover_3 = []  # 覆盖第3个landmark的时间
+    all_time_to_discover_all = []  # 发现所有landmark的时间
 
     # Create evaluation-specific folder if record_video is enabled
     eval_folder = None
@@ -201,6 +207,14 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         tasks = torch.zeros((len(obs), 1), dtype=torch.long, device=args.device)
         landmark_data = torch.zeros((len(obs), args.num_agents, 4), dtype=torch.float32, device=args.device)
         landmark_mask = torch.zeros((len(obs), args.num_agents, 1), dtype=torch.float32, device=args.device)
+        
+        # ⭐ 跟踪发现和覆盖状态
+        discovered_landmarks = set()  # 已发现的landmark索引
+        covered_landmarks = set()  # 已覆盖的landmark索引
+        time_to_discover_all = None  # 发现所有landmark的时间
+        time_to_cover_1 = None  # 覆盖第1个landmark的时间
+        time_to_cover_2 = None  # 覆盖第2个landmark的时间
+        time_to_cover_3 = None  # 覆盖第3个landmark的时间
 
         # Initial render for GIF saving (if needed)
         if should_save_gif:
@@ -240,7 +254,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         while not np.all(done):
             actions = []
             with torch.no_grad():
-                print("step:", info['world_steps'])
+                # print("step:", info['world_steps'])
                 actions, goals, tasks, landmark_data, landmark_mask, graph_data = master.eval_act(obs, env_states, masks,
                                                                                       goals, tasks, 
                                                                                       landmark_data, 
@@ -261,6 +275,42 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             master.envs_info = info
             episode_rewards += reward.cpu().numpy()
             episode_high_rewards += high_reward.cpu().numpy()
+            
+            # ⭐ 跟踪发现状态（基于sensor_range内的检测）
+            if hasattr(args, 'mask_obs_dist'):
+                sensor_range = args.mask_obs_dist
+                for lm_idx, landmark in enumerate(env.world.landmarks):
+                    lm_pos = landmark.state.p_pos
+                    for agent in env.agents:
+                        if np.linalg.norm(agent.state.p_pos - lm_pos) < sensor_range:
+                            discovered_landmarks.add(lm_idx)
+                            break
+            
+            # ⭐ 记录发现所有landmark的时间（首次）
+            if time_to_discover_all is None and len(discovered_landmarks) == len(env.world.landmarks):
+                time_to_discover_all = episode_steps
+            
+            # ⭐ 跟踪覆盖状态
+            if hasattr(env, 'visited_landmarks'):
+                current_covered = set(env.visited_landmarks) if isinstance(env.visited_landmarks, list) else env.visited_landmarks
+            elif hasattr(env, 'landmark_visited'):
+                current_covered = set([i for i, v in enumerate(env.landmark_visited) if v])
+            else:
+                current_covered = set()
+            
+            # ⭐ 更新覆盖状态并记录时间戳
+            new_covered = current_covered - covered_landmarks
+            if new_covered:
+                covered_landmarks.update(new_covered)
+                num_covered = len(covered_landmarks)
+                
+                # 记录覆盖第1/2/3个landmark的时间
+                if num_covered == 1 and time_to_cover_1 is None:
+                    time_to_cover_1 = episode_steps
+                elif num_covered == 2 and time_to_cover_2 is None:
+                    time_to_cover_2 = episode_steps
+                elif num_covered == 3 and time_to_cover_3 is None:
+                    time_to_cover_3 = episode_steps
             
             # Render for GIF saving (if needed)
             if should_save_gif:
@@ -313,6 +363,12 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         if info['is_success']:
             successful_steps_total += info['n'][0]['world_steps']
             successful_episodes_count += 1
+        
+        # ⭐ 记录新增指标
+        all_time_to_cover_1.append(time_to_cover_1 if time_to_cover_1 is not None else episode_steps)
+        all_time_to_cover_2.append(time_to_cover_2 if time_to_cover_2 is not None else episode_steps)
+        all_time_to_cover_3.append(time_to_cover_3 if time_to_cover_3 is not None else episode_steps)
+        all_time_to_discover_all.append(time_to_discover_all if time_to_discover_all is not None else episode_steps)
 
         # for simple spread env only
         if args.env_name == 'simple_spread':
@@ -359,7 +415,9 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     if successful_episodes_count > 0:
         successful_average_length = successful_steps_total / successful_episodes_count
 
-    return all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count
+    return (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
+            final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
+            all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all)
 
 
 if __name__ == '__main__':
@@ -367,11 +425,26 @@ if __name__ == '__main__':
     checkpoint = torch.load(args.load_dir, map_location=lambda storage, loc: storage)
     policies_list = checkpoint['models']
     ob_rms = checkpoint['ob_rms']
-    all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count = evaluate(args, args.seed, 
-                    policies_list, ob_rms, args.render, render_attn=args.masking)
-    print("Average Per Step Reward {}\nNum Success {}/{} | Av. Episode Length {:.2f})"
-            .format(per_step_rewards.mean(0),num_success,args.num_eval_episodes,episode_length))
-    print("Successful Episodes Average Length: {:.2f} ({}/{} episodes)"
-            .format(successful_average_length, successful_episodes_count, args.num_eval_episodes))
+    (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
+     final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
+     all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all) = evaluate(
+        args, args.seed, policies_list, ob_rms, args.render, render_attn=args.masking)
+    
+    print("\n" + "="*60)
+    print("EVALUATION SUMMARY")
+    print("="*60)
+    print(f"Average Per Step Reward: {per_step_rewards.mean(0)}")
+    print(f"\n【任务完成率】")
+    print(f"  Success Rate: {num_success/args.num_eval_episodes*100:.1f}% ({num_success}/{args.num_eval_episodes})")
+    print(f"  Successful Episodes Avg Length: {successful_average_length:.2f} ({successful_episodes_count}/{args.num_eval_episodes})")
+    print(f"\n【覆盖时间】")
+    print(f"  Cover 1st Landmark: {np.mean(all_time_to_cover_1):.2f} ± {np.std(all_time_to_cover_1):.2f} steps")
+    print(f"  Cover 2nd Landmark: {np.mean(all_time_to_cover_2):.2f} ± {np.std(all_time_to_cover_2):.2f} steps")
+    print(f"  Cover 3rd Landmark: {np.mean(all_time_to_cover_3):.2f} ± {np.std(all_time_to_cover_3):.2f} steps")
+    print(f"\n【发现时间】")
+    print(f"  Discover All Landmarks: {np.mean(all_time_to_discover_all):.2f} ± {np.std(all_time_to_discover_all):.2f} steps")
+    print(f"\n【总体性能】")
+    print(f"  Average Episode Length: {episode_length:.2f} steps")
     if final_min_dists:
-        print("Final Min Dists {}".format(np.stack(final_min_dists).mean(0)))
+        print(f"  Final Min Dists: {np.stack(final_min_dists).mean(0)}")
+    print("="*60)
