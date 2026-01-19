@@ -140,6 +140,12 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     all_success_rates = []
     all_steps = []
     
+    # ⭐ 新增指标统计
+    all_time_to_cover_1 = []  # 覆盖第1个landmark的时间
+    all_time_to_cover_2 = []  # 覆盖第2个landmark的时间
+    all_time_to_cover_3 = []  # 覆盖第3个landmark的时间
+    all_time_to_discover_all = []  # 发现所有landmark的时间
+    
     for episode in range(num_eval_episodes):
         print(f"\n--- Episode {episode + 1}/{num_eval_episodes} ---")
         
@@ -211,6 +217,14 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         tasks = torch.zeros((len(obs), 1), dtype=torch.long, device=args.device)
         landmark_data = torch.zeros((len(obs), args.num_agents, 4), dtype=torch.float32, device=args.device)
         landmark_mask = torch.zeros((len(obs), args.num_agents, 1), dtype=torch.float32, device=args.device)
+        
+        # ⭐ 跟踪发现和覆盖状态
+        discovered_landmarks = set()  # 已发现的landmark索引
+        covered_landmarks = set()  # 已覆盖的landmark索引
+        time_to_discover_all = None  # 发现所有landmark的时间
+        time_to_cover_1 = None  # 覆盖第1个landmark的时间
+        time_to_cover_2 = None  # 覆盖第2个landmark的时间
+        time_to_cover_3 = None  # 覆盖第3个landmark的时间
         
         # Execute trajectory
         for t in range(max_traj_len):
@@ -288,8 +302,41 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             # Count visited targets
             if hasattr(env, 'visited_landmarks'):
                 num_visited = len(env.visited_landmarks)
+                current_covered = set(env.visited_landmarks) if isinstance(env.visited_landmarks, list) else env.visited_landmarks
             elif hasattr(env, 'landmark_visited'):
                 num_visited = sum(env.landmark_visited)
+                current_covered = set([i for i, v in enumerate(env.landmark_visited) if v])
+            else:
+                num_visited = 0
+                current_covered = set()
+            
+            # ⭐ 跟踪发现状态（基于sensor_range内的检测）
+            for lm_idx, landmark in enumerate(env.world.landmarks):
+                lm_pos = landmark.state.p_pos
+                for agent in env.agents:
+                    if np.linalg.norm(agent.state.p_pos - lm_pos) < config.sensor_range:
+                        discovered_landmarks.add(lm_idx)
+                        break
+            
+            # ⭐ 记录发现所有landmark的时间（首次）
+            if time_to_discover_all is None and len(discovered_landmarks) == config.num_targets:
+                time_to_discover_all = step
+                print(f"  ✓ All landmarks discovered at step {step}")
+            
+            # ⭐ 更新覆盖状态并记录时间戳
+            new_covered = current_covered - covered_landmarks
+            if new_covered:
+                covered_landmarks.update(new_covered)
+                num_covered = len(covered_landmarks)
+                print(f"  ✓ Covered {num_covered} landmark(s) at step {step}")
+                
+                # 记录覆盖第1/2/3个landmark的时间
+                if num_covered == 1 and time_to_cover_1 is None:
+                    time_to_cover_1 = step
+                elif num_covered == 2 and time_to_cover_2 is None:
+                    time_to_cover_2 = step
+                elif num_covered == 3 and time_to_cover_3 is None:
+                    time_to_cover_3 = step
             
             # Render frame
             if render and episode < 5:  # Save GIF for first 5 episodes
@@ -318,7 +365,15 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         is_success = info.get('is_success', False)
         all_success_rates.append(1.0 if is_success else 0.0)
         
+        # ⭐ 记录新增指标
+        all_time_to_cover_1.append(time_to_cover_1 if time_to_cover_1 is not None else step)
+        all_time_to_cover_2.append(time_to_cover_2 if time_to_cover_2 is not None else step)
+        all_time_to_cover_3.append(time_to_cover_3 if time_to_cover_3 is not None else step)
+        all_time_to_discover_all.append(time_to_discover_all if time_to_discover_all is not None else step)
+        
         print(f"Episode complete: Steps={step}, Success={is_success}, Visited={num_visited}/{config.num_targets}")
+        print(f"  Discovered all at: {time_to_discover_all if time_to_discover_all else 'N/A'}")
+        print(f"  Covered: 1st={time_to_cover_1}, 2nd={time_to_cover_2}, 3rd={time_to_cover_3}")
         
         # Save GIF
         if render and episode < 5 and frames:
@@ -332,14 +387,26 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     print("="*60)
     print(f"Episodes: {num_eval_episodes}")
     print(f"Average ET: {np.mean(all_et_values):.4f} ± {np.std(all_et_values):.4f}")
-    print(f"Success Rate: {np.mean(all_success_rates)*100:.1f}%")
-    print(f"Average Steps: {np.mean(all_steps):.2f} ± {np.std(all_steps):.2f}")
+    print(f"\n【任务完成率】")
+    print(f"  Success Rate: {np.mean(all_success_rates)*100:.1f}% ({int(np.sum(all_success_rates))}/{num_eval_episodes})")
+    print(f"\n【覆盖时间】")
+    print(f"  Cover 1st Landmark: {np.mean(all_time_to_cover_1):.2f} ± {np.std(all_time_to_cover_1):.2f} steps")
+    print(f"  Cover 2nd Landmark: {np.mean(all_time_to_cover_2):.2f} ± {np.std(all_time_to_cover_2):.2f} steps")
+    print(f"  Cover 3rd Landmark: {np.mean(all_time_to_cover_3):.2f} ± {np.std(all_time_to_cover_3):.2f} steps")
+    print(f"\n【发现时间】")
+    print(f"  Discover All Landmarks: {np.mean(all_time_to_discover_all):.2f} ± {np.std(all_time_to_discover_all):.2f} steps")
+    print(f"\n【总体性能】")
+    print(f"  Average Episode Length: {np.mean(all_steps):.2f} ± {np.std(all_steps):.2f} steps")
     print("="*60)
     
     return {
         'et_values': all_et_values,
         'success_rates': all_success_rates,
-        'steps': all_steps
+        'steps': all_steps,
+        'time_to_cover_1': all_time_to_cover_1,
+        'time_to_cover_2': all_time_to_cover_2,
+        'time_to_cover_3': all_time_to_cover_3,
+        'time_to_discover_all': all_time_to_discover_all
     }
 
 
