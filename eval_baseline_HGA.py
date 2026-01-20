@@ -145,6 +145,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     all_time_to_cover_2 = []  # 覆盖第2个landmark的时间
     all_time_to_cover_3 = []  # 覆盖第3个landmark的时间
     all_time_to_discover_all = []  # 发现所有landmark的时间
+    all_avg_velocities = []  # 每个episode的agent平均速度
     
     for episode in range(num_eval_episodes):
         print(f"\n--- Episode {episode + 1}/{num_eval_episodes} ---")
@@ -226,6 +227,10 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         time_to_cover_2 = None  # 覆盖第2个landmark的时间
         time_to_cover_3 = None  # 覆盖第3个landmark的时间
         
+        # ⭐ 跟踪速度信息
+        velocity_sum = 0.0  # 累积所有agent的速度
+        velocity_count = 0  # 速度采样次数
+        
         # Execute trajectory
         for t in range(max_traj_len):
             # 在这里收集是否观测到landmark的数据，如果有观测到则更新belief map
@@ -299,6 +304,13 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             master.envs_info = info
             step += 1
             
+            # ⭐ 累积速度信息（obs前2维是速度[vx, vy]）
+            for agent_obs in obs:
+                vx, vy = agent_obs[0], agent_obs[1]
+                speed = np.sqrt(vx**2 + vy**2)
+                velocity_sum += speed
+                velocity_count += 1
+            
             # Count visited targets
             if hasattr(env, 'visited_landmarks'):
                 num_visited = len(env.visited_landmarks)
@@ -371,6 +383,10 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         all_time_to_cover_3.append(time_to_cover_3 if time_to_cover_3 is not None else step)
         all_time_to_discover_all.append(time_to_discover_all if time_to_discover_all is not None else step)
         
+        # ⭐ 计算并记录平均速度
+        avg_velocity = velocity_sum / velocity_count if velocity_count > 0 else 0.0
+        all_avg_velocities.append(avg_velocity)
+        
         print(f"Episode complete: Steps={step}, Success={is_success}, Visited={num_visited}/{config.num_targets}")
         print(f"  Discovered all at: {time_to_discover_all if time_to_discover_all else 'N/A'}")
         print(f"  Covered: 1st={time_to_cover_1}, 2nd={time_to_cover_2}, 3rd={time_to_cover_3}")
@@ -395,6 +411,8 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     print(f"  Cover 3rd Landmark: {np.mean(all_time_to_cover_3):.2f} ± {np.std(all_time_to_cover_3):.2f} steps")
     print(f"\n【发现时间】")
     print(f"  Discover All Landmarks: {np.mean(all_time_to_discover_all):.2f} ± {np.std(all_time_to_discover_all):.2f} steps")
+    print(f"\n【运动性能】")
+    print(f"  Average Velocity: {np.mean(all_avg_velocities):.4f} ± {np.std(all_avg_velocities):.4f} units/step")
     print(f"\n【总体性能】")
     print(f"  Average Episode Length: {np.mean(all_steps):.2f} ± {np.std(all_steps):.2f} steps")
     print("="*60)
@@ -406,7 +424,8 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         'time_to_cover_1': all_time_to_cover_1,
         'time_to_cover_2': all_time_to_cover_2,
         'time_to_cover_3': all_time_to_cover_3,
-        'time_to_discover_all': all_time_to_discover_all
+        'time_to_discover_all': all_time_to_discover_all,
+        'avg_velocities': all_avg_velocities
     }
 
 
