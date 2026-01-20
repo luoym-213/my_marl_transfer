@@ -1073,3 +1073,104 @@ class Learner(object):
                 actions.append(action.squeeze(1).cpu().numpy())
 
         return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask
+
+    def eval_base_act_HGA(self, obs, env_states, masks, goals, tasks, landmark_data, landmark_mask, deterministic=True):
+        # used only while evaluating policies. Assuming that agents are in order of team!
+        # goals: 上一步的目标分配 [num_agents, 2]
+        # landmark_data: 上一步的地标数据 [num_agents, max_landmarks, 4]
+        # landmark_mask: 上一步的地标掩码 [num_agents, max_landmarks, 1]
+        # 构造当前发现的landmark信息
+        # 使用匈牙利算法（Hungarian Algorithm）分配landmark，仅在所有landmark都被发现后执行
+        
+        from scipy.optimize import linear_sum_assignment
+        
+        obs1 = []
+        obs2 = []
+        all_obs = []
+        for i in range(len(obs)):
+            agent = self.env.world.policy_agents[i]
+            if hasattr(agent, 'adversary') and agent.adversary:
+                obs1.append(torch.as_tensor(obs[i],dtype=torch.float,device=self.device).view(1,-1))
+            else:
+                obs2.append(torch.as_tensor(obs[i],dtype=torch.float,device=self.device).view(1,-1))
+        if len(obs1)!=0:
+            all_obs.append(obs1)
+        if len(obs2)!=0:
+            all_obs.append(obs2)
+
+        actions = []
+        # 这里需要对env_states进行处理，因为它是(env_state_dim)的形状，需要复制成(num_agent, env_state_dim)
+        env_states = torch.from_numpy(env_states).float().to(self.device)
+        for team,policy,obs in zip(self.teams_list,self.policies_list,all_obs):
+            # 默认采取之前的目标分配，[num_agents, 2]
+            all_goals = goals
+            all_tasks = tasks
+
+            num_agents = len(team)
+
+            # 1. 收集数据
+            obs_tensor = torch.cat(obs, dim=0).to(self.device) # [num_agents, obs_dim]  
+
+            # 1.4. 收集 landmark data 和 mask
+            detected_map = torch.from_numpy(np.array(self.envs_info['map'][1])).float().to(self.device)
+
+            new_detected, new_detected_masks = self.update_landmark_info(
+                landmark_data, 
+                landmark_mask, 
+                [detected_map], 
+                self.device
+            )  # [num_agents * 1, max_landmarks, 4], [num_agents * 1, max_landmarks, 1]
+
+            ## 从all_obs批量生成智能体信息（栅格索引） [num_processes, num_agents, 2]
+            agent_positions = obs_tensor[:, 2:4].view(1, num_agents, 2) # 位置[1, num_agents, 2]
+
+            # ⭐ 匈牙利算法分配逻辑
+            # 1. 统计有效的landmarks数量
+            valid_landmarks = []
+            valid_landmark_indices = []
+            for lm_idx in range(new_detected.shape[1]):
+                if new_detected_masks[0, lm_idx, 0] > 0.5:
+                    valid_landmarks.append(new_detected[0, lm_idx, :2])  # 保存位置 [2]
+                    valid_landmark_indices.append(lm_idx)
+            
+            num_valid_landmarks = len(valid_landmarks)
+            expected_num_landmarks = len(self.env.world.landmarks) if hasattr(self.env.world, 'landmarks') else num_agents
+            
+            # 2. 只有当所有landmark都被发现时，才执行匈牙利算法分配
+            if num_valid_landmarks == expected_num_landmarks and num_valid_landmarks > 0:
+                # 构建成本矩阵 [num_agents, num_landmarks]
+                cost_matrix = np.zeros((num_agents, num_valid_landmarks))
+                
+                for agent_idx in range(num_agents):
+                    agent_pos = agent_positions[0, agent_idx].cpu().numpy()  # [2]
+                    for lm_idx, lm_pos in enumerate(valid_landmarks):
+                        lm_pos_np = lm_pos.cpu().numpy()  # [2]
+                        cost_matrix[agent_idx, lm_idx] = np.linalg.norm(agent_pos - lm_pos_np)
+                
+                # 3. 使用匈牙利算法求解最优分配
+                agent_indices, landmark_indices = linear_sum_assignment(cost_matrix)
+                
+                # 4. 根据分配结果更新goals和tasks
+                for agent_idx, lm_idx in zip(agent_indices, landmark_indices):
+                    actual_lm_idx = valid_landmark_indices[lm_idx]  # 映射回原始landmark索引
+                    lm_pos = new_detected[0, actual_lm_idx, :2]
+                    
+                    all_goals[agent_idx] = lm_pos
+                    all_tasks[agent_idx, 0] = 1.0  # 设置为landmark任务
+                    # 标记该landmark为已分配（所有智能体同步更新）
+                    new_detected[:, actual_lm_idx, 3] = 1.0
+                
+                print(f"✅ Hungarian Assignment: Total cost = {cost_matrix[agent_indices, landmark_indices].sum():.4f}")
+            else:
+                # 如果还没发现所有landmark，保持当前goals不变（继续探索）
+                print(f"⏳ Waiting for all landmarks: {num_valid_landmarks}/{expected_num_landmarks} discovered")
+
+            # 更新landmark数据
+            landmark_data = new_detected
+            landmark_mask = new_detected_masks
+
+            if len(obs)!=0:
+                _,action,_ = policy.low_level_act(obs_tensor, all_goals, deterministic=True)
+                actions.append(action.squeeze(1).cpu().numpy())
+
+        return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask
