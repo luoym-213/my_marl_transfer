@@ -171,6 +171,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     all_time_to_cover_2 = []  # 覆盖第2个landmark的时间
     all_time_to_cover_3 = []  # 覆盖第3个landmark的时间
     all_time_to_discover_all = []  # 发现所有landmark的时间
+    all_avg_velocities = []  # 每个episode的agent平均速度
 
     # Create evaluation-specific folder if record_video is enabled
     eval_folder = None
@@ -215,6 +216,10 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         time_to_cover_1 = None  # 覆盖第1个landmark的时间
         time_to_cover_2 = None  # 覆盖第2个landmark的时间
         time_to_cover_3 = None  # 覆盖第3个landmark的时间
+        
+        # ⭐ 跟踪速度信息
+        velocity_sum = 0.0  # 累积所有agent的速度
+        velocity_count = 0  # 速度采样次数
 
         # Initial render for GIF saving (if needed)
         if should_save_gif:
@@ -275,6 +280,13 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             master.envs_info = info
             episode_rewards += reward.cpu().numpy()
             episode_high_rewards += high_reward.cpu().numpy()
+            
+            # ⭐ 累积速度信息（obs前2维是速度[vx, vy]）
+            for agent_obs in obs:
+                vx, vy = agent_obs[0], agent_obs[1]
+                speed = np.sqrt(vx**2 + vy**2)
+                velocity_sum += speed
+                velocity_count += 1
             
             # ⭐ 跟踪发现状态（基于sensor_range内的检测）
             if hasattr(args, 'mask_obs_dist'):
@@ -369,6 +381,10 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         all_time_to_cover_2.append(time_to_cover_2 if time_to_cover_2 is not None else episode_steps)
         all_time_to_cover_3.append(time_to_cover_3 if time_to_cover_3 is not None else episode_steps)
         all_time_to_discover_all.append(time_to_discover_all if time_to_discover_all is not None else episode_steps)
+        
+        # ⭐ 计算并记录平均速度
+        avg_velocity = velocity_sum / velocity_count if velocity_count > 0 else 0.0
+        all_avg_velocities.append(avg_velocity)
 
         # for simple spread env only
         if args.env_name == 'simple_spread':
@@ -417,7 +433,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
 
     return (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
             final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
-            all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all)
+            all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all, all_avg_velocities)
 
 
 if __name__ == '__main__':
@@ -427,7 +443,7 @@ if __name__ == '__main__':
     ob_rms = checkpoint['ob_rms']
     (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
      final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
-     all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all) = evaluate(
+     all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all, all_avg_velocities) = evaluate(
         args, args.seed, policies_list, ob_rms, args.render, render_attn=args.masking)
     
     print("\n" + "="*60)
@@ -443,6 +459,8 @@ if __name__ == '__main__':
     print(f"  Cover 3rd Landmark: {np.mean(all_time_to_cover_3):.2f} ± {np.std(all_time_to_cover_3):.2f} steps")
     print(f"\n【发现时间】")
     print(f"  Discover All Landmarks: {np.mean(all_time_to_discover_all):.2f} ± {np.std(all_time_to_discover_all):.2f} steps")
+    print(f"\n【运动性能】")
+    print(f"  Average Velocity: {np.mean(all_avg_velocities):.4f} ± {np.std(all_avg_velocities):.4f} units/step")
     print(f"\n【总体性能】")
     print(f"  Average Episode Length: {episode_length:.2f} steps")
     if final_min_dists:
