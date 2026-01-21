@@ -257,6 +257,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             # Convert to actions (velocity to reach planned position)
             # Match environment's velocity scale: base_velocity * sensitivity(5.0)
             # We provide base velocity (unit direction scaled), environment multiplies by 5.0
+            speed_scale = 0.6
             for i, agent in enumerate(env.agents):
                 if i < len(planned_positions) and not tasks[i]:
                     target_pos = planned_positions[i]
@@ -271,7 +272,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
                         # Apply max action (1.0) to track the plan
                         # Scale down if very close to avoid overshoot
                         # MPE applies Force = Action * 5.0
-                        scale = min(1.0, distance / config.max_speed)
+                        scale = min(speed_scale, distance / config.max_speed)
                         actions[i] = direction * scale
                     else:
                         actions[i] = np.zeros(2)
@@ -285,7 +286,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
                     elif idx == 2: u[0] = +1.0
                     elif idx == 3: u[1] = -1.0
                     elif idx == 4: u[1] = +1.0
-                    actions[i] = u
+                    actions[i] = u * speed_scale
             
             # Step environment
             # Ensure goals and tasks are numpy arrays for the environment interaction
