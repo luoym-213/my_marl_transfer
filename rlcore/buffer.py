@@ -15,13 +15,13 @@ class LowLevelBuffer:
         self.obs_buf = np.zeros((self.capacity, num_agents, obs_dim), dtype=np.float32)
         self.goal_buf = np.zeros((self.capacity, num_agents, goal_dim), dtype=np.float32)
         self.act_buf = np.zeros((self.capacity, num_agents, act_dim), dtype=np.float32)
-        self.global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.float32)
+        self.global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.uint8)
         
         # Reward 通常是 [Capacity, num_agents, 1] (每个智能体有自己的奖励)
         self.rew_buf = np.zeros((self.capacity, num_agents, 1), dtype=np.float32)
         
         self.next_obs_buf = np.zeros((self.capacity, num_agents, obs_dim), dtype=np.float32)
-        self.next_global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.float32)
+        self.next_global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.uint8)
         
         # Done 通常是 [Capacity, num_agents, 1] 或者是 [Capacity, 1] (取决于环境是各自结束还是一起结束)
         # MPE通常是一起结束，但为了兼容性，保留 N 维度
@@ -131,17 +131,14 @@ class HighLevelBuffer:
 
         # 1. state components
         # Shape: [Capacity, global_state_dim]: belief map 
-        self.global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.float32)
+        self.global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.uint8)
         
         # Shape: [Capacity, num_agents, obs_dim]（每个智能体的局部观察）
         self.obs_buf = np.zeros((self.capacity, num_agents, obs_dim), dtype=np.float32)
         
-        # Shape: [Capacity, H, W]（访问地图）
-        self.visited_map_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.float32)
-        
         # 2. action components
         # Shape: [Capacity, num_agents, H, W]（可达区域 R_u）
-        self.R_u_buf = np.zeros((self.capacity, num_agents, map_height, map_width), dtype=np.float32)
+        self.R_u_buf = np.zeros((self.capacity, num_agents, map_height, map_width), dtype=np.uint8)
 
         # Shape: [Capacity, num_agents, g_dim]（每个智能体的任务向量）动作
         self.g_u_buf = np.zeros((self.capacity, num_agents, g_dim), dtype=np.float32)
@@ -152,29 +149,26 @@ class HighLevelBuffer:
         
         # 4. next state components
         # 下一状态
-        self.next_global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.float32)
+        self.next_global_state_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.uint8)
         self.next_obs_buf = np.zeros((self.capacity, num_agents, obs_dim), dtype=np.float32)
-        self.next_visited_map_buf = np.zeros((self.capacity, map_height, map_width), dtype=np.float32)
         
         # 5. done components
         # Shape: [Capacity, num_agents, 1]（是否结束）
         self.done_buf = np.zeros((self.capacity, num_agents, 1), dtype=np.float32)
 
-    def add_batch(self, global_state, obs, visited_map, R_u, g_u, rew, 
-                  next_global_state, next_obs, next_visited_map, done):
+    def add_batch(self, global_state, obs, R_u, g_u, rew, 
+                  next_global_state, next_obs, done):
         """
         批量添加经验数据
         
         参数:
             global_state: 全局状态，形状 (batch_size, map_height, map_width)
             obs: 局部观察，形状 (batch_size, num_agents, obs_dim)
-            visited_map: 访问地图，形状 (batch_size, map_height, map_width)
             R_u: 可达区域，形状 (batch_size, num_agents, map_height, map_width)
             g_u: 任务向量，形状 (batch_size, num_agents, g_dim)
             rew: 奖励，形状 (batch_size, num_agents, 1)
             next_global_state: 下一全局状态，形状 (batch_size, map_height, map_width)
             next_obs: 下一局部观察，形状 (batch_size, num_agents, obs_dim)
-            next_visited_map: 下一访问地图，形状 (batch_size, map_height, map_width)
             done: 结束标志，形状 (batch_size, num_agents, 1)
          说明:
             1. 这里假设传入的 rew 和 done 是二维的 (batch_size, 1)，如果是一维的，需要在调用前扩展维度。
@@ -187,13 +181,11 @@ class HighLevelBuffer:
         if idx_end <= self.capacity:
             self.global_state_buf[self.ptr : idx_end] = global_state
             self.obs_buf[self.ptr : idx_end] = obs
-            self.visited_map_buf[self.ptr : idx_end] = visited_map
             self.R_u_buf[self.ptr : idx_end] = R_u
             self.g_u_buf[self.ptr : idx_end] = g_u
             self.rew_buf[self.ptr : idx_end] = rew
             self.next_global_state_buf[self.ptr : idx_end] = next_global_state
             self.next_obs_buf[self.ptr : idx_end] = next_obs
-            self.next_visited_map_buf[self.ptr : idx_end] = next_visited_map
             self.done_buf[self.ptr : idx_end] = done
         else:
             # 处理循环覆盖的逻辑
@@ -203,25 +195,21 @@ class HighLevelBuffer:
             # 先填末尾 [ptr, capacity)
             self.global_state_buf[self.ptr : self.capacity] = global_state[:remain]
             self.obs_buf[self.ptr : self.capacity] = obs[:remain]
-            self.visited_map_buf[self.ptr : self.capacity] = visited_map[:remain]
             self.R_u_buf[self.ptr : self.capacity] = R_u[:remain]
             self.g_u_buf[self.ptr : self.capacity] = g_u[:remain]
             self.rew_buf[self.ptr : self.capacity] = rew[:remain]
             self.next_global_state_buf[self.ptr : self.capacity] = next_global_state[:remain]
             self.next_obs_buf[self.ptr : self.capacity] = next_obs[:remain]
-            self.next_visited_map_buf[self.ptr : self.capacity] = next_visited_map[:remain]
             self.done_buf[self.ptr : self.capacity] = done[:remain]
             
             # 再填开头 [0, overflow)
             self.global_state_buf[0 : overflow] = global_state[remain:]
             self.obs_buf[0 : overflow] = obs[remain:]
-            self.visited_map_buf[0 : overflow] = visited_map[remain:]
             self.R_u_buf[0 : overflow] = R_u[remain:]
             self.g_u_buf[0 : overflow] = g_u[remain:]
             self.rew_buf[0 : overflow] = rew[remain:]
             self.next_global_state_buf[0 : overflow] = next_global_state[remain:]
             self.next_obs_buf[0 : overflow] = next_obs[remain:]
-            self.next_visited_map_buf[0 : overflow] = next_visited_map[remain:]
             self.done_buf[0 : overflow] = done[remain:]
 
         self.ptr = (self.ptr + batch_size) % self.capacity
@@ -239,13 +227,11 @@ class HighLevelBuffer:
         data = {
             'global_state': self._to_tensor(self.global_state_buf[idxs]),
             'obs': self._to_tensor(self.obs_buf[idxs]),
-            'visited_map': self._to_tensor(self.visited_map_buf[idxs]),
             'R_u': self._to_tensor(self.R_u_buf[idxs]),
             'g_u': self._to_tensor(self.g_u_buf[idxs]),
             'rew': self._to_tensor(self.rew_buf[idxs]),
             'next_global_state': self._to_tensor(self.next_global_state_buf[idxs]),
             'next_obs': self._to_tensor(self.next_obs_buf[idxs]),
-            'next_visited_map': self._to_tensor(self.next_visited_map_buf[idxs]),
             'done': self._to_tensor(self.done_buf[idxs])
         }
         

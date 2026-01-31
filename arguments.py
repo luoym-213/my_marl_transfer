@@ -127,9 +127,8 @@ def get_args():
     # raise warning if save directory already exists
     if not args.test:
         if os.path.exists(args.save_dir):
-            print(args.save_dir)
             if args.save_dir == '../marlsave/save_new/test':
-                print('\nWarning: deleting existing test directory...')
+                print("Warning: \"test\" already exists!")
                 shutil.rmtree(args.save_dir)
             else:
                 print('\nSave directory exists already! Enter')

@@ -98,9 +98,9 @@ def setup_master(args, env=None, return_env=False):
                 policy2.load_pretrained_high_level(args.load_high_critic_path, freeze=False)
         # ============================================================
     
-    low_buffer = LowLevelBuffer(10e6, args.num_agents, obs_dim, action_space.n, args.goal_dim, device=args.device)
+    low_buffer = LowLevelBuffer(10e6, args.num_agents, obs_dim, action_space.n, args.goal_dim, map_height=100, map_width=100, device=args.device)
 
-    high_buffer = HighLevelBuffer(10e5, args.num_agents, obs_dim, action_space.n, args.goal_dim, device=args.device)
+    high_buffer = HighLevelBuffer(10e5, args.num_agents, obs_dim, args.goal_dim, map_height=100, map_width=100, device=args.device)
         
     master = Learner(args, [team1, team2], [policy1, policy2], low_buffer, high_buffer, env=env) # 传入并行环境
     
@@ -1042,32 +1042,47 @@ class Learner(object):
             agent.update_rollout(agent_obs, reward[:,i].unsqueeze(1), high_rewards[:,i].unsqueeze(1), 
                                  masks[:,i].unsqueeze(1), env_state_t, goal_dones[:,i].unsqueeze(1))
     
-    def update_high_buffer(self, belief_map, obs, visited_map, R_u, g_u, high_rew, 
-                           next_belief_map, next_obs, next_visited_map, done):
-        belief_map_t = torch.from_numpy(belief_map).float().to(self.device)
-        obs_t = torch.from_numpy(obs).float().to(self.device)
-        visited_map_t = torch.from_numpy(visited_map).float().to(self.device)
-        R_u_t = torch.from_numpy(R_u).float().to(self.device)
-        g_u_t = torch.from_numpy(g_u).float().to(self.device)
-        next_belief_map_t = torch.from_numpy(next_belief_map).float().  to(self.device)
-        next_obs_t = torch.from_numpy(next_obs).float().to(self.device)
-        next_visited_map_t = torch.from_numpy(next_visited_map).float().to(self.device)
-        done_t = torch.from_numpy(done).float().to(self.device)
+    def update_high_buffer(self, belief_map, obs, R_u, g_u, high_rew, 
+                           next_belief_map, next_obs, done):
+        if isinstance(belief_map, torch.Tensor):
+            belief_map = belief_map.cpu().numpy()
+        if isinstance(obs, torch.Tensor):
+            obs = obs.cpu().numpy()
+        if isinstance(R_u, torch.Tensor):
+            R_u = R_u.cpu().numpy()
+        if isinstance(g_u, torch.Tensor):
+            g_u = g_u.cpu().numpy()
+        if isinstance(high_rew, torch.Tensor):
+            high_rew = high_rew.cpu().numpy()
+        if isinstance(next_belief_map, torch.Tensor):
+            next_belief_map = next_belief_map.cpu().numpy()
+        if isinstance(next_obs, torch.Tensor):
+            next_obs = next_obs.cpu().numpy()
+        if isinstance(done, torch.Tensor):
+            done = done.cpu().numpy()
         
-        self.high_buffer.add_batch(belief_map_t, obs_t, visited_map_t, R_u_t, g_u_t, high_rew,
-                             next_belief_map_t, next_obs_t, next_visited_map_t, done_t)
+        self.high_buffer.add_batch(belief_map, obs, R_u, g_u, high_rew[..., np.newaxis],
+                             next_belief_map, next_obs, done[..., np.newaxis])
         
     def update_low_buffer(self, obs, belief_map, goal, act_t, reward, next_obs, next_belief_map, done):
-        obs_t = torch.from_numpy(obs).float().to(self.device)
-        belief_map_t = torch.from_numpy(belief_map).float().to(self.device)
-        act_t = torch.from_numpy(act_t).float().to(self.device)
-        goal_t = torch.from_numpy(goal).float().to(self.device)
-        reward_t = torch.from_numpy(reward).float().to(self.device)
-        next_obs_t = torch.from_numpy(next_obs).float().to(self.device)
-        next_belief_map_t = torch.from_numpy(next_belief_map).float().to(self.device)
-        done_t = torch.from_numpy(done).float().to(self.device)
+        if isinstance(obs, torch.Tensor):
+            obs = obs.cpu().numpy()
+        if isinstance(belief_map, torch.Tensor):
+            belief_map = belief_map.cpu().numpy()
+        if isinstance(goal, torch.Tensor):
+            goal = goal.cpu().numpy()
+        if isinstance(act_t, torch.Tensor):
+            act_t = act_t.cpu().numpy()
+        if isinstance(reward, torch.Tensor):
+            reward = reward.cpu().numpy()
+        if isinstance(next_obs, torch.Tensor):
+            next_obs = next_obs.cpu().numpy()
+        if isinstance(next_belief_map, torch.Tensor):
+            next_belief_map = next_belief_map.cpu().numpy()
+        if isinstance(done, torch.Tensor):
+            done = done.cpu().numpy()
         
-        self.low_buffer.add_batch(obs_t, belief_map_t, goal_t, act_t, reward_t, next_obs_t, next_belief_map_t, done_t)
+        self.low_buffer.add_batch(obs, belief_map, goal, act_t, reward, next_obs, next_belief_map, done)
 
     def load_models(self, policies_list):
         for agent, policy in zip(self.all_agents, policies_list):

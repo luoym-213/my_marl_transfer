@@ -55,26 +55,22 @@ class Hi_MADDPG:
         sample_data = {
             'global_state': self._to_tensor(self.global_state_buf[idxs]),
             'obs': self._to_tensor(self.obs_buf[idxs]),
-            'visited_map': self._to_tensor(self.visited_map_buf[idxs]),
             'R_u': self._to_tensor(self.R_u_buf[idxs]),
             'g_u': self._to_tensor(self.g_u_buf[idxs]),
             'rew': self._to_tensor(self.rew_buf[idxs]),
             'next_global_state': self._to_tensor(self.next_global_state_buf[idxs]),
             'next_obs': self._to_tensor(self.next_obs_buf[idxs]),
-            'next_visited_map': self._to_tensor(self.next_visited_map_buf[idxs]),
             'done': self._to_tensor(self.done_buf[idxs])
         }
         """
         # Unpack sample
         global_states = sample['global_state']  # [Batch, global_state_dim]
         obs = sample['obs']                    # [Batch, N, obs_dim]
-        visited_maps = sample['visited_map']   # [Batch, N, H, W]
         R_u = sample['R_u']                    # [Batch, N, region_dim]
         g_u = sample['g_u']                    # [Batch, N, goal_dim]
         rewards = sample['rew']                 # [Batch, N]
         next_global_states = sample['next_global_state']  # [Batch, global_state_dim]
         next_obs = sample['next_obs']          # [Batch, N, obs_dim]
-        next_visited_maps = sample['next_visited_map']    # [Batch, N, H, W]
         dones = sample['done']                 # [Batch, N]
 
         uav_pos = obs[:, :, 2:4].reshape(obs.shape[0], -1)  # [Batch, N * 2]
@@ -85,8 +81,8 @@ class Hi_MADDPG:
         with torch.no_grad():
             _, _, next_q = self.target_ac.dth_high_level_act(next_uav_pos, next_global_states)
 
-            global_rewards = rewards.mean(dim=1, keepdim=True)  # [Batch, 1]
-            global_dones = dones.all(dim=1, keepdim=True).float() # [Batch, 1]
+            global_rewards = rewards.mean(dim=1, keepdim=True).view(-1, 1) / 1000  # [Batch, 1]
+            global_dones = dones.all(dim=1, keepdim=True).float().view(-1, 1) # [Batch, 1]
 
             target_q = global_rewards + self.gamma * (1 - global_dones) * next_q
         

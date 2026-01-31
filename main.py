@@ -23,10 +23,10 @@ def train(args, return_early=False):
 
     n = len(master.all_agents)
     eta = 0.1  # weight for action smooth loss
-    episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
-    final_rewards = torch.zeros([args.num_processes, n], device=args.device)
-    episode_high_rewards = torch.zeros([args.num_processes, n], device=args.device)
-    final_high_rewards = torch.zeros([args.num_processes, n], device=args.device)
+    episode_rewards = np.zeros([args.num_processes, n])
+    final_rewards = np.zeros([args.num_processes, n])
+    episode_high_rewards = np.zeros([args.num_processes, n])
+    final_high_rewards = np.zeros([args.num_processes, n])
 
     # start simulations
     start = datetime.datetime.now()
@@ -81,8 +81,8 @@ def train(args, return_early=False):
             high_level_rewards = (1-beta) * r_init + beta * r_ref - eta * smooth_loss   # [num_processes, num_agents]
 
             # 3. add to buffer...
-            master.update_high_buffer(last_belief_maps, last_obs, last_visited_maps, R_u, last_goals,
-                                    high_level_rewards, next_belief_maps, next_obs, next_visited_maps, done)
+            master.update_high_buffer(last_belief_maps, last_obs, R_u, last_goals,
+                                    high_level_rewards, next_belief_maps, next_obs, done)
             
             # 3.5 accumulate episode high-level reward
             episode_high_rewards += high_level_rewards
@@ -118,7 +118,7 @@ def train(args, return_early=False):
 
         # 1.5 compute low-level reward
         episode_rewards += low_level_rewards
-        all_masks = torch.FloatTensor(1-1.0*done).to(args.device)
+        all_masks = 1.0 - done.astype(np.float32)
         final_rewards *= all_masks
         final_rewards += (1 - all_masks) * episode_rewards
         final_high_rewards *= all_masks
@@ -160,8 +160,8 @@ def train(args, return_early=False):
         if t%args.log_interval == 0:
             end = datetime.datetime.now()
             seconds = (end-start).total_seconds()
-            mean_low_reward = final_rewards.mean(dim=0).cpu().numpy()
-            mean_high_reward = final_high_rewards.mean(dim=0).cpu().numpy()
+            mean_low_reward = final_rewards.mean(axis=0)
+            mean_high_reward = final_high_rewards.mean(axis=0)
 
             print("Updates {} | Num timesteps {} | Time {} | FPS {} \
                   \nlow Value loss {:.4f} low level loss {:.4f} \
@@ -172,8 +172,8 @@ def train(args, return_early=False):
             
             if not args.test:
                 for idx in range(n):
-                    writer.add_scalar('agent'+str(idx)+'/training_low_reward', mean_low_reward[idx], t)
-                    writer.add_scalar('agent'+str(idx)+'/training_high_reward', mean_high_reward[idx], t)
+                    writer.add_scalar('agent'+str(idx)+'/training_low_reward', float(mean_low_reward[idx]), t)
+                    writer.add_scalar('agent'+str(idx)+'/training_high_reward', float(mean_high_reward[idx]), t)
 
                 writer.add_scalar('all/low_value_loss', value_low_loss[0], t)
                 writer.add_scalar('all/action_low_loss', action_low_loss[0], t)
