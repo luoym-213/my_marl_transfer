@@ -7,10 +7,10 @@ def _flatten_helper(T, N, _tensor):
 
 
 class RolloutStorage(object):
-    def __init__(self, num_steps, num_processes, obs_shape, action_space, num_agent, recurrent_hidden_state_size, top_k=5):
+    def __init__(self, num_steps, num_processes, obs_shape, action_space, num_agent):
         # 环境基础信息
         self.obs = torch.zeros(num_steps + 1, num_processes, *obs_shape)
-        self.recurrent_hidden_states = torch.zeros(num_steps + 1, num_processes, recurrent_hidden_state_size)
+        self.recurrent_hidden_states = torch.zeros(num_steps + 1, num_processes, 128)
         self.env_states = torch.zeros(num_steps + 1, num_processes, num_agent*6)
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
         self.num_steps = num_steps
@@ -36,7 +36,7 @@ class RolloutStorage(object):
         self.goal_dones = torch.zeros(num_steps + 1, num_processes, 1) # 当前是否是决策点，yes=1, no=0
         self.goal_dones[0].fill_(1.0) # 初始化第一步为1，因为需要执行高层策略来分配初始目标
         self.ego_nodes = torch.zeros(num_steps, num_processes, 5)  # Ego节点特征存储: [num_steps, num_processes, 5]
-        self.explore_nodes = torch.zeros(num_steps, num_processes, top_k, 4)  # Explore节点特征存储: [num_steps, num_processes, K, 4]
+        self.explore_nodes = torch.zeros(num_steps, num_processes, 3, 4)  # Explore节点特征存储: [num_steps, num_processes, K, 4]
         self.teammate_nodes = torch.zeros(num_steps, num_processes, num_agent, 5)  # Teammate节点特征存储: [num_steps, num_processes, num_agent, 5]
         self.teammate_masks = torch.zeros(num_steps, num_processes, num_agent, 1)  # Teammate节点掩码存储: [num_steps, num_processes, num_agent, 1]
 
@@ -111,7 +111,6 @@ class RolloutStorage(object):
         self.goals[self.step].copy_(goals)
         self.tasks[self.step].copy_(task)
         self.higoal_log_probs[self.step].copy_(higoal_log_probs)
-        self.high_values[self.step].copy_(high_values)
         self.high_values[self.step].copy_(high_values)
         self.goal_dones[self.step + 1].copy_(goal_dones)
         self.ego_nodes[self.step].copy_(ego_nodes)

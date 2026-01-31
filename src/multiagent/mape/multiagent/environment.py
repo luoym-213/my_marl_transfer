@@ -130,8 +130,8 @@ class MultiAgentEnv(gym.Env):
         current_reward_n = []
         last_goal_n = []
         action_n = data['agents_actions']
-        goal_n = data['agents_goals']
-        task_n = data['agents_tasks']
+        # goal_n = data['agents_goals']
+        # task_n = data['agents_tasks']
 
         # 获取step前全局状态，智能体速度、位置，landmark位置
         state = self._get_state(self.world)
@@ -147,7 +147,7 @@ class MultiAgentEnv(gym.Env):
                 ## 设置agent.action,留给world.step()使用
                 self._set_action(action_n[i], agent, self.action_space[i])
                 ## 设置agent.state.g_pos, 供reward计算使用
-                self._set_goal(goal_n[i], agent)
+                # self._set_goal(goal_n[i], agent)
         
         # 计算step前的距离奖励，即上一步智能体距离目标点的距离，以便后续计算差分奖励
         for agent in self.agents:
@@ -185,8 +185,7 @@ class MultiAgentEnv(gym.Env):
             self.global_belief_map.update_beliefs(agents_pos, self.world.mask_obs_dist)
 
         # 获取step更新后的voronoi加权质心以及目标位置
-        centroids = self.global_belief_map.get_voronoi_weighted_centroids(agents_pos) if self.enable_exploration_reward else []
-        
+        centroids = self.global_belief_map.compute_entropy_weighted_centroids(agents_pos)
         target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
 
         # 添加world_steps到info_n中
@@ -196,12 +195,14 @@ class MultiAgentEnv(gym.Env):
         info_n['map'].append(centroids)
         info_n['map'].append(target_positions)
         # 将高层策略需要的通道图、是否达到目标点分别加入
+        info_n['centroids'] = centroids
         info_n['belief_map'] = self.global_belief_map.belief_grid
         info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos, self.agents_done)
         info_n['goal_done'] = self._get_goal_dones(self.agents)
         info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
+        info_n["visited_map"] = self.global_belief_map.get_visited_map()
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
@@ -214,11 +215,6 @@ class MultiAgentEnv(gym.Env):
 
         # 获取全局状态，智能体速度、位置，landmark位置
         state = self._get_state(self.world)
-
-        # # all agents get total reward in cooperative case
-        # reward = np.sum(reward_n)
-        # if self.shared_reward:
-        #     reward_n = [reward] * self.n
 
         # 差分奖励
         reward_n = np.array(reward_n) - np.array(last_reward_n)
@@ -235,7 +231,7 @@ class MultiAgentEnv(gym.Env):
 
         info_n['is_success'] = np.all(self.agents_done)
         
-        return obs_n, all_reward, total_high_rewards, done, info_n, state
+        return obs_n, all_reward, low_level_rewards, done, info_n, state
 
     def reset(self):
         # reset world
@@ -267,13 +263,12 @@ class MultiAgentEnv(gym.Env):
         # 获取当前智能体的位置，[num_agents, 2]
         agent_positions = np.array([agent.state.p_pos for agent in self.agents])
         # 获取reset后的voronoi加权质心以及目标位置
-        centroids = []
+        centroids = self.global_belief_map.compute_entropy_weighted_centroids(agent_positions)
         target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
-        reset_info['map'].append(centroids)
         reset_info['map'].append(target_positions)
 
         # 将高层策略需要的通道图、是否达到目标点分别加入
-        
+        reset_info['centroids'] = centroids
         reset_info['belief_map'] = self.global_belief_map.belief_grid
         reset_info['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         reset_info['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agent_positions)
@@ -281,6 +276,7 @@ class MultiAgentEnv(gym.Env):
         reset_info['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
         # reset下，goal_done全部为True
         reset_info['goal_done'] = [True] * len(self.agents)
+        reset_info["visited_map"] = self.global_belief_map.get_visited_map()
 
         return obs_n, state, reset_info
     
@@ -418,6 +414,9 @@ class MultiAgentEnv(gym.Env):
         # agent pos: agent.state.p_pos
         # goal pos: agent.state.g_pos
         # threshold: self.world.dist_thres
+        if agents[0].state.g_pos is None:
+            return [False] * len(agents)
+        
         goal_dones = [np.linalg.norm(agent.state.p_pos - agent.state.g_pos) < self.world.dist_thres for agent in agents] 
         # 如果agent已经退役，则goal_done也设为False
         for i in range(len(goal_dones)):

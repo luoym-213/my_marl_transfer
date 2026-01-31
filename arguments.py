@@ -18,6 +18,8 @@ def get_args():
     parser.add_argument('--dropout-masking', action='store_true', help='dropout masking enabled')
     parser.add_argument('--entity-mp', action='store_true', help='enable entity message passing')
     parser.add_argument('--identity-size', default=0, type=int, help='size of identity vector')
+    parser.add_argument('--episode-steps', type=int, default=50, help='number of forward steps in each episode (default: 50)')
+    parser.add_argument('--K', type=int, default=10, help='number of high-level action samples to consider")')
 
     # RRT
     #parser.add_argument('--num-rrt-nodes', type=int, default=50, help='number of RRT nodes to sample')
@@ -35,7 +37,6 @@ def get_args():
     parser.add_argument('--gpu-id', type=int, default=None, help='Specific GPU ID to use (e.g., 0 or 1). Default (None) uses CUDA_VISIBLE_DEVICES setting.')
     parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')
     parser.add_argument('--arena-size', type=int, default=1, help='size of arena')
-    parser.add_argument('--high-level-interval', type=int, default=5, help='number of steps between high-level decisions')
 
     # evaluation
     parser.add_argument('--num-eval-episodes', type=int, default=30, help='number of episodes to evaluate with')
@@ -44,7 +45,7 @@ def get_args():
     parser.add_argument('--record-video', action='store_true', default=False, help='record evaluation video')
     parser.add_argument('--gif-save-path', type=str, default='gifs', help='directory to save GIF files (default: gifs)')
     
-    # PPO
+    # PPO / maddpg
     parser.add_argument('--algo', default='ppo', help='algorithm to use: a2c | ppo | acktr')
     parser.add_argument('--lr', type=float, default=1e-4, help='learning rate (default: 1e-4)')
     parser.add_argument('--gamma', type=float, default=0.99, help='discount factor for rewards (default: 0.99)')
@@ -55,11 +56,18 @@ def get_args():
     parser.add_argument('--ppo-epoch', type=int, default=4, help='number of ppo epochs (default: 4)')
     parser.add_argument('--num-mini-batch', type=int, default=32, help='number of batches for ppo (default: 32)')
     parser.add_argument('--clip-param', type=float, default=0.2, help='ppo clip parameter (default: 0.2)')
-    parser.add_argument('--recurrent-hidden-state-size', type=int, default=128, help='number of batches for ppo (default: 32)')
+    parser.add_argument('--goal-dim', type=int, default=32, help='dimension of goal vector')
     parser.add_argument('--is-recurrent', action='store_true')
     parser.add_argument("--load-low-level-path", type=str, default=None, help="Path of pre-trained low-level policy")
     parser.add_argument("--load-high-level-path", type=str, default=None, help="Path of pre-trained high-level policy")
     parser.add_argument("--load-high-critic-path", type=str, default=None, help="Path of pre-trained high-level critic")
+    parser.add_argument('--update-high-loop', type=int, default=8, help='number of high-level update loops (default: 8)')
+    parser.add_argument('--update-low-loop', type=int, default=4, help='number of low-level update loops (default: 4)')
+    parser.add_argument('--high-batch-size', type=int, default=128, help='high-level batch size for training (default: 128)')
+    parser.add_argument('--low-batch-size', type=int, default=256, help='low-level batch size for training (default: 256)')
+    parser.add_argument('--hi-tau', type=float, default=0.05, help='soft update parameter for high-level target networks (default: 0.05)')
+    parser.add_argument('--lo-tau', type=float, default=0.01, help='soft update parameter for low-level target networks (default: 0.01)')
+    
 
     # logging
     parser.add_argument('--save-dir', default='tmp', help='directory to save models (default: tmp)')
@@ -119,16 +127,21 @@ def get_args():
     # raise warning if save directory already exists
     if not args.test:
         if os.path.exists(args.save_dir):
-            print('\nSave directory exists already! Enter')
-            ch = input('c (rename the existing directory with _old and continue)\ns (stop)!\ndel (delete existing dir): ')
-            if ch == 's':
-                sys.exit(0)
-            elif ch == 'c':
-                os.rename(args.save_dir, args.save_dir+'_old')
-            elif ch == 'del':
+            print(args.save_dir)
+            if args.save_dir == '../marlsave/save_new/test':
+                print('\nWarning: deleting existing test directory...')
                 shutil.rmtree(args.save_dir)
             else:
-                raise NotImplementedError('Unknown input')
+                print('\nSave directory exists already! Enter')
+                ch = input('c (rename the existing directory with _old and continue)\ns (stop)!\ndel (delete existing dir): ')
+                if ch == 's':
+                    sys.exit(0)
+                elif ch == 'c':
+                    os.rename(args.save_dir, args.save_dir+'_old')
+                elif ch == 'del':
+                    shutil.rmtree(args.save_dir)
+                else:
+                    raise NotImplementedError('Unknown input')
         os.makedirs(args.save_dir)
     
     return args

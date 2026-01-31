@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 from rlcore.algo import IPPO, JointPPO
+from rlcore.algo import Hi_MADDPG, Lo_MADDPG
+from rlcore.buffer import LowLevelBuffer, HighLevelBuffer
 from rlagent import Neo
 from mpnn import MPNN
 from utils import make_multiagent_env
@@ -26,6 +28,7 @@ def setup_master(args, env=None, return_env=False):
 
     # share a common policy in a team
     action_space = env.action_space[i]
+    obs_dim = env.observation_space[i].shape[0]
     entity_mp = args.entity_mp
     if args.env_name == 'simple_spread':
         num_entities = args.num_agents
@@ -59,8 +62,8 @@ def setup_master(args, env=None, return_env=False):
             team1.append(Neo(args,policy1,(obs_dim,),action_space))
         else:
             if policy2 is None:
-                policy2 = MPNN(input_size=pol_obs_dim,num_agents=num_friendly,num_entities=num_entities,action_space=action_space,
-                               pos_index=pos_index, mask_dist=args.mask_dist,mask_obs_dist=args.mask_obs_dist,entity_mp=entity_mp,is_recurrent=args.is_recurrent).to(args.device)
+                policy2 = MPNN(input_size=pol_obs_dim,num_agents=num_friendly,num_entities=num_entities,action_space=action_space, goal_dim = args.goal_dim,
+                               pos_index=pos_index, mask_dist=args.mask_dist, mask_obs_dist=args.mask_obs_dist, entity_mp=entity_mp, is_recurrent=args.is_recurrent).to(args.device)
 
             team2.append(Neo(args,policy2,(obs_dim,),action_space))
 
@@ -94,8 +97,12 @@ def setup_master(args, env=None, return_env=False):
             if policy2 is not None:
                 policy2.load_pretrained_high_level(args.load_high_critic_path, freeze=False)
         # ============================================================
+    
+    low_buffer = LowLevelBuffer(10e6, args.num_agents, obs_dim, action_space.n, args.goal_dim, device=args.device)
+
+    high_buffer = HighLevelBuffer(10e5, args.num_agents, obs_dim, action_space.n, args.goal_dim, device=args.device)
         
-    master = Learner(args, [team1, team2], [policy1, policy2], env=env) # 传入并行环境
+    master = Learner(args, [team1, team2], [policy1, policy2], low_buffer, high_buffer, env=env) # 传入并行环境
     
     if args.continue_training:
         print("Loading pretrained model")
@@ -107,7 +114,7 @@ def setup_master(args, env=None, return_env=False):
 
 
 class Learner(object):
-    def __init__(self, args, teams_list, policies_list, env):
+    def __init__(self, args, teams_list, policies_list, low_buffer, high_buffer, env):
         self.teams_list = [x for x in teams_list if len(x)!=0]
         self.all_agents = [agent for team in teams_list for agent in team]
         self.policies_list = [x for x in policies_list if x is not None]
@@ -121,17 +128,29 @@ class Learner(object):
         )
 
         # 初始化训练器
+        # if not self.use_pretrained_low_level:
+        #     self.trainers_list = [IPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
+        #                                 args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
+        #                                 use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
+        # self.high_trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
+        #                                args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
+        #                                use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
+
         if not self.use_pretrained_low_level:
-            self.trainers_list = [IPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
-                                        args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
-                                        use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
-        self.high_trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
-                                       args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
-                                       use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
+            self.trainers_list = [Lo_MADDPG(policy, args.num_agents, args.lo_tau) for policy in self.policies_list]
+        self.high_trainers_list = [Hi_MADDPG(policy, args.hi_tau) for policy in self.policies_list]
+
         self.device = args.device
         self.env = env
         self.envs_info = None
-        self.high_level_interval = args.high_level_interval
+        self.K = args.K
+        self.arena_size = args.arena_size
+        self.low_buffer = low_buffer
+        self.high_buffer = high_buffer
+        self.update_high_loop = args.update_high_loop
+        self.update_low_loop = args.update_low_loop
+        self.high_batch_size = args.high_batch_size
+        self.low_batch_size = args.low_batch_size
 
         self.top_k = args.top_k
         self.rrt_max_iter = args.rrt_max_iter
@@ -411,6 +430,225 @@ class Learner(object):
                 tasks_list.append(all_tasks[i].cpu().numpy())
 
         return actions_list, goals_list, tasks_list
+    
+    def high_level_act(self, obs, belief_maps):
+        """
+        parameters:
+            obs: np array of shape [num_processes, num_agents, obs_dim]
+            belief_maps: list: [num_processes, H, W]
+        returns:
+            R_u: np array of shape [num_processes, num_agents, H, W]
+            goals: np array of shape [num_processes, num_agents, goal_dim]
+        """
+        # 1. concatenate all agents' positons from obs: [num_processes, num_agents * 2]
+        agent_positions = obs[:, :, 2:4]  # shape: [num_processes, num_agents, 2]
+        positions = agent_positions.reshape(obs.shape[0], -1)  # shape: [num_processes, num_agents * 2]
+
+        # 2. convert to tensors
+        positions = torch.from_numpy(positions).float().to(self.device)
+        belief_maps = torch.from_numpy(belief_maps).float().to(self.device)
+
+        # 3. for each team, get R_u and goals from its policy
+        for team, policy in zip(self.teams_list, self.policies_list):
+            with torch.no_grad():
+                R_u, goals, _ = policy.dth_high_level_act(positions, belief_maps)    # R_u: [num_processes, num_agents, H, W], goals: [num_processes, num_agents, goal_dim]
+        
+        # 4. turn to numpy
+        R_u = R_u.cpu().numpy()
+        goals = goals.cpu().numpy()
+        return R_u, goals
+
+    def low_level_act(self, obs, g_u):
+        """
+        parameters:
+            obs: np array of shape [num_processes, num_agents, obs_dim]
+            g_u: np array of shape [num_processes, num_agents, goal_dim]
+        returns:
+            actions: np array of shape [num_processes, num_agents, action_dim]
+        """
+        # 1. get batch of obs and goals [num_processes * num_agents, obs_dim], [num_processes * num_agents, goal_dim]
+        num_processes = obs.shape[0]
+        num_agents = obs.shape[1]
+        batch_obs = obs.reshape(num_processes * num_agents, -1)
+        batch_goals = g_u.reshape(num_processes * num_agents, -1)
+
+        # 1.5 convert to tensors
+        batch_obs = torch.from_numpy(batch_obs).float().to(self.device)
+        batch_goals = torch.from_numpy(batch_goals).float().to(self.device)
+
+        # 2. for each team, get actions from its policy
+        for team, policy in zip(self.teams_list, self.policies_list):
+            with torch.no_grad():
+                actions, action_logits = policy.dth_low_level_act(batch_obs[:,:4], batch_goals)  # shape: [num_processes * num_agents, action_dim]
+                action_int = torch.argmax(actions, dim=-1)
+
+        actions = actions.cpu().numpy()
+        action_int = action_int.cpu().numpy()
+        return actions.reshape(num_processes, num_agents, -1), action_int.reshape(num_processes, num_agents)
+    
+    def get_region(self, obs, voronoi_masks):
+        """
+        parameters:
+            obs: np array of shape [num_processes, num_agents, obs_dim]
+            voronoi_masks: np array of shape [num_processes, num_agents, H, W]
+        returns:
+            regions: np array of shape [num_processes, num_agents, H, W]  (x_min, y_min, x_max, y_max)
+        """
+
+        # 1. get each agent's position from global_state of all num_processes
+        num_processes = obs.shape[0]
+        num_agents = voronoi_masks.shape[1]
+        H, W = voronoi_masks.shape[2], voronoi_masks.shape[3]
+
+        agent_positions = obs[:,:,2:4]  # shape: [num_processes, num_agents, 2]
+
+        # 2. compute each agent's can-reach region in K steps
+        regions = np.zeros_like(voronoi_masks)  # shape: [num_processes, num_agents, H, W]
+        radius = self.K * 0.07
+
+        arena_size = self.arena_size * 2
+        cell_size = arena_size / H  # 栅格大小
+
+        # 3. 批量转换世界坐标到栅格坐标
+        # agent_positions: [num_processes, num_agents, 2]
+        grid_positions = ((agent_positions + arena_size / 2) / cell_size).astype(np.int32)
+        grid_positions = np.clip(grid_positions, 0, [W - 1, H - 1])  # [num_processes, num_agents, 2]
+        
+        # 4. 计算可达半径（栅格单位）
+        radius_in_grid = int(np.ceil(radius / cell_size))
+        
+        # 5. 创建栅格坐标网格
+        y_indices, x_indices = np.ogrid[0:H, 0:W]  # [H, 1], [1, W]
+        
+        # 6. 批量计算所有智能体的可达区域
+        # 扩展维度以支持广播: grid_positions: [P, A, 2] -> [P, A, 1, 1, 2]
+        grid_x = grid_positions[:, :, 0].reshape(num_processes, num_agents, 1, 1)  # [P, A, 1, 1]
+        grid_y = grid_positions[:, :, 1].reshape(num_processes, num_agents, 1, 1)  # [P, A, 1, 1]
+        
+        # 计算距离: [P, A, H, W]
+        distances = np.sqrt((x_indices - grid_x)**2 + (y_indices - grid_y)**2)
+        
+        # 生成可达区域掩码: [P, A, H, W]
+        reach_masks = (distances <= radius_in_grid).astype(np.float32)
+        
+        # 7. 与 Voronoi 掩码求交集
+        regions = reach_masks * voronoi_masks  # [P, A, H, W]
+
+        return regions
+    
+    def compute_initial_reward(self, R_u, obs, visited_maps):
+        """
+        parameters:
+            R_u: np array [num_processes, num_agents, H, W]
+            obs: np array [num_processes, num_agents, obs_dim]
+            visited_maps: np array [num_processes, H, W]
+        
+        equation:
+            reward_u = RegionCov_u - gamma * (dist_u / sqrt(A_env))
+        
+        returns:
+            rewards: np array of shape [num_processes, num_agents]
+        """
+
+        # 1. get each agent's position from global_state of all num_processes
+        num_processes = obs.shape[0]
+        num_agents = obs.shape[1]
+        H, W = visited_maps.shape[1], visited_maps.shape[2]
+
+        # 2. compute each agent's can-reach region area |R_u|
+        A_R_u = np.sum(R_u, axis=(2,3))  # shape: [num_processes, num_agents]
+
+        # 3. compute each agent's unvisited cells ratio in R_u
+        unvisited_maps = 1.0 - visited_maps  # shape: [num_processes, H, W]
+        unvisited_R_u = R_u * unvisited_maps[:, np.newaxis, :, :]  # shape: [num_processes, num_agents, H, W]
+        RegionCov_u = np.sum(unvisited_R_u, axis=(2,3)) / A_R_u  # shape: [num_processes, num_agents]
+
+        # 4. compute each agent's centroid of its assigned region(R_u)
+        agent_positions = obs[:,:,2:4]  # shape: [num_processes, num_agents, 2]
+
+        y_coords, x_coords = np.meshgrid(np.arange(H), np.arange(W), indexing='ij')
+        grid_coords = np.stack([y_coords, x_coords], axis=-1)  # [H, W, 2]
+
+        # 扩展维度以支持广播: [1, 1, H, W, 2]
+        grid_coords = grid_coords[np.newaxis, np.newaxis, :, :, :]
+        
+        # R_u 扩展维度: [P, A, H, W, 1]
+        R_u_expanded = R_u[:, :, :, :, np.newaxis]
+        
+        # 加权求和: [P, A, H, W, 2] * [P, A, H, W, 1] -> [P, A, 2]
+        weighted_coords = (grid_coords * R_u_expanded).sum(axis=(2, 3))  # [P, A, 2]
+        
+        # 归一化得到质心（避免除零）
+        R_u_sum = R_u.sum(axis=(2, 3), keepdims=True)[:, :, 0, 0]  # [P, A]
+        centroid_R_u = np.where(
+            R_u_sum[:, :, np.newaxis] > 0,  # [P, A, 1]
+            weighted_coords / R_u_sum[:, :, np.newaxis],  # [P, A, 2]
+            agent_positions  # fallback to agent position
+        )  
+
+        arena_size = self.arena_size * 2
+        cell_size = arena_size / H
+        # 将栅格质心转换为世界坐标
+        centroid_world = centroid_R_u * cell_size - arena_size / 2  # [P, A, 2]
+        
+        # 计算距离
+        dist_u = np.linalg.norm(agent_positions - centroid_world, axis=-1)  # [P, A]
+
+        # 计算同一个环境中所有agent R_u的联合面积 A_env
+        union_R_env = np.clip(np.sum(R_u, axis=1), 0, 1)  # shape: [num_processes, H, W]
+        A_env = np.sum(union_R_env, axis=(1,2)) * (cell_size ** 2)  # shape: [num_processes]
+
+        # 5. compute each agent's reward
+        gamma = 0.1
+        rewards = RegionCov_u - gamma * (dist_u / np.sqrt(A_env[:, np.newaxis]))  # shape: [num_processes, num_agents]
+
+        # 6. each agent share the same reward in the same environment
+        rewards = np.repeat(np.expand_dims(np.sum(rewards, axis=1), axis=1), rewards.shape[1], axis=1)  # shape: [num_processes, num_agents]
+
+        return rewards
+
+    def compute_r_ref(self, R_u, last_map_entropy, curr_map_entropy):
+        """
+        parameters:
+            R_u: np array of shape [num_processes, num_agents, H, W]
+            last_map_entropy: np array of shape [num_processes, H, W]
+            curr_map_entropy: np array of shape [num_processes, H, W]
+        returns:
+            r_ref: np array of shape [num_processes, num_agents]
+        """
+        
+        # 1. compute each agent's info gain in its assigned region R_u
+        delta_entropy = last_map_entropy - curr_map_entropy  # shape: [num_processes, H, W]
+        delta_entropy = np.clip(delta_entropy, a_min=0.0, a_max=None)  # only consider positive gain
+        R_u_expanded = R_u  # shape: [num_processes, num_agents, H, W]
+        info_gain_maps = R_u_expanded * delta_entropy[:, np.newaxis, :, :]  # shape: [num_processes, num_agents, H, W]
+        info_gains = np.sum(info_gain_maps, axis=(2,3))  # shape: [num_processes, num_agents]
+
+        # 2. compute each agent's info gain varience penalty
+        info_gain_vars = np.var(info_gains, axis=1, keepdims=True)  # shape: [num_processes, 1]
+
+        # 3. compute final info gains with penalty
+        lamda = 0.5
+        info_gains = np.sum(info_gains, axis=1, keepdims=True)  # shape: [num_processes, 1]
+        r_ref = info_gains - lamda * info_gain_vars  # shape: [num_processes, 1]
+
+        # 4. each agent share the same reward in the same environment
+        r_ref = np.repeat(r_ref, R_u.shape[1], axis=1)  # shape: [num_processes, num_agents]
+
+        return r_ref
+    
+    def get_beta(self, step, max_steps):
+        """
+        parameters:
+            step: current global step
+            max_steps: episodes steps
+        equation:
+            beta = 1 - exp(-step%max_steps / max_steps)
+        returns:
+            beta: float
+        """
+        beta = 1 - float(np.exp((-step % max_steps) / max_steps))
+        return beta
 
     def update(self):
         return_high_vals = []
@@ -435,6 +673,38 @@ class Learner(object):
 
         # === 拼接 === [num_agents, 8]
         return np.concatenate([low_arr, high_arr], axis=1)
+    
+    def update_high_level(self):
+        return_high_vals = []
+        for i, trainer in enumerate(self.high_trainers_list):
+            c_loss_total = 0.0
+            a_loss_total = 0.0
+            for _ in range(self.update_high_loop):
+                # sample from buffer
+                sample_batch = self.high_buffer.sample(self.high_batch_size)
+                c_loss, a_loss = trainer.update(sample_batch)
+                c_loss_total += c_loss
+                a_loss_total += a_loss
+            c_loss_total /= self.update_high_loop
+            a_loss_total /= self.update_high_loop
+            return_high_vals.append([c_loss_total, a_loss_total])
+        return return_high_vals
+
+    def update_low_level(self):
+        return_vals = []
+        for i, trainer in enumerate(self.trainers_list):
+            c_loss_total = 0.0
+            a_loss_total = 0.0
+            for _ in range(self.update_low_loop):
+                # sample from buffer
+                sample_batch = self.low_buffer.sample(self.low_batch_size)
+                c_loss, a_loss = trainer.update(sample_batch)
+                c_loss_total += c_loss
+                a_loss_total += a_loss
+            c_loss_total /= self.update_low_loop
+            a_loss_total /= self.update_low_loop
+            return_vals.append([c_loss_total, a_loss_total])
+        return return_vals
     
     def update_landmark_info(self,prev_landmark_data, prev_landmark_mask, detected_map_list, device, env_dones = None, match_threshold=0.1, cleanup_threshold=0.06):
         """
@@ -771,6 +1041,33 @@ class Learner(object):
             agent_obs = obs_t[:, i, :]
             agent.update_rollout(agent_obs, reward[:,i].unsqueeze(1), high_rewards[:,i].unsqueeze(1), 
                                  masks[:,i].unsqueeze(1), env_state_t, goal_dones[:,i].unsqueeze(1))
+    
+    def update_high_buffer(self, belief_map, obs, visited_map, R_u, g_u, high_rew, 
+                           next_belief_map, next_obs, next_visited_map, done):
+        belief_map_t = torch.from_numpy(belief_map).float().to(self.device)
+        obs_t = torch.from_numpy(obs).float().to(self.device)
+        visited_map_t = torch.from_numpy(visited_map).float().to(self.device)
+        R_u_t = torch.from_numpy(R_u).float().to(self.device)
+        g_u_t = torch.from_numpy(g_u).float().to(self.device)
+        next_belief_map_t = torch.from_numpy(next_belief_map).float().  to(self.device)
+        next_obs_t = torch.from_numpy(next_obs).float().to(self.device)
+        next_visited_map_t = torch.from_numpy(next_visited_map).float().to(self.device)
+        done_t = torch.from_numpy(done).float().to(self.device)
+        
+        self.high_buffer.add_batch(belief_map_t, obs_t, visited_map_t, R_u_t, g_u_t, high_rew,
+                             next_belief_map_t, next_obs_t, next_visited_map_t, done_t)
+        
+    def update_low_buffer(self, obs, belief_map, goal, act_t, reward, next_obs, next_belief_map, done):
+        obs_t = torch.from_numpy(obs).float().to(self.device)
+        belief_map_t = torch.from_numpy(belief_map).float().to(self.device)
+        act_t = torch.from_numpy(act_t).float().to(self.device)
+        goal_t = torch.from_numpy(goal).float().to(self.device)
+        reward_t = torch.from_numpy(reward).float().to(self.device)
+        next_obs_t = torch.from_numpy(next_obs).float().to(self.device)
+        next_belief_map_t = torch.from_numpy(next_belief_map).float().to(self.device)
+        done_t = torch.from_numpy(done).float().to(self.device)
+        
+        self.low_buffer.add_batch(obs_t, belief_map_t, goal_t, act_t, reward_t, next_obs_t, next_belief_map_t, done_t)
 
     def load_models(self, policies_list):
         for agent, policy in zip(self.all_agents, policies_list):
@@ -806,7 +1103,6 @@ class Learner(object):
             num_agents = len(team)
 
             # 1. 收集数据
-
             obs_tensor = torch.cat(obs, dim=0).to(self.device) # [num_agents, obs_dim]
 
             # 1.1. 构建 entropy_map, heatmap, landmark_heatmap

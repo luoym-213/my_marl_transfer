@@ -17,7 +17,7 @@ def weights_init(m):
 
 
 class MPNN(nn.Module):
-    def __init__(self, action_space, num_agents, num_entities, input_size=16, hidden_dim=128, embed_dim=None,
+    def __init__(self, action_space, num_agents, num_entities, input_size=16, hidden_dim=128, embed_dim=None, goal_dim=2,
                  pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None, entity_mp=False, is_recurrent=True):
         super().__init__()
 
@@ -41,6 +41,7 @@ class MPNN(nn.Module):
         self.task_dim = 2
         self.h_dim2 = self.h_dim // 2 # 64
         num_actions = action_space.n
+        self.goal_dim = goal_dim
 
         # ==================== 模块化网络 ====================
         self.modules_dict = nn.ModuleDict()
@@ -54,6 +55,13 @@ class MPNN(nn.Module):
         # 3. 高层 Critic
         self.modules_dict['high_critic'] = self._build_high_critic_modules()
 
+        # maddpg
+        # 4. dth_low_level
+        self.modules_dict['dth_low_level'] = self._build_dth_low_level_modules(action_space)
+
+        # 5. dth_high_level
+        self.modules_dict['dth_high_level'] = self._build_dth_high_level_modules()
+
         # ==================== 其他属性 ====================
         if norm_in:
             self.in_fn = nn.BatchNorm1d(self.input_size)
@@ -64,17 +72,6 @@ class MPNN(nn.Module):
         self.apply(weights_init)
         self.attn_mat = np.ones((num_agents, num_agents))
         self.dropout_mask = None     
-        
-
-        # self.value_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
-        #                                 self.nonlin(inplace=True),
-        #                                 nn.Linear(self.h_dim,1))
-
-        # self.policy_head = nn.Sequential(nn.Linear(self.h_dim, self.h_dim),
-        #                                  self.nonlin(inplace=True))
-
-        # self.low_agent_encoder = nn.Sequential(nn.Linear(self.low_level_input, self.h_dim),
-        #                                       self.nonlin(inplace=True))
         
         # ==================== 代办 ====================
         self.dist = Categorical(self.h_dim,num_actions)
@@ -254,6 +251,131 @@ class MPNN(nn.Module):
         ])
         
         return high_critic
+
+    def _build_dth_low_level_modules(self, action_space):
+        """构建 DTH 底层网络"""
+        total_vec_dim = (4 + self.goal_dim + action_space.n) * self.num_agents
+        fusion_dim = 128 + 32*12*12
+        dth_low_level = nn.ModuleDict({
+            'dth_low_actor': nn.Sequential(
+                nn.Linear(4 + self.goal_dim, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU(),
+                nn.Linear(128, 64),
+                nn.ReLU(),
+                nn.Linear(64, action_space.n)
+            ),
+
+            # === 1. Critic (Shared Backbone) ===
+            'dth_low_map_cnn': nn.Sequential(
+                nn.Conv2d(1, 16, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(16, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(32, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2) 
+            ),  # 100x100 -> 12x12, 32 channels
+
+            'dth_low_vec_mlp': nn.Sequential(
+                nn.Linear(total_vec_dim, 256),
+                nn.ReLU(),
+                nn.Linear(256, 128),
+                nn.ReLU()
+            ),
+
+            'dth_low_value_heads': nn.ModuleList([
+                nn.Sequential(
+                    nn.Linear(fusion_dim, 64),
+                    nn.ReLU(),
+                    nn.Linear(64, 1) # 输出标量 Q_u
+                ) for _ in range(self.num_agents)
+            ])
+        })
+        
+        return dth_low_level
+    
+    def _build_dth_high_level_modules(self):
+        """构建 DTH 高层网络"""
+        # 定义必要的参数
+        map_dim = 100  # 地图维度
+        goal_dim = 32   # 目标维度
+        cnn_out_dim = 64 * 12 * 12  # 9216
+        fusion_dim = cnn_out_dim + 64
+        
+        dth_high_level = nn.ModuleDict({
+            # --- 1. Feature Extractor (CNN) ---
+            'dth_high_map_CNN': nn.Sequential(
+                nn.Conv2d(1, 32, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(64, 64, kernel_size=3, padding=1),
+                nn.ReLU(),
+                nn.MaxPool2d(2)
+            ),
+
+            # MLP for UAV Positions
+            'dth_high_pos_mlp': nn.Sequential(
+                nn.Linear(self.num_agents * 2, 64),
+                nn.ReLU()
+            ),
+            
+            # --- 2. Region Generator Head (Decoder) ---
+            'dth_high_decoder_fc': nn.Linear(fusion_dim, 64 * 12 * 12),
+
+            'dth_high_decoder_net': nn.Sequential(
+                # Input: [Batch, 64, 12, 12]
+                # Upsample 1: 12 -> 24
+                nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1), 
+                nn.ReLU(),
+                
+                # Upsample 2: 24 -> 50 (近似)
+                nn.ConvTranspose2d(32, 16, kernel_size=4, stride=2, padding=1),
+                nn.ReLU(),
+
+                # Upsample 3 (关键): 强制拉伸到 map_dim (100x100)
+                nn.Upsample(size=(map_dim, map_dim), mode='bilinear', align_corners=False),
+                
+                nn.Conv2d(16, 16, kernel_size=3, padding=1), # 平滑一下
+                nn.ReLU(),
+                
+                # Output Layer
+                nn.Conv2d(16, self.num_agents, kernel_size=1) # -> [Batch, N, 100, 100]
+            ),
+
+            # --- 3. Goal Encoder (Goal Generator) ---
+            'dth_high_goal_encoder': nn.Sequential(
+                nn.Linear(map_dim * map_dim, 128), # 10000 -> 128
+                nn.ReLU(),
+                nn.Linear(128, goal_dim),
+                nn.Tanh() 
+            ),
+
+            # --- 4. Critic branch ---
+            'dth_high_critic_head': nn.Sequential(
+                nn.Linear(fusion_dim + goal_dim * self.num_agents, 256),
+                nn.ReLU(),
+                nn.Linear(256, 64),
+                nn.ReLU(),
+                nn.Linear(64, 1)
+            )
+
+        })
+        
+        # 保存配置参数作为类属性
+        self.dth_cnn_out_dim = cnn_out_dim
+        self.dth_fusion_dim = fusion_dim
+        self.dth_map_dim = map_dim
+        self.dth_goal_dim = goal_dim
+        
+        return dth_high_level
+
 
     # ==================== 参数管理接口 ====================
     
@@ -625,8 +747,112 @@ class MPNN(nn.Module):
         return self.modules_dict['high_level']['node_selection_head']
     
     @property
+    def dth_high_map_CNN(self):
+        return self.modules_dict['dth_high_level']['dth_high_map_CNN']
+    
+    @property
+    def dth_high_pos_mlp(self):
+        return self.modules_dict['dth_high_level']['dth_high_pos_mlp']
+    
+    @property
+    def dth_high_decoder_fc(self):
+        return self.modules_dict['dth_high_level']['dth_high_decoder_fc']
+    
+    @property
+    def dth_high_decoder_net(self):
+        return self.modules_dict['dth_high_level']['dth_high_decoder_net']
+    
+    @property
+    def dth_high_goal_encoder(self):
+        return self.modules_dict['dth_high_level']['dth_high_goal_encoder']
+    
+    @property
+    def dth_high_critic_head(self):
+        return self.modules_dict['dth_high_level']['dth_high_critic_head']
+    
+    @property
+    def dth_low_actor(self):
+        return self.modules_dict['dth_low_level']['dth_low_actor']
+    
+    @property
+    def dth_low_map_cnn(self):
+        return self.modules_dict['dth_low_level']['dth_low_map_cnn']
+    
+    @property
+    def dth_low_vec_mlp(self):
+        return self.modules_dict['dth_low_level']['dth_low_vec_mlp']
+    
+    @property
+    def dth_low_value_heads(self):
+        return self.modules_dict['dth_low_level']['dth_low_value_heads']
+    
+    @property
     def attn_dim(self):
         return 64
+    
+    def dth_high_level_act(self, agent_positions, belief_maps):
+        """
+        parameters:
+            agent_positions: [Batch, num_agents * 2]
+            belief_maps: [Batch, H, W]
+        returns:
+            R_u: [Batch, num_agents, H, W]
+            g_u: [Batch, num_agents, goal_dim]
+        """
+        # 增加 Channel 维度: [B, H, W] -> [B, 1, H, W]
+        if belief_maps.dim() == 3:
+            input_maps = belief_maps.unsqueeze(1)
+        else:
+            input_maps = belief_maps
+
+        # 1. feature extraction
+        map_feat = self.dth_high_map_CNN(input_maps).reshape(input_maps.size(0), -1)  # [B, 64, 12, 12]
+        pos_feat = self.dth_high_pos_mlp(agent_positions)  # [B, 64]
+        fused_feat = torch.cat([map_feat, pos_feat], dim=-1)  # [B, fusion_dim]
+
+        # 2. decoder for region proposal
+        fused_decoder_feat = self.dth_high_decoder_fc(fused_feat)  # [B, 64*12*12]
+        fused_decoder_feat = fused_decoder_feat.view(-1, 64, 12, 12)  # [B, 64, 12, 12]
+        decoded_logits = self.dth_high_decoder_net(fused_decoder_feat)  # [B, num_agents, 100, 100]
+        R_u = F.softmax(decoded_logits, dim=1)
+
+        # 3. goal encoder
+        B, N, H, W = R_u.size()
+        decoded_logits_flat = R_u.view(B * N, H * W)  # [B * num_agents, H*W]
+        g_u = self.dth_high_goal_encoder(decoded_logits_flat)  # [B * num_agents, goal_dim]
+        g_u = g_u.view(B, N, self.dth_goal_dim)  # [B, num_agents, goal_dim]
+
+        # q value
+        fused_feat_with_goals = torch.cat([fused_feat, g_u.view(B, -1)], dim=-1)  # [B, fusion_dim + goal_dim * num_agents]
+        q_values = self.dth_high_critic_head(fused_feat_with_goals) # [B, 1]
+        
+        return R_u, g_u, q_values
+
+    def dth_low_level_act(self, agent_obs, goals, temperature=1.0, hard=False):
+        """
+        parameters:
+            agent_obs: [Batch, 4]
+            goals: [Batch, goal_dim]
+        returns:
+            action_dist: Categorical distribution over actions
+            value: state value
+        """
+        input_tensor = torch.cat([agent_obs, goals], dim=-1)  # [Batch, 4 + goal_dim]
+        low_action_logits = self.dth_low_actor(input_tensor)  # [Batch, num_actions]
+
+        # 2. 动作采样逻辑
+        if self.training:
+            # === 训练模式：Gumbel-Softmax 采样 ===
+            # 核心：生成 One-Hot 动作，但梯度可以回传给 Actor
+            action_out = F.gumbel_softmax(low_action_logits, tau=temperature, hard=hard, dim=-1)
+        else:
+            # === 评估模式：确定性选择 (Argmax) ===
+            # 测试时不需要随机噪声，直接选概率最大的
+            action_idx = torch.argmax(low_action_logits, dim=-1)
+            # 转换成 One-Hot 格式以保持数据格式统一
+            action_out = F.one_hot(action_idx, num_classes=low_action_logits.size(-1)).float()
+
+        return action_out, low_action_logits
 
     def get_explore_nodes(self, top_k, rrt_max_iter, vec_inp, map_inp, agent_indices=None, deterministic=False):
         """

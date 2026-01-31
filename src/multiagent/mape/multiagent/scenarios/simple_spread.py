@@ -70,6 +70,8 @@ class Scenario(BaseScenario):
         return True if dist < dist_min else False
     
     def reward(self, agent, world):
+        if agent.state.g_pos is None:
+            return 0.0
         # 直接计算每个智能体距离自己目标点的距离奖励
         reward = -np.linalg.norm(agent.state.p_pos - agent.state.g_pos)
         reward = np.clip(reward, -15, 15)

@@ -174,10 +174,12 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         print(f"GIF files will be saved to: {eval_folder}")
 
     for t in range(num_eval_episodes):
+        eta = 0.1  # weight for action smoothness loss
         obs, env_states, info = env.reset()
         master.envs_info = info
-        # 修复：使用args.device确保设备一致性
-        recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size, device=args.device)
+        belief_maps = np.array([info['belief_map']])  # [num_processes, map_dim, map_dim]
+        visited_maps = np.array([info['visited_map']])  # [num_processes, map_dim, map_dim]
+        curr_map_entropy = np.array([info['entropy_map']])  # [num_processes, map_dim, map_dim]
         obs = normalize_obs(obs, obs_mean, obs_std)
         done = [False]*env.n
         masks = torch.ones(env.n, 1, device=args.device)
@@ -239,28 +241,68 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         
         while not np.all(done):
             actions = []
+            obs = np.array(obs)[np.newaxis, ...]  # [1, n_agents, obs_dim]
             with torch.no_grad():
-                # print("step:", info['world_steps'])
-                actions, goals, tasks, landmark_data, landmark_mask = master.eval_act(obs, env_states, masks,
-                                                                                      goals, tasks, 
-                                                                                      landmark_data, 
-                                                                                      landmark_mask)
+                if episode_steps == 0:
+                    # for each episode, initia
+                    R_u, g_u = master.high_level_act(obs, belief_maps)
+                    r_init = master.compute_initial_reward(R_u, obs, visited_maps)  # [num_processes, num_agents]
+
+                    last_goals = g_u
+                    last_obs = obs
+                    last_belief_maps = belief_maps
+                    last_visited_maps = visited_maps
+                    last_map_entropy = curr_map_entropy
+
+                if episode_steps % args.K == 0 and episode_steps > 0:
+                    next_belief_maps = belief_maps
+                    next_obs = obs
+                    next_visited_maps = visited_maps
+                    
+                    prev_goals = last_goals
+                    last_goals = g_u
+                    # 1. get current state (t)
+                    curr_map_entropy = np.array([info['entropy_map']])  # [num_processes, map_dim, map_dim]
+                    
+                    # 2. compute high-level reward (t-K to t)
+                    # a. compute each agent's ref reward from (t-K) to (t)
+                    r_ref = master.compute_r_ref(R_u, last_map_entropy, curr_map_entropy)   # [num_processes, num_agents]
+
+                    # b. action smooth loss
+                    smooth_loss = np.linalg.norm(last_goals - prev_goals, axis=2)  # [num_processes, num_agents]
+
+                    # d. total high-level reward
+                    beta = master.get_beta(episode_steps, args.episode_steps)
+                    high_level_rewards = (1-beta) * r_init + beta * r_ref - eta * smooth_loss   # [num_processes, num_agents]
+                    episode_high_rewards += high_level_rewards[0]
+
+                    # 3. 
+                    R_u, g_u = master.high_level_act(obs, belief_maps)
+                    r_init = master.compute_initial_reward(R_u, next_obs, next_visited_maps)
+
+                    # 5. save for next high-level reward computation
+                    last_belief_maps = belief_maps
+                    last_obs = next_obs
+                    last_visited_maps = next_visited_maps
+                    last_map_entropy = curr_map_entropy
+
+                # === Low-Level Decision (every step) ===
+                agent_actions, action_int= master.low_level_act(obs, g_u)
+                step_data = {'agents_actions': action_int[0]}
+                next_obs, rew, low_level_rewards, done_info, info, env_state = env.step(step_data)
+                next_belief_maps = np.array([info['belief_map']]) # [num_processes, map_dim, map_dim]
+                episode_rewards += low_level_rewards
+
+                # 1. add to buffer...
+                done = np.array([done_info['all']])
+
+                # 2. save for next step
+                obs = next_obs
+                belief_maps = next_belief_maps
+                visited_maps = np.array([info['visited_map']])  # [num_processes, map_dim, map_dim]
+                master.envs_info = info
+
             episode_steps += 1
-            step_data = {'agents_actions': actions, 'agents_goals': goals, 'agents_tasks': tasks} 
-            if isinstance(step_data['agents_goals'], torch.Tensor):
-                step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
-            if isinstance(step_data['agents_tasks'], torch.Tensor):
-                step_data['agents_tasks'] = step_data['agents_tasks'].cpu().numpy()
-            obs, reward, high_reward, done_info, info, env_states = env.step(step_data)
-            done = done_info['agent']
-            done_agent = np.array(done_info['agent'])
-            high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
-            masks = torch.FloatTensor(1-1.0*done_agent).to(args.device)
-            reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
-            obs = normalize_obs(obs, obs_mean, obs_std)
-            master.envs_info = info
-            episode_rewards += reward.cpu().numpy()
-            episode_high_rewards += high_reward.cpu().numpy()
             
             # Render for GIF saving (if needed)
             if should_save_gif:
@@ -270,10 +312,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                 render_result = env.render(
                     mode='rgb_array', 
                     attn=attn,
-                    goals=step_data['agents_goals'],
                     show_voronoi=True,
                     show_uncertainty=True,  # 👈 启用不确定性显示
-                    tasks=step_data['agents_tasks'],
                     info=info
                 )
                 if render_result:
@@ -283,7 +323,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                     num_visited = sum(env.landmark_visited) if hasattr(env, 'landmark_visited') else 0
                     num_targets = len(env.world.landmarks) if hasattr(env.world, 'landmarks') else args.num_agents
                     # 记录当前步每个智能体的奖励（high-level）
-                    current_step_rewards = high_reward.cpu().numpy()
+                    current_step_rewards = high_level_rewards.cpu().numpy()
                     frame_stats.append((episode_steps, num_retired, num_visited, num_targets, current_step_rewards))
             
             # Show window if render is enabled
@@ -294,10 +334,8 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
                 env.render(
                     mode='human', 
                     attn=attn,
-                    goals=step_data['agents_goals'],
                     show_voronoi=True,
                     show_uncertainty=True,  # 👈 启用不确定性显示
-                    tasks=step_data['agents_tasks'],
                     info=info
                 )
                 if args.record_video:
