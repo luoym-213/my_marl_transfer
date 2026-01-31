@@ -135,6 +135,7 @@ class MultiAgentEnv(gym.Env):
 
         # 获取step前全局状态，智能体速度、位置，landmark位置
         state = self._get_state(self.world)
+        last_agents_pos = np.array([a.state.p_pos for a in self.agents])
 
         # set action and goal for each agent
         for i, agent in enumerate(self.agents):
@@ -152,28 +153,40 @@ class MultiAgentEnv(gym.Env):
         for agent in self.agents:
             last_reward_n.append(self._get_goal_reward(agent))
 
+        # 收集step前的belief_map，用于后续计算差分奖励
+        last_belief_map = self.global_belief_map.belief_grid.copy()
+
         # advance world state
         self.world.step()
 
+        # A. 计算底层差分奖励
         # 收集当前智能体位置
         agents_pos = np.array([a.state.p_pos for a in self.agents])
 
-        # 必须在更新全图信息图前获取高层奖励，因为高层奖励依赖于step前的全局信息图
-        agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
-        agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
-        # 到达目标点奖励，需要满足当前当前task = 1，即collect模式，且距离目标点小于阈值
-        goal_dones = self._get_goal_dones(self.agents) # 获取当前step后，智能体是否达到目标点的布尔列表
-        agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, goal_dones)
+        # a. 计算【有我】时的全局势能
+        current_global_potential = self.global_belief_map.compute_global_potential(last_belief_map, agents_pos, self.world.mask_obs_dist)
 
-        # 总高层奖励
-        total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards) - self.time_penalty
+        # b. 计算【无我】时的反事实势能 & 差分奖励
+        low_level_rewards = []
+
+        for i, agent in enumerate(self.agents):
+            # 构建反事实位置列表
+            counterfactual_positions = agents_pos.copy()
+            # 将当前智能体位置替换为上一步位置
+            counterfactual_positions[i] = last_agents_pos[i]
+            # 计算反事实势能
+            counterfactual_potential = self.global_belief_map.compute_global_potential(last_belief_map, counterfactual_positions, self.world.mask_obs_dist)
+            # 计算差分奖励
+            diff_reward = current_global_potential - counterfactual_potential
+            low_level_rewards.append(diff_reward)
 
         # 根据获取的全局状态更新全局信息图
         if self.enable_exploration_reward:
             self.global_belief_map.update_beliefs(agents_pos, self.world.mask_obs_dist)
 
         # 获取step更新后的voronoi加权质心以及目标位置
-        centroids = []
+        centroids = self.global_belief_map.get_voronoi_weighted_centroids(agents_pos) if self.enable_exploration_reward else []
+        
         target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
 
         # 添加world_steps到info_n中

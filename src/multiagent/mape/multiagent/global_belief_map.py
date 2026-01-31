@@ -142,35 +142,67 @@ class GlobalBeliefMap:
         dist_sq = (self.cell_world_x - x)**2 + (self.cell_world_y - y)**2
         return dist_sq <= obs_radius**2
     
-    def bayesian_update(self, positive_mask, negative_mask):
+    def bayesian_update(self, positive_mask, negative_mask, last_belief_map=None):
         """使用贝叶斯规则更新信念"""
-        # 正向更新：检测到目标
-        if np.any(positive_mask):
-            b_prev = self.belief_grid[positive_mask]
-            p_s = self.sensor_fidelity
+
+        if last_belief_map is None:
+            # 正向更新：检测到目标
+            if np.any(positive_mask):
+                b_prev = self.belief_grid[positive_mask]
+                p_s = self.sensor_fidelity
+                
+                numerator = p_s * b_prev
+                denominator = p_s * b_prev + (1 - p_s) * (1 - b_prev)
+                denominator = np.maximum(denominator, self.epsilon)
+                
+                b_new = numerator / denominator
+                b_new = np.clip(b_new, 0.0, 1.0)
+                self.belief_grid[positive_mask] = b_new
             
-            numerator = p_s * b_prev
-            denominator = p_s * b_prev + (1 - p_s) * (1 - b_prev)
-            denominator = np.maximum(denominator, self.epsilon)
-            
-            b_new = numerator / denominator
-            b_new = np.clip(b_new, 0.0, 1.0)
-            self.belief_grid[positive_mask] = b_new
+            # 负向更新：未检测到目标
+            if np.any(negative_mask):
+                b_prev = self.belief_grid[negative_mask]
+                p_s = self.sensor_fidelity
+                
+                numerator = (1 - p_s) * b_prev
+                denominator = (1 - p_s) * b_prev + p_s * (1 - b_prev)
+                denominator = np.maximum(denominator, self.epsilon)
+                
+                b_new = numerator / denominator
+                b_new = np.clip(b_new, 0.0, 1.0)
+                self.belief_grid[negative_mask] = b_new
+
+            return self.belief_grid
         
-        # 负向更新：未检测到目标
-        if np.any(negative_mask):
-            b_prev = self.belief_grid[negative_mask]
-            p_s = self.sensor_fidelity
+        else:
+            # 使用提供的 last_belief_map 进行更新
+            if np.any(positive_mask):
+                b_prev = last_belief_map[positive_mask]
+                p_s = self.sensor_fidelity
+                
+                numerator = p_s * b_prev
+                denominator = p_s * b_prev + (1 - p_s) * (1 - b_prev)
+                denominator = np.maximum(denominator, self.epsilon)
+                
+                b_new = numerator / denominator
+                b_new = np.clip(b_new, 0.0, 1.0)
+                last_belief_map[positive_mask] = b_new
             
-            numerator = (1 - p_s) * b_prev
-            denominator = (1 - p_s) * b_prev + p_s * (1 - b_prev)
-            denominator = np.maximum(denominator, self.epsilon)
+            if np.any(negative_mask):
+                b_prev = last_belief_map[negative_mask]
+                p_s = self.sensor_fidelity
+                
+                numerator = (1 - p_s) * b_prev
+                denominator = (1 - p_s) * b_prev + p_s * (1 - b_prev)
+                denominator = np.maximum(denominator, self.epsilon)
+                
+                b_new = numerator / denominator
+                b_new = np.clip(b_new, 0.0, 1.0)
+                last_belief_map[negative_mask] = b_new
             
-            b_new = numerator / denominator
-            b_new = np.clip(b_new, 0.0, 1.0)
-            self.belief_grid[negative_mask] = b_new
+            return last_belief_map
     
-    def update_beliefs(self, agent_positions, obs_radius):
+    def update_beliefs(self, agent_positions, obs_radius, last_belief_map=None):
         """
         根据智能体观测和 landmark 实际位置更新信念地图
         
@@ -190,11 +222,14 @@ class GlobalBeliefMap:
         negative_mask = fov_mask & (~self.landmark_map)
 
         # 4. 执行贝叶斯更新
-        self.bayesian_update(positive_mask, negative_mask)
+        if last_belief_map is None:
+            return self.bayesian_update(positive_mask, negative_mask)  
+        else:
+            return self.bayesian_update(positive_mask, negative_mask, last_belief_map)
     
-    def compute_shannon_entropy(self):
+    def compute_shannon_entropy(self, curr_belief=None):
         """计算每个栅格的香农熵"""
-        b = self.belief_grid
+        b = self.belief_grid if curr_belief is None else curr_belief
         
         with np.errstate(divide='ignore', invalid='ignore'):
             entropy = np.where(
@@ -709,3 +744,44 @@ class GlobalBeliefMap:
     def get_agent_discover_target_reward(self, agent_positions, radius, reward_value=1.0):
         """向后兼容的发现目标奖励接口"""
         return self.get_agent_step_rewards(agent_positions, radius, reward_value)['discover_rewards']
+    
+    def compute_global_potential(self, last_belief_map, agent_positions, obs_radius):
+        """
+        计算全局潜力值，衡量智能体团队对高不确定性区域的覆盖程度
+        
+        参数:
+            last_belief_map: 上一时间步的信念地图 (GlobalBeliefMap 对象)
+            agent_positions: 智能体位置列表 [(x1, y1), (x2, y2), ...]
+            obs_radius: 观测半径
+        
+        计算: 
+            \Phi(\mathbf{a}_t) = \mu \cdot \Delta \mathcal{I}(\mathbf{a}_t) + (1-\mu) \cdot \text{CovPotential}(\mathbf{a}_t, b(t))
+        
+        返回:
+            global_potential: 浮点数，表示全局潜力值
+        """
+        if len(agent_positions) == 0:
+            return 0.0
+        
+        # 0. 计算信念地图的变化（熵变化）
+        curr_belief = self.update_beliefs(agent_positions, obs_radius, last_belief_map)
+        curr_entropy = self.compute_shannon_entropy(curr_belief)
+        last_belief = last_belief_map
+        last_entropy = self.compute_shannon_entropy(last_belief)
+        delta_global_entropy = last_entropy - curr_entropy
+
+        # 1. 计算覆盖势能cov_potential
+        # 计算当前动作下，所有智能体的观测掩码
+        combined_fov_mask = np.zeros((self.map_dim, self.map_dim), dtype=bool)
+        for agent_pos in agent_positions:
+            fov_mask = self.get_fov_mask(agent_pos, obs_radius)
+            combined_fov_mask |= fov_mask
+        # 计算覆盖网格的价值，即覆盖区域的信念总和
+        covered_belief = self.belief_grid[combined_fov_mask]
+        cov_potential = np.sum(covered_belief)
+
+        # 2. 返回加权和作为全局潜力值
+        mu = 0.35  # 权重系数，可根据需要调整
+        global_potential = mu * np.sum(delta_global_entropy) + (1 - mu) * cov_potential
+        
+        return float(global_potential)
