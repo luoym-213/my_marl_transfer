@@ -1,0 +1,255 @@
+import numpy as np
+import torch
+from arguments import get_args
+from utils import normalize_obs
+from learner import setup_master
+import time
+import os
+import imageio
+
+# Global counter to track evaluate function calls
+_evaluate_call_count = 0
+
+def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, master=None, render_attn=True):
+    """
+    RL evaluation: supports eval through training code as well as independently
+    policies_list should be a list of policies of all the agents;
+    len(policies_list) = num agents
+    """
+    global _evaluate_call_count
+    _evaluate_call_count += 1
+    current_eval_call = _evaluate_call_count
+    
+    if env is None or master is None: # if any one of them is None, generate both of them
+        master, env = setup_master(args, return_env=True)
+        # Set observation range for visualization
+        if hasattr(args, 'mask_obs_dist'):
+            env.world.mask_obs_dist = args.mask_obs_dist
+
+    if seed is None: # ensure env eval seed is different from training seed
+        seed = np.random.randint(0,100000)
+    print("Evaluation Seed: ",seed)
+    print(f"Evaluation Call #{current_eval_call}")
+    env.seed(seed)
+
+    if ob_rms is not None:
+        obs_mean, obs_std = ob_rms
+    else:
+        obs_mean = None
+        obs_std = None
+    master.load_models(policies_list)
+    master.set_eval_mode()
+
+    num_eval_episodes = args.num_eval_episodes
+    all_episode_rewards = np.full((num_eval_episodes, env.n), 0.0)
+    per_step_rewards = np.full((num_eval_episodes, env.n), 0.0)
+
+    # TODO: provide support for recurrent policies and mask
+    recurrent_hidden_states = None
+    mask = None
+
+    # world.dists at the end of episode for simple_spread
+    final_min_dists = []
+    num_success = 0
+    episode_length = 0
+    
+    # 新增变量，用于计算成功回合的平均步数
+    successful_steps_total = 0
+    successful_episodes_count = 0
+    
+    # 新增变量，用于记录发现所有landmark的数据
+    all_discovery_times = []
+    episodes_fully_discovered = 0
+
+    # Create evaluation-specific folder if record_video is enabled
+    eval_folder = None
+    if args.record_video:
+        eval_folder = os.path.join(args.gif_save_path, f"evaluation_{current_eval_call}")
+        os.makedirs(eval_folder, exist_ok=True)
+        print(f"GIF files will be saved to: {eval_folder}")
+
+    for t in range(num_eval_episodes):
+        obs, env_states, info = env.reset()
+        master.envs_info = info
+        # 修复：使用args.device确保设备一致性
+        recurrent_hidden_states = torch.zeros(args.num_agents, args.recurrent_hidden_state_size, device=args.device)
+        obs = normalize_obs(obs, obs_mean, obs_std)
+        done = [False]*env.n
+        episode_rewards = np.full(env.n, 0.0)
+        episode_steps = 0
+        
+        # 记录landmark发现状态
+        num_landmarks = len(env.world.landmarks)
+        discovered_landmarks = np.zeros(num_landmarks, dtype=bool)
+        episode_discovery_step = None
+        
+        # 初始检查landmark发现情况
+        dists = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in env.world.landmarks] for a in env.world.agents])
+        min_dists_to_landmarks = np.min(dists, axis=0)
+        # 用 args.dist_threshold，如果不存在默认为 0.1
+        threshold = args.dist_threshold if hasattr(args, 'dist_threshold') else 0.1
+        discovered_landmarks |= (min_dists_to_landmarks < threshold)
+        if np.all(discovered_landmarks) and episode_discovery_step is None:
+            episode_discovery_step = episode_steps
+        
+        # Determine rendering behavior
+        # If record_video is True, we always want to save GIF for first 5 episodes
+        # If render is True, we show the window for first 5 episodes
+        should_save_gif = args.record_video and t < 5
+        should_show_window = render and t < 5
+        
+        # Initialize frame collection for GIF
+        frames = []
+        
+        # Initialize goals to None at the start of each episode
+        goals = None
+        
+        # Initial render for GIF saving (if needed)
+        if should_save_gif:
+            attn = None if not render_attn else master.team_attn
+            if attn is not None and len(attn.shape)==3:
+                attn = attn.max(0)
+            render_result = env.render(
+                mode='rgb_array', 
+                attn=attn,
+                goals=goals,
+                show_voronoi=True,
+                show_uncertainty=True  # 👈 启用不确定性显示
+            )
+            if render_result:
+                frames.append(render_result[0])
+        
+        # Show window if render is enabled
+        if should_show_window:
+            attn = None if not render_attn else master.team_attn
+            if attn is not None and len(attn.shape)==3:
+                attn = attn.max(0)
+            env.render(
+                mode='human', 
+                attn=attn,
+                goals=goals,
+                show_voronoi=True,
+                show_uncertainty=True  # 👈 启用不确定性显示
+            )
+        
+        while not np.all(done):
+            actions = []
+            with torch.no_grad():
+                actions, goals = master.eval_act(obs, env_states, goals)
+            episode_steps += 1
+            step_data = {'agents_actions': actions, 'agents_goals': goals} 
+            if isinstance(step_data['agents_goals'], torch.Tensor):
+                step_data['agents_goals'] = step_data['agents_goals'].cpu().numpy()
+            obs, reward, done, info, env_states = env.step(step_data)
+            reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
+            obs = normalize_obs(obs, obs_mean, obs_std)
+            master.envs_info = info
+            episode_rewards += np.array(reward)
+            
+            # 更新landmark发现情况
+            if episode_discovery_step is None:
+                dists_step = np.array([[np.linalg.norm(a.state.p_pos - l.state.p_pos) for l in env.world.landmarks] for a in env.world.agents])
+                min_dists_step = np.min(dists_step, axis=0)
+                discovered_landmarks |= (min_dists_step < threshold)
+                if np.all(discovered_landmarks):
+                    episode_discovery_step = episode_steps
+            
+            # Render for GIF saving (if needed)
+            if should_save_gif:
+                attn = None if not render_attn else master.team_attn
+                if attn is not None and len(attn.shape)==3:
+                    attn = attn.max(0)
+                render_result = env.render(
+                    mode='rgb_array', 
+                    attn=attn,
+                    goals=step_data['agents_goals'],
+                    show_voronoi=True,
+                    show_uncertainty=True,  # 👈 启用不确定性显示
+                    info=info
+                )
+                if render_result:
+                    frames.append(render_result[0])
+            
+            # Show window if render is enabled
+            if should_show_window:
+                attn = None if not render_attn else master.team_attn
+                if attn is not None and len(attn.shape)==3:
+                    attn = attn.max(0)
+                env.render(
+                    mode='human', 
+                    attn=attn,
+                    goals=step_data['agents_goals'],
+                    show_voronoi=True,
+                    show_uncertainty=True,  # 👈 启用不确定性显示
+                    info=info
+                )
+                if args.record_video:
+                    time.sleep(0.08)
+
+        per_step_rewards[t] = episode_rewards/episode_steps
+        num_success += info['n'][0]['is_success']
+        episode_length = (episode_length*t + info['n'][0]['world_steps'])/(t+1)
+        
+        # 更新成功回合的统计数据
+        if info['n'][0]['is_success']:
+            successful_steps_total += info['n'][0]['world_steps']
+            successful_episodes_count += 1
+
+        # 记录每回合全部发现landmark的时间
+        if episode_discovery_step is not None:
+            all_discovery_times.append(episode_discovery_step)
+            episodes_fully_discovered += 1
+        else:
+            # 如果直到回合结束都没有全部发现，可以用最大步数作为时间，或者选择忽略
+            all_discovery_times.append(episode_steps)
+
+        # for simple spread env only
+        if args.env_name == 'simple_spread':
+            final_min_dists.append(env.world.min_dists)
+        elif args.env_name == 'simple_formation' or args.env_name=='simple_line':
+            final_min_dists.append(env.world.dists)
+
+        if should_show_window:
+            print("Ep {} | Success: {} \n Av per-step reward: {:.2f} | Ep Length {}".format(t,info['n'][0]['is_success'],
+                per_step_rewards[t][0],info['n'][0]['world_steps']))
+        all_episode_rewards[t, :] = episode_rewards # all_episode_rewards shape: num_eval_episodes x num agents
+
+        # Save GIF for this episode
+        if should_save_gif and frames:
+            # Simple sequential naming within the evaluation folder
+            gif_filename = f"{t+1}.gif"  # 1.gif, 2.gif, 3.gif, 4.gif, 5.gif
+            gif_path = os.path.join(eval_folder, gif_filename)
+            
+            try:
+                # Save frames as GIF using imageio
+                imageio.mimsave(gif_path, frames, duration=0.1)  # 0.1s per frame (10 FPS)
+                print(f"Saved GIF: {gif_path}")
+            except Exception as e:
+                print(f"Error saving GIF {gif_path}: {e}")
+    
+    # 计算成功回合的平均步数
+    successful_average_length = 0
+    if successful_episodes_count > 0:
+        successful_average_length = successful_steps_total / successful_episodes_count
+
+    # 计算全部发现landmark的平均时间
+    average_discovery_time = np.mean(all_discovery_times) if all_discovery_times else 0
+
+    return all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count, average_discovery_time, episodes_fully_discovered
+
+
+if __name__ == '__main__':
+    args = get_args()
+    checkpoint = torch.load(args.load_dir, map_location=lambda storage, loc: storage)
+    policies_list = checkpoint['models']
+    ob_rms = checkpoint['ob_rms']
+    all_episode_rewards, per_step_rewards, final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count, average_discovery_time, episodes_fully_discovered = evaluate(args, args.seed, 
+                    policies_list, ob_rms, args.render, render_attn=args.masking)
+    print("Average Per Step Reward {}\nNum Success {}/{} | Av. Episode Length {:.2f})"
+            .format(per_step_rewards.mean(0),num_success,args.num_eval_episodes,episode_length))
+    print("Successful Episodes Average Length: {:.2f} ({}/{} episodes)"
+            .format(successful_average_length, successful_episodes_count, args.num_eval_episodes))
+    print("Average Time to Discover All Landmarks: {:.2f} steps (Fully Discovered in {}/{} episodes)"
+            .format(average_discovery_time, episodes_fully_discovered, args.num_eval_episodes))
+    if final_min_dists:
+        print("Final Min Dists {}".format(np.stack(final_min_dists).mean(0)))
