@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import math
 from scipy.optimize import linear_sum_assignment  # 匈牙利算法
 from torch.distributions import Categorical as TorchCategorical
-from planning.rrt_GNN import RRT_GNN, plan_batch
+from planning.rrt_GNN import RRT_GNN, plan_batch, plan_batch_random
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -662,7 +662,8 @@ class MPNN(nn.Module):
         voronoi_inp = voronoi_np.reshape(-1, voronoi_np.shape[-2], voronoi_np.shape[-1])  # [B_pro*B_agents, H, W]
         entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])  # [B_pro*B_agents, H, W]
         
-        batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=rrt_max_iter, top_k=top_k)  # [B_pro*B_agents, K, 3]
+        #batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=rrt_max_iter, top_k=top_k)  # [B_pro*B_agents, K, 3]
+        batch_rtt = plan_batch_random(starte_nodes, voronoi_inp, entropy_inp, max_iterations=rrt_max_iter, top_k=top_k)  # [B_pro*B_agents, K, 3]
         batch_rtt = torch.tensor(batch_rtt, dtype=torch.float32, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
         
         ## 转为世界坐标

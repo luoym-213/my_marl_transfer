@@ -599,5 +599,70 @@ def plan_batch(
     return results
 
 
+def plan_batch_random(
+    starts: Sequence[Sequence[int]],
+    voronoi_masks: np.ndarray,
+    entropy_maps: np.ndarray,
+    entropy_threshold: float = 0.8,
+    radius: int = 2,
+    expand_dis: int = 4,
+    max_iterations: int = 50,
+    top_k: int = 10,
+) -> List[List[List[float]]]:
+    """
+    Batch 随机采样版本（消融实验）：
+    对每个 batch 样本不运行 RRT，而是在 Voronoi 区域内直接随机采样 K 个点返回。
+
+    输入/输出接口与 plan_batch 完全一致。
+
+    输入:
+      - starts: (B, 2) 的栅格索引 [[x,y], ...]
+      - voronoi_masks: (B, H, W) bool
+      - entropy_maps: (B, H, W) float
+
+    输出:
+      - results: 长度为 B 的 list；每个元素是 [[x, y, value], ...]
+                 其中 value 为该点在 entropy_map 上的熵值（用于占位，保持接口一致）
+    """
+    # 保留与 plan_batch 相同的参数接口。以下参数在随机消融中不使用：
+    # entropy_threshold, radius, expand_dis, max_iterations
+    _ = entropy_threshold, radius, expand_dis, max_iterations
+
+    if voronoi_masks.ndim != 3 or entropy_maps.ndim != 3:
+        raise ValueError("voronoi_masks 与 entropy_maps 需要是 (B,H,W)")
+    if len(starts) != voronoi_masks.shape[0] or len(starts) != entropy_maps.shape[0]:
+        raise ValueError("starts 与 masks/maps 的 batch 维度 B 不一致")
+
+    results: List[List[List[float]]] = []
+    B = voronoi_masks.shape[0]
+
+    for b in range(B):
+        indices = np.argwhere(voronoi_masks[b])
+
+        if len(indices) == 0:
+            # 与 RRT 异常回退思路一致：若 Voronoi 为空，返回起点附近随机点
+            fallback_nodes: List[List[float]] = []
+            sx, sy = int(starts[b][0]), int(starts[b][1])
+            h, w = entropy_maps[b].shape
+            for _ in range(top_k):
+                x = int(np.clip(sx + np.random.randint(-5, 6), 0, h - 1))
+                y = int(np.clip(sy + np.random.randint(-5, 6), 0, w - 1))
+                fallback_nodes.append([x, y, float(entropy_maps[b, x, y])])
+            results.append(fallback_nodes)
+            continue
+
+        k = min(top_k, len(indices))
+        sampled_ids = np.random.choice(len(indices), size=k, replace=False)
+
+        sampled_nodes: List[List[float]] = []
+        for idx in sampled_ids:
+            x, y = int(indices[idx][0]), int(indices[idx][1])
+            sampled_nodes.append([x, y, float(entropy_maps[b, x, y])])
+
+        results.append(sampled_nodes)
+
+    return results
+
+
 if __name__ == '__main__':
     main()
