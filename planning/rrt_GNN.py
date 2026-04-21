@@ -325,9 +325,11 @@ class RRT_GNN:
                     print(f"采样出错: {e}")
                     continue
             
-            # 按价值排序，选择Top-K节点
+            # 按价值排序，选择Top-K节点。下游会堆叠成规则张量，所以必须固定返回 top_k 个。
             sorted_nodes = sorted(self.node_list, key=lambda node: node.value, reverse=True)
-            top_k_nodes = sorted_nodes[:min(self.top_k, len(sorted_nodes))]
+            top_k_nodes = sorted_nodes[:self.top_k]
+            while len(top_k_nodes) < self.top_k:
+                top_k_nodes.append(top_k_nodes[-1])
             
             # 格式化返回结果，value进行归一化  / 1500
             result = [
@@ -651,8 +653,8 @@ def plan_batch_random(
             results.append(fallback_nodes)
             continue
 
-        k = min(top_k, len(indices))
-        sampled_ids = np.random.choice(len(indices), size=k, replace=False)
+        replace = len(indices) < top_k
+        sampled_ids = np.random.choice(len(indices), size=top_k, replace=replace)
 
         sampled_nodes: List[List[float]] = []
         for idx in sampled_ids:
