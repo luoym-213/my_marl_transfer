@@ -775,7 +775,8 @@ class Learner(object):
             'ego_to_explore_edges': [], # 自我到探索节点的边
             'ego_to_landmark_edges': [], # 自我到landmark的边
             'selected_goal_idx': [],   # 选中的目标索引
-            'selected_task': []        # 选中的任务类型
+            'selected_task': [],        # 选中的任务类型
+            'entropy_map': []        # 熵地图 [H, W]
         }
 
         for i in range(len(obs)):
@@ -807,6 +808,7 @@ class Learner(object):
             entropy_map = torch.from_numpy(np.array(self.envs_info['entropy_map'])).float().unsqueeze(0).to(self.device)  # [1, H, W]
             heatmap = torch.from_numpy(np.array(self.envs_info['heatmap'])).float().unsqueeze(0).to(self.device)  # [1, H, W]
             landmark_heatmap = torch.from_numpy(np.array(self.envs_info['landmark_heatmap'])).float().unsqueeze(0).to(self.device)  # [1, H, W]
+            graph_data['entropy_map'].append(entropy_map[0])  # [H, W]
 
             # 1.2. 收集所有 goal_done 状态并构建mask
             goal_done_list = [self.envs_info['goal_done']]  # ✅ 包装成列表

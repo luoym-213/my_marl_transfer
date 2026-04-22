@@ -6,6 +6,7 @@ from learner import setup_master
 import time
 import os
 import imageio
+import csv
 from PIL import Image, ImageDraw, ImageFont
 
 # Global counter to track evaluate function calls
@@ -170,8 +171,10 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     all_time_to_cover_1 = []  # 覆盖第1个landmark的时间
     all_time_to_cover_2 = []  # 覆盖第2个landmark的时间
     all_time_to_cover_3 = []  # 覆盖第3个landmark的时间
-    all_time_to_discover_all = []  # 发现所有landmark的时间
+    all_time_to_discover_k = []  # 发现第k个landmark的时间（k从1开始）
     all_avg_velocities = []  # 每个episode的agent平均速度
+    search_efficiency_sums = []  # 每个step的搜索效率累计和
+    search_efficiency_counts = []  # 每个step参与平均的episode计数
 
     # Create evaluation-specific folder if record_video is enabled
     eval_folder = None
@@ -209,10 +212,14 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         landmark_data = torch.zeros((len(obs), args.num_agents, 4), dtype=torch.float32, device=args.device)
         landmark_mask = torch.zeros((len(obs), args.num_agents, 1), dtype=torch.float32, device=args.device)
         
+        num_landmarks = len(env.world.landmarks) if hasattr(env.world, 'landmarks') else args.num_agents
+        if not all_time_to_discover_k:
+            all_time_to_discover_k = [[] for _ in range(num_landmarks)]
+
         # ⭐ 跟踪发现和覆盖状态
         discovered_landmarks = set()  # 已发现的landmark索引
         covered_landmarks = set()  # 已覆盖的landmark索引
-        time_to_discover_all = None  # 发现所有landmark的时间
+        time_to_discover_k = [None] * num_landmarks  # 发现第k个landmark的时间（k从1开始）
         time_to_cover_1 = None  # 覆盖第1个landmark的时间
         time_to_cover_2 = None  # 覆盖第2个landmark的时间
         time_to_cover_3 = None  # 覆盖第3个landmark的时间
@@ -220,6 +227,24 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         # ⭐ 跟踪速度信息
         velocity_sum = 0.0  # 累积所有agent的速度
         velocity_count = 0  # 速度采样次数
+
+        # ⭐ 搜索效率统计：Coverage(t) = 1 - H_global(t)/H_max
+        h_max = None
+        if isinstance(info, dict) and 'entropy_map' in info:
+            entropy_init = np.asarray(info['entropy_map'], dtype=np.float32)
+            h_max = float(np.sum(entropy_init))
+
+        # 记录 step=0 的搜索效率
+        if h_max is None or h_max <= 1e-8:
+            coverage_step0 = 0.0
+        else:
+            coverage_step0 = 1.0 - (h_max / h_max)
+        if len(search_efficiency_sums) == 0:
+            search_efficiency_sums.append(coverage_step0)
+            search_efficiency_counts.append(1)
+        else:
+            search_efficiency_sums[0] += coverage_step0
+            search_efficiency_counts[0] += 1
 
         # Initial render for GIF saving (if needed)
         if should_save_gif:
@@ -280,7 +305,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             master.envs_info = info
             episode_rewards += reward.cpu().numpy()
             episode_high_rewards += high_reward.cpu().numpy()
-            
+
             # ⭐ 累积速度信息（obs前2维是速度[vx, vy]）
             for agent_obs in obs:
                 vx, vy = agent_obs[0], agent_obs[1]
@@ -291,16 +316,49 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             # ⭐ 跟踪发现状态（基于sensor_range内的检测）
             if hasattr(args, 'mask_obs_dist'):
                 sensor_range = args.mask_obs_dist
+                prev_discovered_count = len(discovered_landmarks)
                 for lm_idx, landmark in enumerate(env.world.landmarks):
                     lm_pos = landmark.state.p_pos
                     for agent in env.agents:
                         if np.linalg.norm(agent.state.p_pos - lm_pos) < sensor_range:
                             discovered_landmarks.add(lm_idx)
                             break
-            
-            # ⭐ 记录发现所有landmark的时间（首次）
-            if time_to_discover_all is None and len(discovered_landmarks) == len(env.world.landmarks):
-                time_to_discover_all = episode_steps
+
+                # ⭐ 记录首次发现第1/2/3/...个landmark的时间
+                curr_discovered_count = len(discovered_landmarks)
+                if curr_discovered_count > prev_discovered_count:
+                    for k in range(prev_discovered_count + 1, curr_discovered_count + 1):
+                        if time_to_discover_k[k - 1] is None:
+                            time_to_discover_k[k - 1] = episode_steps
+
+            # ⭐ 根据熵地图计算搜索效率
+            if h_max is not None and h_max > 1e-8:
+                entropy_curr = None
+                if isinstance(info, dict) and 'entropy_map' in info:
+                    entropy_curr = np.asarray(info['entropy_map'], dtype=np.float32)
+                elif isinstance(graph_data, dict) and graph_data.get('entropy_map', None):
+                    entropy_entry = graph_data['entropy_map'][0]
+                    if isinstance(entropy_entry, torch.Tensor):
+                        entropy_curr = entropy_entry.detach().cpu().numpy()
+                    else:
+                        entropy_curr = np.asarray(entropy_entry, dtype=np.float32)
+
+                if entropy_curr is not None:
+                    h_global_t = float(np.sum(entropy_curr))
+                    coverage_t = 1.0 - (h_global_t / h_max)
+                    coverage_t = float(np.clip(coverage_t, 0.0, 1.0))
+                else:
+                    coverage_t = 0.0
+            else:
+                coverage_t = 0.0
+
+            # 按step跨episode累计（step索引与episode_steps一致）
+            if episode_steps >= len(search_efficiency_sums):
+                search_efficiency_sums.append(coverage_t)
+                search_efficiency_counts.append(1)
+            else:
+                search_efficiency_sums[episode_steps] += coverage_t
+                search_efficiency_counts[episode_steps] += 1
             
             # ⭐ 跟踪覆盖状态
             if hasattr(env, 'visited_landmarks'):
@@ -380,7 +438,10 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         all_time_to_cover_1.append(time_to_cover_1 if time_to_cover_1 is not None else episode_steps)
         all_time_to_cover_2.append(time_to_cover_2 if time_to_cover_2 is not None else episode_steps)
         all_time_to_cover_3.append(time_to_cover_3 if time_to_cover_3 is not None else episode_steps)
-        all_time_to_discover_all.append(time_to_discover_all if time_to_discover_all is not None else episode_steps)
+        for k in range(num_landmarks):
+            all_time_to_discover_k[k].append(
+                time_to_discover_k[k] if time_to_discover_k[k] is not None else episode_steps
+            )
         
         # ⭐ 计算并记录平均速度
         avg_velocity = velocity_sum / velocity_count if velocity_count > 0 else 0.0
@@ -431,9 +492,28 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     if successful_episodes_count > 0:
         successful_average_length = successful_steps_total / successful_episodes_count
 
+    # ⭐ 导出每一步平均搜索效率到CSV
+    search_efficiency_avg = []
+    for sum_v, cnt_v in zip(search_efficiency_sums, search_efficiency_counts):
+        avg_v = (sum_v / cnt_v) if cnt_v > 0 else 0.0
+        search_efficiency_avg.append(avg_v)
+
+    os.makedirs(args.gif_save_path, exist_ok=True)
+    search_eff_csv_path = os.path.join(
+        args.gif_save_path,
+        f"search_efficiency_eval_{current_eval_call}.csv"
+    )
+    with open(search_eff_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["step", "avg_search_efficiency", "num_episodes"])
+        for step_idx, (avg_v, cnt_v) in enumerate(zip(search_efficiency_avg, search_efficiency_counts)):
+            writer.writerow([step_idx, avg_v, cnt_v])
+    print(f"Saved search efficiency CSV: {search_eff_csv_path}")
+
     return (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
             final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
-            all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all, all_avg_velocities)
+            all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_k, all_avg_velocities,
+            search_efficiency_avg, search_efficiency_counts)
 
 
 if __name__ == '__main__':
@@ -443,7 +523,8 @@ if __name__ == '__main__':
     ob_rms = checkpoint['ob_rms']
     (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
      final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
-     all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_all, all_avg_velocities) = evaluate(
+     all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_k, all_avg_velocities,
+     search_efficiency_avg, search_efficiency_counts) = evaluate(
         args, args.seed, policies_list, ob_rms, args.render, render_attn=args.masking)
     
     print("\n" + "="*60)
@@ -458,9 +539,15 @@ if __name__ == '__main__':
     print(f"  Cover 2nd Landmark: {np.mean(all_time_to_cover_2):.2f} ± {np.std(all_time_to_cover_2):.2f} steps")
     print(f"  Cover 3rd Landmark: {np.mean(all_time_to_cover_3):.2f} ± {np.std(all_time_to_cover_3):.2f} steps")
     print(f"\n【发现时间】")
-    print(f"  Discover All Landmarks: {np.mean(all_time_to_discover_all):.2f} ± {np.std(all_time_to_discover_all):.2f} steps")
+    for k, discover_times in enumerate(all_time_to_discover_k, start=1):
+        print(f"  Discover {k}th Landmark: {np.mean(discover_times):.2f} ± {np.std(discover_times):.2f} steps")
     print(f"\n【运动性能】")
     print(f"  Average Velocity: {np.mean(all_avg_velocities):.4f} ± {np.std(all_avg_velocities):.4f} units/step")
+    if search_efficiency_avg:
+        valid_mask = np.array(search_efficiency_counts) > 0
+        final_eff = np.array(search_efficiency_avg)[valid_mask][-1]
+        print(f"\n【搜索效率】")
+        print(f"  Final Step Avg Search Efficiency: {final_eff:.4f}")
     print(f"\n【总体性能】")
     print(f"  Average Episode Length: {episode_length:.2f} steps")
     if final_min_dists:
