@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import os
 import imageio
+import csv
 from utils import normalize_obs
 from PIL import Image, ImageDraw, ImageFont
 from arguments import get_args
@@ -144,7 +145,9 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     all_time_to_cover_1 = []  # 覆盖第1个landmark的时间
     all_time_to_cover_2 = []  # 覆盖第2个landmark的时间
     all_time_to_cover_3 = []  # 覆盖第3个landmark的时间
-    all_time_to_discover_all = []  # 发现所有landmark的时间
+    all_time_to_discover_k = [[] for _ in range(config.num_targets)]  # 发现第k个landmark的时间（k从1开始）
+    search_efficiency_sums = []  # 每个step的搜索效率累计和
+    search_efficiency_counts = []  # 每个step参与平均的episode计数
     
     for episode in range(num_eval_episodes):
         print(f"\n--- Episode {episode + 1}/{num_eval_episodes} ---")
@@ -221,10 +224,28 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         # ⭐ 跟踪发现和覆盖状态
         discovered_landmarks = set()  # 已发现的landmark索引
         covered_landmarks = set()  # 已覆盖的landmark索引
-        time_to_discover_all = None  # 发现所有landmark的时间
+        time_to_discover_k = [None] * config.num_targets  # 发现第k个landmark的时间（k从1开始）
         time_to_cover_1 = None  # 覆盖第1个landmark的时间
         time_to_cover_2 = None  # 覆盖第2个landmark的时间
         time_to_cover_3 = None  # 覆盖第3个landmark的时间
+
+        # ⭐ 搜索效率统计：Coverage(t) = 1 - H_global(t)/H_max
+        h_max = None
+        if isinstance(info, dict) and 'entropy_map' in info:
+            entropy_init = np.asarray(info['entropy_map'], dtype=np.float32)
+            h_max = float(np.sum(entropy_init))
+
+        # 记录 step=0 的搜索效率
+        if h_max is None or h_max <= 1e-8:
+            coverage_step0 = 0.0
+        else:
+            coverage_step0 = 1.0 - (h_max / h_max)
+        if len(search_efficiency_sums) == 0:
+            search_efficiency_sums.append(coverage_step0)
+            search_efficiency_counts.append(1)
+        else:
+            search_efficiency_sums[0] += coverage_step0
+            search_efficiency_counts[0] += 1
         
         # Execute trajectory
         for t in range(max_traj_len):
@@ -232,7 +253,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             # 按照最贪婪策略，如果观测到landmark则认为已经发现，立刻执行覆盖策略，安排最近的agent前往覆盖
             # 否则持续执行原有路径规划
             # 1. 获取 RL 策略的输出 (重命名为 rl_actions 以避免冲突)
-            rl_actions, goals, tasks, landmark_data, landmark_mask = master.eval_base_act(obs, env_states, masks,
+            rl_actions, goals, tasks, landmark_data, landmark_mask, entropy_map = master.eval_base_act(obs, env_states, masks,
                                                                                     goals, tasks, 
                                                                                     landmark_data, 
                                                                                     landmark_mask)
@@ -298,6 +319,34 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             obs = normalize_obs(obs, obs_mean, obs_std)
             master.envs_info = info
             step += 1
+
+            # ⭐ 基于 entropy_map[H, W] 计算平均搜索效率
+            if h_max is not None and h_max > 1e-8:
+                entropy_curr = None
+                if isinstance(info, dict) and 'entropy_map' in info:
+                    entropy_curr = np.asarray(info['entropy_map'], dtype=np.float32)
+                elif entropy_map is not None:
+                    if isinstance(entropy_map, torch.Tensor):
+                        entropy_curr = entropy_map.detach().cpu().numpy()
+                    else:
+                        entropy_curr = np.asarray(entropy_map, dtype=np.float32)
+
+                if entropy_curr is not None and entropy_curr.size > 0:
+                    h_global_t = float(np.sum(entropy_curr))
+                    coverage_t = 1.0 - (h_global_t / h_max)
+                    coverage_t = float(np.clip(coverage_t, 0.0, 1.0))
+                else:
+                    coverage_t = 0.0
+            else:
+                coverage_t = 0.0
+
+            # 按 step 跨 episode 累计
+            if step >= len(search_efficiency_sums):
+                search_efficiency_sums.append(coverage_t)
+                search_efficiency_counts.append(1)
+            else:
+                search_efficiency_sums[step] += coverage_t
+                search_efficiency_counts[step] += 1
             
             # Count visited targets
             if hasattr(env, 'visited_landmarks'):
@@ -311,6 +360,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
                 current_covered = set()
             
             # ⭐ 跟踪发现状态（基于sensor_range内的检测）
+            prev_discovered_count = len(discovered_landmarks)
             for lm_idx, landmark in enumerate(env.world.landmarks):
                 lm_pos = landmark.state.p_pos
                 for agent in env.agents:
@@ -318,10 +368,13 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
                         discovered_landmarks.add(lm_idx)
                         break
             
-            # ⭐ 记录发现所有landmark的时间（首次）
-            if time_to_discover_all is None and len(discovered_landmarks) == config.num_targets:
-                time_to_discover_all = step
-                print(f"  ✓ All landmarks discovered at step {step}")
+            # ⭐ 记录首次发现第1/2/3/...个landmark的时间
+            curr_discovered_count = len(discovered_landmarks)
+            if curr_discovered_count > prev_discovered_count:
+                for k in range(prev_discovered_count + 1, curr_discovered_count + 1):
+                    if time_to_discover_k[k - 1] is None:
+                        time_to_discover_k[k - 1] = step
+                        print(f"  ✓ {k} landmark(s) discovered at step {step}")
             
             # ⭐ 更新覆盖状态并记录时间戳
             new_covered = current_covered - covered_landmarks
@@ -369,10 +422,15 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         all_time_to_cover_1.append(time_to_cover_1 if time_to_cover_1 is not None else step)
         all_time_to_cover_2.append(time_to_cover_2 if time_to_cover_2 is not None else step)
         all_time_to_cover_3.append(time_to_cover_3 if time_to_cover_3 is not None else step)
-        all_time_to_discover_all.append(time_to_discover_all if time_to_discover_all is not None else step)
+        for k in range(config.num_targets):
+            all_time_to_discover_k[k].append(
+                time_to_discover_k[k] if time_to_discover_k[k] is not None else step
+            )
         
         print(f"Episode complete: Steps={step}, Success={is_success}, Visited={num_visited}/{config.num_targets}")
-        print(f"  Discovered all at: {time_to_discover_all if time_to_discover_all else 'N/A'}")
+        discovered_summary = [time_to_discover_k[k] if time_to_discover_k[k] is not None else 'N/A'
+                              for k in range(config.num_targets)]
+        print(f"  Discover k-th at: {discovered_summary}")
         print(f"  Covered: 1st={time_to_cover_1}, 2nd={time_to_cover_2}, 3rd={time_to_cover_3}")
         
         # Save GIF
@@ -382,6 +440,18 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             print(f"Saved GIF: {gif_path}")
     
     # Print summary statistics
+    search_efficiency_avg = []
+    for sum_v, cnt_v in zip(search_efficiency_sums, search_efficiency_counts):
+        avg_v = (sum_v / cnt_v) if cnt_v > 0 else 0.0
+        search_efficiency_avg.append(avg_v)
+
+    search_eff_csv_path = os.path.join(eval_folder, "search_efficiency_eval.csv")
+    with open(search_eff_csv_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["step", "avg_search_efficiency", "num_episodes"])
+        for step_idx, (avg_v, cnt_v) in enumerate(zip(search_efficiency_avg, search_efficiency_counts)):
+            writer.writerow([step_idx, avg_v, cnt_v])
+
     print("\n" + "="*60)
     print("EVALUATION SUMMARY")
     print("="*60)
@@ -394,7 +464,14 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     print(f"  Cover 2nd Landmark: {np.mean(all_time_to_cover_2):.2f} ± {np.std(all_time_to_cover_2):.2f} steps")
     print(f"  Cover 3rd Landmark: {np.mean(all_time_to_cover_3):.2f} ± {np.std(all_time_to_cover_3):.2f} steps")
     print(f"\n【发现时间】")
-    print(f"  Discover All Landmarks: {np.mean(all_time_to_discover_all):.2f} ± {np.std(all_time_to_discover_all):.2f} steps")
+    for k, discover_times in enumerate(all_time_to_discover_k, start=1):
+        print(f"  Discover {k}th Landmark: {np.mean(discover_times):.2f} ± {np.std(discover_times):.2f} steps")
+    if search_efficiency_avg:
+        valid_mask = np.array(search_efficiency_counts) > 0
+        final_eff = np.array(search_efficiency_avg)[valid_mask][-1]
+        print(f"\n【搜索效率】")
+        print(f"  Final Step Avg Search Efficiency: {final_eff:.4f}")
+        print(f"  CSV Saved: {search_eff_csv_path}")
     print(f"\n【总体性能】")
     print(f"  Average Episode Length: {np.mean(all_steps):.2f} ± {np.std(all_steps):.2f} steps")
     print("="*60)
@@ -406,7 +483,11 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         'time_to_cover_1': all_time_to_cover_1,
         'time_to_cover_2': all_time_to_cover_2,
         'time_to_cover_3': all_time_to_cover_3,
-        'time_to_discover_all': all_time_to_discover_all
+        'time_to_discover_k': all_time_to_discover_k,
+        'time_to_discover_all': all_time_to_discover_k[-1] if all_time_to_discover_k else [],
+        'search_efficiency_avg': search_efficiency_avg,
+        'search_efficiency_counts': search_efficiency_counts,
+        'search_efficiency_csv': search_eff_csv_path
     }
 
 

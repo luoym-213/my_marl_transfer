@@ -1022,6 +1022,9 @@ class Learner(object):
                 self.device
             )  # [num_agents * 1, max_landmarks, 4], [num_agents * 1, max_landmarks, 1]
 
+            # 🌟 香农熵
+            entropy_map = torch.from_numpy(np.array(self.envs_info['entropy_map'])).float().unsqueeze(0).to(self.device)  # [1, H, W]
+
             # 2. 生成动态异构图结构的节点表示
             # 2.1. 输入准备，包括地图输入和向量输入
 
@@ -1072,7 +1075,7 @@ class Learner(object):
                 _,action,_ = policy.low_level_act(obs_tensor, all_goals, deterministic=True)
                 actions.append(action.squeeze(1).cpu().numpy())
 
-        return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask
+        return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask, entropy_map[0]
 
     def eval_base_act_HGA(self, obs, env_states, masks, goals, tasks, landmark_data, landmark_mask, deterministic=True):
         # used only while evaluating policies. Assuming that agents are in order of team!

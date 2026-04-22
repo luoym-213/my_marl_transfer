@@ -148,7 +148,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     all_avg_velocities = []  # 每个episode的agent平均速度
     
     for episode in range(num_eval_episodes):
-        print(f"\n--- Episode {episode + 1}/{num_eval_episodes} ---")
+        #print(f"\n--- Episode {episode + 1}/{num_eval_episodes} ---")
         
         # Reset environment
         obs, env_states, info = env.reset()
@@ -161,7 +161,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             # Fallback: random positions
             targets = [np.random.uniform(-0.8, 0.8, 2) for _ in range(config.num_targets)]
         
-        print(f"Target positions: {[f'({t[0]:.2f}, {t[1]:.2f})' for t in targets]}")
+        #print(f"Target positions: {[f'({t[0]:.2f}, {t[1]:.2f})' for t in targets]}")
         
         # Create ACO environment and planner
         aco_env = Environment(config, targets)
@@ -179,15 +179,15 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         planner = ACOPlanner(config, aco_env)
         planner.uav_positions = uav_positions
         
-        print(f"UAV start positions: {[f'({u[0]:.2f}, {u[1]:.2f})' for u in uav_positions]}")
+        #print(f"UAV start positions: {[f'({u[0]:.2f}, {u[1]:.2f})' for u in uav_positions]}")
         
         # Run ACO optimization
-        print("Running ACO optimization...")
+        #print("Running ACO optimization...")
         et_history = planner.optimize()
         final_et = et_history[-1]
         all_et_values.append(final_et)
         
-        print(f"Optimization complete: ET = {final_et:.4f}")
+        #print(f"Optimization complete: ET = {final_et:.4f}")
         
         # Execute best solution in environment
         if planner.best_solution is None:
@@ -209,7 +209,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         # Get maximum trajectory length
         max_traj_len = max(len(traj) for traj in planner.best_solution.values())
         
-        print(f"Executing solution (max {max_traj_len} steps)...")
+        #print(f"Executing solution (max {max_traj_len} steps)...")
         obs_mean = None
         obs_std = None
 
@@ -293,7 +293,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             goals_np = goals.cpu().numpy() if isinstance(goals, torch.Tensor) else goals
             tasks_np = tasks.cpu().numpy() if isinstance(tasks, torch.Tensor) else tasks
 
-            print(f"Step {step + 1}: Actions: {actions},\n Goals: {goals_np},\n Tasks: {tasks_np.flatten()}")
+            #print(f"Step {step + 1}: Actions: {actions},\n Goals: {goals_np},\n Tasks: {tasks_np.flatten()}")
             
             step_data = {'agents_actions': actions, 'agents_goals': goals_np, 'agents_tasks': tasks_np} 
             
@@ -334,14 +334,14 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
             # ⭐ 记录发现所有landmark的时间（首次）
             if time_to_discover_all is None and len(discovered_landmarks) == config.num_targets:
                 time_to_discover_all = step
-                print(f"  ✓ All landmarks discovered at step {step}")
+                #print(f"  ✓ All landmarks discovered at step {step}")
             
             # ⭐ 更新覆盖状态并记录时间戳
             new_covered = current_covered - covered_landmarks
             if new_covered:
                 covered_landmarks.update(new_covered)
                 num_covered = len(covered_landmarks)
-                print(f"  ✓ Covered {num_covered} landmark(s) at step {step}")
+                # print(f"  ✓ Covered {num_covered} landmark(s) at step {step}")
                 
                 # 记录覆盖第1/2/3个landmark的时间
                 if num_covered == 1 and time_to_cover_1 is None:
@@ -388,9 +388,9 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         avg_velocity = velocity_sum / velocity_count if velocity_count > 0 else 0.0
         all_avg_velocities.append(avg_velocity)
         
-        print(f"Episode complete: Steps={step}, Success={is_success}, Visited={num_visited}/{config.num_targets}")
-        print(f"  Discovered all at: {time_to_discover_all if time_to_discover_all else 'N/A'}")
-        print(f"  Covered: 1st={time_to_cover_1}, 2nd={time_to_cover_2}, 3rd={time_to_cover_3}")
+        # print(f"Episode complete: Steps={step}, Success={is_success}, Visited={num_visited}/{config.num_targets}")
+        # print(f"  Discovered all at: {time_to_discover_all if time_to_discover_all else 'N/A'}")
+        # print(f"  Covered: 1st={time_to_cover_1}, 2nd={time_to_cover_2}, 3rd={time_to_cover_3}")
         
         # Save GIF
         if render and episode < 5 and frames:
