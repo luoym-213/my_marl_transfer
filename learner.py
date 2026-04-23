@@ -55,12 +55,16 @@ def setup_master(args, env=None, return_env=False):
         if hasattr(agent, 'adversary') and agent.adversary:
             if policy1 is None:
                 policy1 = MPNN(input_size=pol_obs_dim,num_agents=num_adversary,num_entities=num_entities,action_space=action_space,
-                               pos_index=pos_index, mask_dist=args.mask_dist,entity_mp=entity_mp, is_recurrent=args.is_recurrent).to(args.device)
+                               pos_index=pos_index, mask_dist=args.mask_dist,entity_mp=entity_mp, is_recurrent=args.is_recurrent,
+                               high_actor_backbone=args.high_actor_backbone, high_mlp_hidden=args.high_mlp_hidden,
+                               high_mlp_layers=args.high_mlp_layers, high_mlp_dropout=args.high_mlp_dropout).to(args.device)
             team1.append(Neo(args,policy1,(obs_dim,),action_space))
         else:
             if policy2 is None:
                 policy2 = MPNN(input_size=pol_obs_dim,num_agents=num_friendly,num_entities=num_entities,action_space=action_space,
-                               pos_index=pos_index, mask_dist=args.mask_dist,mask_obs_dist=args.mask_obs_dist,entity_mp=entity_mp,is_recurrent=args.is_recurrent).to(args.device)
+                               pos_index=pos_index, mask_dist=args.mask_dist,mask_obs_dist=args.mask_obs_dist,entity_mp=entity_mp,is_recurrent=args.is_recurrent,
+                               high_actor_backbone=args.high_actor_backbone, high_mlp_hidden=args.high_mlp_hidden,
+                               high_mlp_layers=args.high_mlp_layers, high_mlp_dropout=args.high_mlp_dropout).to(args.device)
 
             team2.append(Neo(args,policy2,(obs_dim,),action_space))
 

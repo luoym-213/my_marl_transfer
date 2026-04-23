@@ -36,6 +36,14 @@ def get_args():
     parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')
     parser.add_argument('--arena-size', type=int, default=1, help='size of arena')
     parser.add_argument('--high-level-interval', type=int, default=5, help='number of steps between high-level decisions')
+    parser.add_argument('--high-actor-backbone', type=str, default='graph', choices=['graph', 'mlp'],
+                        help='high-level actor backbone: graph (default) or mlp (ablation)')
+    parser.add_argument('--high-mlp-hidden', type=int, default=256,
+                        help='hidden size for high-level MLP actor when --high-actor-backbone=mlp')
+    parser.add_argument('--high-mlp-layers', type=int, default=3,
+                        help='number of layers for high-level MLP actor when --high-actor-backbone=mlp')
+    parser.add_argument('--high-mlp-dropout', type=float, default=0.0,
+                        help='dropout for high-level MLP actor when --high-actor-backbone=mlp')
 
     # evaluation
     parser.add_argument('--num-eval-episodes', type=int, default=30, help='number of episodes to evaluate with')

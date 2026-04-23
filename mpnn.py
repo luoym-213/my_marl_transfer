@@ -18,7 +18,9 @@ def weights_init(m):
 
 class MPNN(nn.Module):
     def __init__(self, action_space, num_agents, num_entities, input_size=16, hidden_dim=128, embed_dim=None,
-                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None, entity_mp=False, is_recurrent=True):
+                 pos_index=2, norm_in=False, nonlin=nn.ReLU, n_heads=3, mask_dist=None, mask_obs_dist=None,
+                 entity_mp=False, is_recurrent=True, high_actor_backbone='graph', high_mlp_hidden=256,
+                 high_mlp_layers=3, high_mlp_dropout=0.0):
         super().__init__()
 
         # ==================== 基础配置 ====================
@@ -35,6 +37,12 @@ class MPNN(nn.Module):
         self.mask_obs_dist = mask_obs_dist
         self.input_size = input_size # 这里是agengt自身速度位置（4）
         self.entity_mp = entity_mp
+        self.high_actor_backbone = str(high_actor_backbone).lower()
+        if self.high_actor_backbone not in ("graph", "mlp"):
+            raise ValueError(f"Unsupported high_actor_backbone: {high_actor_backbone}")
+        self.high_mlp_hidden = int(high_mlp_hidden)
+        self.high_mlp_layers = int(high_mlp_layers)
+        self.high_mlp_dropout = float(high_mlp_dropout)
         # this index must be from the beginning of observation vector
         self.pos_index = pos_index
         # task generation parameters
@@ -102,8 +110,32 @@ class MPNN(nn.Module):
         
         return low_level
 
+    def _build_mlp(self, in_dim, hidden_dim, out_dim, num_layers=3, dropout=0.0):
+        """Build a configurable feed-forward MLP."""
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
+
+        layers = []
+        if num_layers == 1:
+            layers.append(nn.Linear(in_dim, out_dim))
+            return nn.Sequential(*layers)
+
+        layers.extend([nn.Linear(in_dim, hidden_dim), nn.ReLU()])
+        if dropout > 0:
+            layers.append(nn.Dropout(dropout))
+
+        for _ in range(num_layers - 2):
+            layers.extend([nn.Linear(hidden_dim, hidden_dim), nn.ReLU()])
+            if dropout > 0:
+                layers.append(nn.Dropout(dropout))
+
+        layers.append(nn.Linear(hidden_dim, out_dim))
+        return nn.Sequential(*layers)
+
     def _build_high_level_modules(self):
         """构建高层策略网络（Actor）"""
+        mlp_context_input_dim = 5 + self.num_agents * 6
+        mlp_slot_input_dim = 9
         high_level = nn.ModuleDict({
             # 地图编码器
             'map_conv1': nn.Sequential(
@@ -181,6 +213,32 @@ class MPNN(nn.Module):
             
             # 节点选择头（统一对所有节点打分）
             'node_selection_head': nn.Linear(64, 1),
+
+            # ===== MLP 消融模块 =====
+            # context: ego + teammate(+mask)
+            'mlp_context_encoder': self._build_mlp(
+                in_dim=mlp_context_input_dim,
+                hidden_dim=self.high_mlp_hidden,
+                out_dim=64,
+                num_layers=self.high_mlp_layers,
+                dropout=self.high_mlp_dropout
+            ),
+            # slot: [dx, dy, utility, flag, d, cos, sin, type, valid]
+            'mlp_slot_encoder': self._build_mlp(
+                in_dim=mlp_slot_input_dim,
+                hidden_dim=self.high_mlp_hidden,
+                out_dim=64,
+                num_layers=self.high_mlp_layers,
+                dropout=self.high_mlp_dropout
+            ),
+            # score each slot conditioned on context
+            'mlp_selection_head': self._build_mlp(
+                in_dim=128,
+                hidden_dim=self.high_mlp_hidden,
+                out_dim=1,
+                num_layers=self.high_mlp_layers,
+                dropout=self.high_mlp_dropout
+            ),
             
             # 决策头（保留用于其他用途，如果不需要可以删除）
             'decision_head': nn.Sequential(
@@ -623,6 +681,18 @@ class MPNN(nn.Module):
     @property
     def node_selection_head(self):
         return self.modules_dict['high_level']['node_selection_head']
+
+    @property
+    def mlp_context_encoder(self):
+        return self.modules_dict['high_level']['mlp_context_encoder']
+
+    @property
+    def mlp_slot_encoder(self):
+        return self.modules_dict['high_level']['mlp_slot_encoder']
+
+    @property
+    def mlp_selection_head(self):
+        return self.modules_dict['high_level']['mlp_selection_head']
     
     @property
     def attn_dim(self):
@@ -933,6 +1003,228 @@ class MPNN(nn.Module):
         
         return landmark_node_agg_feats
 
+    def _sort_high_level_nodes_for_mlp(self,
+                                       batch_explore_nodes, batch_ego_to_explore_edges,
+                                       batch_landmark_nodes, batch_landmark_node_masks,
+                                       batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks):
+        """Sort explore by utility(desc) and landmark by distance(asc) for MLP slots."""
+        B, K = batch_explore_nodes.size(0), batch_explore_nodes.size(1)
+        max_L = batch_landmark_nodes.size(1)
+
+        if K > 1:
+            explore_sort_idx = torch.argsort(batch_explore_nodes[:, :, 2], dim=1, descending=True)
+            gather_idx = explore_sort_idx.unsqueeze(-1)
+            batch_explore_nodes = torch.gather(
+                batch_explore_nodes, 1, gather_idx.expand(B, K, batch_explore_nodes.size(-1))
+            )
+            batch_ego_to_explore_edges = torch.gather(
+                batch_ego_to_explore_edges, 1, gather_idx.expand(B, K, batch_ego_to_explore_edges.size(-1))
+            )
+
+        if max_L > 1:
+            valid_landmark_mask = batch_landmark_node_masks[:, :, 0] > 0.5
+            landmark_dist = batch_ego_to_landmark_edges[:, :, 0].masked_fill(~valid_landmark_mask, float('inf'))
+            landmark_sort_idx = torch.argsort(landmark_dist, dim=1, descending=False)
+            gather_idx = landmark_sort_idx.unsqueeze(-1)
+            batch_landmark_nodes = torch.gather(
+                batch_landmark_nodes, 1, gather_idx.expand(B, max_L, batch_landmark_nodes.size(-1))
+            )
+            batch_landmark_node_masks = torch.gather(
+                batch_landmark_node_masks, 1, gather_idx.expand(B, max_L, batch_landmark_node_masks.size(-1))
+            )
+            batch_ego_to_landmark_edges = torch.gather(
+                batch_ego_to_landmark_edges, 1, gather_idx.expand(B, max_L, batch_ego_to_landmark_edges.size(-1))
+            )
+            batch_ego_to_landmark_edge_masks = torch.gather(
+                batch_ego_to_landmark_edge_masks, 1, gather_idx.expand(B, max_L, batch_ego_to_landmark_edge_masks.size(-1))
+            )
+
+        return (
+            batch_explore_nodes, batch_ego_to_explore_edges,
+            batch_landmark_nodes, batch_landmark_node_masks,
+            batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
+        )
+
+    def _build_unified_slot_tensors(self,
+                                    batch_explore_nodes, batch_ego_to_explore_edges,
+                                    batch_landmark_nodes, batch_landmark_node_masks,
+                                    batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks):
+        """Build fixed-length candidate slots shared by graph/mlp high-level actors."""
+        B = batch_explore_nodes.size(0)
+        K = batch_explore_nodes.size(1)
+        max_L = batch_landmark_nodes.size(1)
+
+        explore_valid = torch.ones(B, K, device=batch_explore_nodes.device, dtype=torch.bool)
+        valid_mask = batch_landmark_node_masks[:, :, 0] > 0.5
+        edge_valid_mask = batch_ego_to_landmark_edge_masks[:, :, 0] > 0.5
+        not_targeted = batch_landmark_nodes[:, :, 3] < 0.5
+        landmark_valid = valid_mask & edge_valid_mask & not_targeted
+
+        # Keep original behavior: if all landmarks are already found, disable explore nodes.
+        all_landmarks_found = valid_mask.all(dim=1)
+        if all_landmarks_found.any():
+            explore_valid[all_landmarks_found, :] = False
+
+        unified_mask = torch.cat([explore_valid, landmark_valid], dim=1)  # [B, K+max_L]
+        unified_relative_pos = torch.cat(
+            [batch_explore_nodes[:, :, :2], batch_landmark_nodes[:, :, :2]], dim=1
+        )  # [B, K+max_L, 2]
+
+        node_type_labels = torch.cat([
+            torch.zeros(B, K, device=batch_explore_nodes.device, dtype=torch.long),
+            torch.ones(B, max_L, device=batch_explore_nodes.device, dtype=torch.long)
+        ], dim=1)  # [B, K+max_L]
+
+        explore_type = torch.zeros(B, K, 1, device=batch_explore_nodes.device)
+        landmark_type = torch.ones(B, max_L, 1, device=batch_explore_nodes.device)
+        explore_valid_f = explore_valid.float().unsqueeze(-1)
+        landmark_valid_f = landmark_valid.float().unsqueeze(-1)
+
+        # slot feats: [dx, dy, utility, flag, d, cos, sin, type, valid]
+        explore_slots = torch.cat(
+            [batch_explore_nodes, batch_ego_to_explore_edges, explore_type, explore_valid_f], dim=-1
+        )  # [B, K, 9]
+        landmark_slots = torch.cat(
+            [batch_landmark_nodes, batch_ego_to_landmark_edges, landmark_type, landmark_valid_f], dim=-1
+        )  # [B, max_L, 9]
+        slot_feats = torch.cat([explore_slots, landmark_slots], dim=1)  # [B, K+max_L, 9]
+
+        # Safety fallback: avoid an all-invalid categorical row.
+        no_valid = ~unified_mask.any(dim=1)
+        if no_valid.any():
+            unified_mask[no_valid, 0] = True
+            slot_feats[no_valid, 0, -1] = 1.0
+
+        return unified_mask, unified_relative_pos, node_type_labels, slot_feats
+
+    def _compute_graph_selection_logits(self,
+                                        batch_ego_nodes, batch_teammate_nodes, batch_teammate_masks,
+                                        batch_explore_nodes, batch_ego_to_explore_edges,
+                                        batch_landmark_nodes, batch_landmark_node_masks,
+                                        batch_ego_to_landmark_edges):
+        """Graph-attention actor logits over unified slots."""
+        B = batch_ego_nodes.size(0)
+        K = batch_explore_nodes.size(1)
+        max_L = batch_landmark_nodes.size(1)
+        total_nodes = K + max_L
+
+        # 1) Node/edge embeddings
+        explore_node_feats = self.explore_node_encoder(
+            batch_explore_nodes.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 64]
+
+        landmark_node_feats = self.landmark_node_encoder(
+            batch_landmark_nodes.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, max_L, 64]
+
+        landmark_node_agg_feats = self.landmark_team_gat(
+            batch_ego_nodes[:, :2],
+            batch_teammate_nodes, batch_teammate_masks,
+            batch_landmark_nodes, batch_landmark_node_masks, landmark_node_feats
+        )  # [B, max_L, 64]
+
+        explore_node_feats = self.explore_node_linear(
+            explore_node_feats.view(B * K, -1)
+        ).view(B, K, -1)
+        explore_node_feats = self.linear_ln(explore_node_feats)
+
+        landmark_node_feats = self.landmark_node_linear(
+            landmark_node_agg_feats.view(B * max_L, -1)
+        ).view(B, max_L, -1)
+        landmark_node_feats = self.linear_ln(landmark_node_feats)
+
+        explore_edge_feats = self.edge_encoder(
+            batch_ego_to_explore_edges.view(B * K, -1)
+        ).view(B, K, -1)  # [B, K, 32]
+        landmark_edge_feats = self.edge_encoder(
+            batch_ego_to_landmark_edges.view(B * max_L, -1)
+        ).view(B, max_L, -1)  # [B, max_L, 32]
+
+        # 2) Unified slot values
+        unified_v = torch.zeros(B, total_nodes, self.attn_dim, device=batch_ego_nodes.device)
+        explore_kv = torch.cat([explore_node_feats, explore_edge_feats], dim=-1)  # [B, K, 96]
+        unified_v[:, :K, :] = self.v_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
+
+        landmark_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)  # [B, max_L, 96]
+        unified_v[:, K:K + max_L, :] = self.v_proj(landmark_kv.view(B * max_L, -1)).view(B, max_L, -1)
+
+        return self.node_selection_head(unified_v).squeeze(-1)  # [B, K+max_L]
+
+    def _compute_mlp_selection_logits(self,
+                                      batch_ego_nodes, batch_teammate_nodes, batch_teammate_masks, slot_feats):
+        """MLP actor logits over fixed-length slots."""
+        B, total_nodes = slot_feats.size(0), slot_feats.size(1)
+        teammate_with_mask = torch.cat([batch_teammate_nodes, batch_teammate_masks], dim=-1)  # [B, A, 6]
+        context_input = torch.cat([batch_ego_nodes, teammate_with_mask.view(B, -1)], dim=-1)  # [B, 5+A*6]
+        context_feat = self.mlp_context_encoder(context_input)  # [B, 64]
+
+        slot_feat = self.mlp_slot_encoder(slot_feats.view(B * total_nodes, -1)).view(B, total_nodes, -1)  # [B, T, 64]
+        context_expand = context_feat.unsqueeze(1).expand(B, total_nodes, context_feat.size(-1))
+        fused = torch.cat([context_expand, slot_feat], dim=-1)  # [B, T, 128]
+        return self.mlp_selection_head(fused.view(B * total_nodes, -1)).view(B, total_nodes)  # [B, T]
+
+    def _build_high_selection_distribution(self,
+                                           batch_ego_nodes, batch_teammate_nodes, batch_teammate_masks,
+                                           batch_explore_nodes, batch_ego_to_explore_edges,
+                                           batch_landmark_nodes, batch_landmark_node_masks,
+                                           batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks):
+        """Build logits/distribution and unified slot metadata for high-level actor."""
+        if self.high_actor_backbone == "mlp":
+            (
+                batch_explore_nodes, batch_ego_to_explore_edges,
+                batch_landmark_nodes, batch_landmark_node_masks,
+                batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
+            ) = self._sort_high_level_nodes_for_mlp(
+                batch_explore_nodes, batch_ego_to_explore_edges,
+                batch_landmark_nodes, batch_landmark_node_masks,
+                batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
+            )
+
+        unified_mask, unified_relative_pos, node_type_labels, slot_feats = self._build_unified_slot_tensors(
+            batch_explore_nodes, batch_ego_to_explore_edges,
+            batch_landmark_nodes, batch_landmark_node_masks,
+            batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
+        )
+
+        if self.high_actor_backbone == "mlp":
+            selection_logits = self._compute_mlp_selection_logits(
+                batch_ego_nodes, batch_teammate_nodes, batch_teammate_masks, slot_feats
+            )
+        else:
+            selection_logits = self._compute_graph_selection_logits(
+                batch_ego_nodes, batch_teammate_nodes, batch_teammate_masks,
+                batch_explore_nodes, batch_ego_to_explore_edges,
+                batch_landmark_nodes, batch_landmark_node_masks,
+                batch_ego_to_landmark_edges
+            )
+
+        selection_logits = selection_logits.masked_fill(~unified_mask, -1e9)
+        node_dist = TorchCategorical(logits=selection_logits)
+        return selection_logits, node_dist, unified_mask, unified_relative_pos, node_type_labels
+
+    def _map_goals_to_selected_indices(self, goals, tasks, ego_nodes, unified_relative_pos, unified_mask, K):
+        """Map stored (goal, task) back to selected slot index."""
+        B, total_nodes = unified_mask.size()
+        goals_relative = goals - ego_nodes[:, :2]  # [B, 2]
+        dists = torch.norm(unified_relative_pos - goals_relative.unsqueeze(1), dim=-1)  # [B, T]
+        dists_masked = dists.masked_fill(~unified_mask, float('inf'))
+
+        if tasks is not None:
+            node_ids = torch.arange(total_nodes, device=goals.device).unsqueeze(0).expand(B, total_nodes)
+            is_landmark_task = tasks.squeeze(-1) > 0.5
+            task_domain_mask = torch.where(
+                is_landmark_task.unsqueeze(1),
+                node_ids >= K,
+                node_ids < K
+            )
+            dists_task = dists_masked.masked_fill(~task_domain_mask, float('inf'))
+            no_task_valid = torch.isinf(dists_task).all(dim=1)
+            if no_task_valid.any():
+                dists_task[no_task_valid] = dists_masked[no_task_valid]
+            dists_masked = dists_task
+
+        return torch.argmin(dists_masked, dim=-1)  # [B]
+
     def get_high_level_goal(self, batch_ego_nodes, 
                             batch_teammate_nodes, batch_teammate_masks,
                             batch_explore_nodes, batch_ego_to_explore_edges, 
@@ -962,128 +1254,14 @@ class MPNN(nn.Module):
                 map_log_probs: [B, 1] 同上（保持接口兼容）
         """
         B = batch_ego_nodes.size(0)
-        K = batch_explore_nodes.size(1)
-        
-        # ===== 1. 节点和边的特征嵌入 =====
-        # 1.1 Ego节点嵌入
-        ego_node_feats = self.ego_node_encoder(batch_ego_nodes)  # [B, 64]
-        
-        # 1.2 Explore节点嵌入
-        explore_node_feats = self.explore_node_encoder(
-            batch_explore_nodes.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 64]
- 
-        # 1.3 Landmark节点GAT聚合
-        max_L = batch_landmark_nodes.size(1)  # [B, Max_L, 4]
+        selection_logits, node_dist, unified_mask, unified_relative_pos, node_type_labels = \
+            self._build_high_selection_distribution(
+                batch_ego_nodes, batch_teammate_nodes, batch_teammate_masks,
+                batch_explore_nodes, batch_ego_to_explore_edges,
+                batch_landmark_nodes, batch_landmark_node_masks,
+                batch_ego_to_landmark_edges, batch_ego_to_landmark_edge_masks
+            )
 
-        # 一次性编码所有 landmark 节点 [B, Max_L, 4] -> [B, Max_L, 64]
-        landmark_node_feats = self.landmark_node_encoder(
-            batch_landmark_nodes.view(B * max_L, -1)
-        ).view(B, max_L, -1)  # [B, Max_L, 64]
-
-        # landmark 和 队友节点进行聚合
-        landmark_node_agg_feats = self.landmark_team_gat(
-            batch_ego_nodes[:, :2],  # 只传递 ego 的位置用于计算相对位置
-            batch_teammate_nodes, batch_teammate_masks,
-            batch_landmark_nodes, batch_landmark_node_masks, landmark_node_feats
-        )  # [B, Max_L, 64]
-
-        # 1.4 对explore和landmark节点特征进行线性变换和LayerNorm
-        explore_node_feats = self.explore_node_linear(
-            explore_node_feats.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 64]
-
-        explore_node_feats = self.linear_ln(explore_node_feats)  # LayerNorm
-
-        landmark_node_feats = self.landmark_node_linear(
-            landmark_node_agg_feats.view(B * max_L, -1)
-        ).view(B, max_L, -1)  # [B, Max_L, 64]
-
-        landmark_node_feats = self.linear_ln(landmark_node_feats)  # LayerNorm
-
-        # 1.5 编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
-        landmark_edge_feats = self.edge_encoder(
-            batch_ego_to_landmark_edges.view(B * max_L, -1)
-        ).view(B, max_L, -1)  # [B, Max_L, 32]
-
-        # 编码 explore 边 [B, K, 3] -> [B, K, 32]
-        explore_edge_feats = self.edge_encoder(
-            batch_ego_to_explore_edges.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 32]
-
-        # ===== 2. 构建统一的候选节点集合 =====
-        # 将 explore 和 landmark 合并为一个统一的节点集
-        # 总节点数 = K (explore) + max_L (landmark)
-        total_nodes = K + max_L
-        
-        # 2.1 准备 Query
-        q = self.q_proj(ego_node_feats).unsqueeze(1)  # [B, 1, 64]
-        
-        # 2.2 合并所有节点的 Key 和 Value
-        # 初始化统一的 K/V 矩阵: [B, K+max_L, 64]
-        unified_k = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
-        unified_v = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
-        unified_mask = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.bool)
-        
-        # 存储相对坐标用于后续输出
-        unified_relative_pos = torch.zeros(B, total_nodes, 2, device=ego_node_feats.device)
-
-        # 节点类型标签: 0=explore, 1=landmark
-        node_type_labels = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.long)
-        
-        # 填充 explore 节点 (索引 0 ~ K-1)
-        explore_kv = torch.cat([explore_node_feats, explore_edge_feats], dim=-1)  # [B, K, 96]
-        unified_k[:, :K, :] = self.k_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
-        unified_v[:, :K, :] = self.v_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
-        unified_mask[:, :K] = True  # explore 节点全部有效
-        unified_relative_pos[:, :K, :] = batch_explore_nodes[:, :, :2]  # 相对坐标
-        node_type_labels[:, :K] = 0  # explore 类型
-        
-        # 填充 landmark 节点 (索引 K ~ K+max_L-1)
-        # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
-        lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
-        # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
-        unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-        unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-        
-        # 构建有效掩码：mask 有效 且 未被追踪
-        valid_mask = batch_landmark_node_masks[:, :, 0] > 0.5  # [B, Max_L]
-        not_targeted = batch_landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
-        combined_mask = valid_mask & not_targeted              # [B, Max_L]
-
-        # 如果valid_mask某行全部有效，则说明已经找到全部landmark，则该样本不需要探索节点
-        all_landmarks_found = valid_mask.all(dim=1)  # [B] bool tensor
-        if all_landmarks_found.any():
-            unified_mask[all_landmarks_found, :K] = False
-        
-        unified_mask[:, K:K+max_L] = combined_mask
-        unified_relative_pos[:, K:K+max_L, :] = batch_landmark_nodes[:, :, :2]
-        node_type_labels[:, K:K+max_L] = 1
-
-        # ===== 3. 注意力机制 =====
-        # 计算注意力分数
-        scale = math.sqrt(self.attn_dim)
-        attn_scores = (q @ unified_k.transpose(1, 2)) / scale  # [B, 1, total_nodes]
-        
-        # 应用 mask（无效节点设为 -inf）
-        attn_scores = attn_scores.masked_fill(~unified_mask.unsqueeze(1), -1e9)
-        
-        # Softmax 得到注意力权重
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, 1, total_nodes]
-        
-        # 注意力加权求和
-        context = (attn_weights @ unified_v).squeeze(1)  # [B, 64]
-        
-        # ===== 4. 节点选择 =====
-        # 对所有节点进行打分
-        selection_logits = self.node_selection_head(unified_v).squeeze(-1)  # [B, total_nodes]
-        
-        # 应用 mask
-        selection_logits = selection_logits.masked_fill(~unified_mask, -1e9)
-        
-        # 构建分类分布
-        node_dist = TorchCategorical(logits=selection_logits)
-        
         # 采样或选择最优节点
         if deterministic:
             selected_idx = torch.argmax(selection_logits, dim=-1)  # [B]
@@ -1097,7 +1275,7 @@ class MPNN(nn.Module):
         node_log_prob = node_dist.log_prob(selected_idx)  # [B]
         
         # ===== 5. 提取选中节点的信息 =====
-        batch_indices = torch.arange(B, device=ego_node_feats.device)
+        batch_indices = torch.arange(B, device=batch_ego_nodes.device)
         
         # 5.1 节点类型 (0=explore, 1=landmark)
         selected_type = node_type_labels[batch_indices, selected_idx]  # [B]
@@ -1265,14 +1443,7 @@ class MPNN(nn.Module):
             node_entropy: [batch, 1] - 节点选择分布的熵
         """
         batch_size = env_states.size(0)
-        num_agents = self.num_agents
-        K = explore_nodes.size(1)  # explore节点数量
-
-        # =====================================================
-        # 1. 重建Graph nodes和Edges
-        # =====================================================
-
-        # 计算边特征
+        K = explore_nodes.size(1)
         ego_to_explore_edges, ego_to_landmark_edges, ego_to_landmark_edge_masks = self.get_edge_features(
             explore_nodes=explore_nodes,
             landmark_nodes=landmark_nodes,
@@ -1280,138 +1451,15 @@ class MPNN(nn.Module):
             norm=False,
             max_distance=2.8
         )
-
-        # =====================================================
-        # 2. 复用 get_high_level_goal 的逻辑构建节点分布
-        # =====================================================
-        B = batch_size
-        
-        # 2.1 节点和边的特征嵌入
-        ego_node_feats = self.ego_node_encoder(ego_nodes)  # [B, 64]
-        
-        # 2.2 Explore节点嵌入
-        explore_node_feats = self.explore_node_encoder(
-            explore_nodes.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 64]
-        
-        # 2.3 Landmark节点GAT聚合
-        max_L = landmark_nodes.size(1)  # [B, Max_L, 4]
-
-        # 一次性编码所有 landmark 节点 [B, Max_L, 4] -> [B, Max_L, 64]
-        landmark_node_feats = self.landmark_node_encoder(
-            landmark_nodes.view(B * max_L, -1)
-        ).view(B, max_L, -1)  # [B, Max_L, 64]
-
-        # landmark 和 队友节点进行聚合
-        landmark_node_agg_feats = self.landmark_team_gat(
-            ego_nodes[:, :2],  # 只传递 ego 的位置用于计算相对位置
-            teammate_nodes, teammate_masks,
-            landmark_nodes, landmark_masks, landmark_node_feats
-        )  # [B, Max_L, 64]
-
-        # 2.4 对explore和landmark节点特征进行线性变换和LayerNorm
-        explore_node_feats = self.explore_node_linear(
-            explore_node_feats.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 64]
-
-        explore_node_feats = self.linear_ln(explore_node_feats)  # LayerNorm
-
-        landmark_node_feats = self.landmark_node_linear(
-            landmark_node_agg_feats.view(B * max_L, -1)
-        ).view(B, max_L, -1)  # [B, Max_L, 64]
-
-        landmark_node_feats = self.linear_ln(landmark_node_feats)  # LayerNorm
-
-        # 2.5 一次性编码所有 landmark 边 [B, Max_L, 3] -> [B, Max_L, 32]
-        landmark_edge_feats = self.edge_encoder(
-            ego_to_landmark_edges.view(B * max_L, -1)
-        ).view(B, max_L, -1)  # [B, Max_L, 32]
-
-        explore_edge_feats = self.edge_encoder(
-            ego_to_explore_edges.view(B * K, -1)
-        ).view(B, K, -1)  # [B, K, 32]
-        
-        # 2.2 构建统一的候选节点集合
-        total_nodes = K + max_L
-        
-        q = self.q_proj(ego_node_feats).unsqueeze(1)  # [B, 1, 64]
-        
-        unified_k = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
-        unified_v = torch.zeros(B, total_nodes, self.attn_dim, device=ego_node_feats.device)
-        unified_mask = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.bool)
-        unified_relative_pos = torch.zeros(B, total_nodes, 2, device=ego_node_feats.device)
-
-        # 节点类型标签: 0=explore, 1=landmark
-        node_type_labels = torch.zeros(B, total_nodes, device=ego_node_feats.device, dtype=torch.long)
-        
-        # 填充 explore 节点
-        explore_kv = torch.cat([explore_node_feats, explore_edge_feats], dim=-1)
-        unified_k[:, :K, :] = self.k_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
-        unified_v[:, :K, :] = self.v_proj(explore_kv.view(B * K, -1)).view(B, K, -1)
-        unified_mask[:, :K] = True  # explore 节点全部有效
-        unified_relative_pos[:, :K, :] = explore_nodes[:, :, :2]  # 相对坐标
-        node_type_labels[:, :K] = 0  # explore 类型
-        
-        # 填充 landmark 节点 (索引 K ~ K+max_L-1)
-        # 拼接节点和边特征 [B, Max_L, 64] + [B, Max_L, 32] -> [B, Max_L, 96]
-        lm_kv = torch.cat([landmark_node_feats, landmark_edge_feats], dim=-1)
-        # 投影为 K/V [B, Max_L, 96] -> [B, Max_L, 64]
-        unified_k[:, K:K+max_L, :] = self.k_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-        unified_v[:, K:K+max_L, :] = self.v_proj(lm_kv.view(B * max_L, -1)).view(B, max_L, -1)
-        
-        # 构建有效掩码：mask 有效 且 未被追踪
-        valid_mask = landmark_masks[:, :, 0] > 0.5  # [B, Max_L]
-        not_targeted = landmark_nodes[:, :, 3] < 0.5    # [B, Max_L]
-        combined_mask = valid_mask & not_targeted    # [B, Max_L]
-        
-        # 如果valid_mask某行全部有效，则说明已经找到全部landmark，则该样本不需要探索节点
-        all_landmarks_found = valid_mask.all(dim=1)  # [B] bool tensor
-        if all_landmarks_found.any():
-            unified_mask[all_landmarks_found, :K] = False          
-        
-        unified_mask[:, K:K+max_L] = combined_mask
-        unified_relative_pos[:, K:K+max_L, :] = landmark_nodes[:, :, :2]
-        node_type_labels[:, K:K+max_L] = 1
-        
-        # 3. 注意力机制
-        scale = math.sqrt(self.attn_dim)
-        attn_scores = (q @ unified_k.transpose(1, 2)) / scale
-        attn_scores = attn_scores.masked_fill(~unified_mask.unsqueeze(1), -1e9)
-        
-        # Softmax 得到注意力权重
-        attn_weights = torch.softmax(attn_scores, dim=-1)  # [B, 1, total_nodes]
-        
-        # 注意力加权求和
-        context = (attn_weights @ unified_v).squeeze(1)  # [B, 64]
-        
-        # 2.4 节点选择分布
-        selection_logits = self.node_selection_head(unified_v).squeeze(-1)  # [B, total_nodes]
-        
-        # 应用 mask
-        selection_logits = selection_logits.masked_fill(~unified_mask, -1e9)
-        
-        # 构建分类分布
-        node_dist = TorchCategorical(logits=selection_logits)
-        
-        # =====================================================
-        # 3. 找到给定 goal 对应的节点索引
-        # =====================================================
-        # 将给定的 goals (世界坐标) 转换为相对坐标
-        ego_pos = ego_nodes[:, :2]  # [B, 2]
-        goals_relative = goals - ego_pos  # [B, 2]
-        
-        # 计算 goals_relative 到所有节点的距离
-        # unified_relative_pos: [B, total_nodes, 2]
-        # goals_relative: [B, 2] -> [B, 1, 2]
-        dists = torch.norm(unified_relative_pos - goals_relative.unsqueeze(1), dim=-1)  # [B, total_nodes]
-        
-        # 只在有效节点中查找最近的
-        dists_masked = dists.masked_fill(~unified_mask, float('inf'))
-        selected_idx = torch.argmin(dists_masked, dim=-1)  # [B]
-        
-        # =====================================================
-        # 4. 计算 log_prob 和 entropy
-        # =====================================================
+        _, node_dist, unified_mask, unified_relative_pos, _ = self._build_high_selection_distribution(
+            ego_nodes, teammate_nodes, teammate_masks,
+            explore_nodes, ego_to_explore_edges,
+            landmark_nodes, landmark_masks,
+            ego_to_landmark_edges, ego_to_landmark_edge_masks
+        )
+        selected_idx = self._map_goals_to_selected_indices(
+            goals, tasks, ego_nodes, unified_relative_pos, unified_mask, K
+        )
         node_log_probs = node_dist.log_prob(selected_idx).unsqueeze(-1)  # [B, 1]
         node_entropy = node_dist.entropy().unsqueeze(-1)  # [B, 1]
         
@@ -1423,7 +1471,7 @@ class MPNN(nn.Module):
         
         # 根据 agent_ids 选择对应的价值
         agent_ids_flat = agent_ids.squeeze(-1)  # [B]
-        batch_indices = torch.arange(B, device=env_states.device)
+        batch_indices = torch.arange(batch_size, device=env_states.device)
         high_values = all_values[batch_indices, agent_ids_flat].unsqueeze(-1)  # [B, 1]
 
         return (high_values, node_log_probs, node_entropy)
