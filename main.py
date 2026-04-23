@@ -129,9 +129,14 @@ def train(args, return_early=False):
         if args.eval_interval is not None and j%args.eval_interval==0:
             ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)
             print('===========================================================================================')
-            _, eval_perstep_rewards, _, eval_high_perstep_rewards, final_min_dists, num_success, eval_episode_len, _, _ = evaluate(args, None, master.all_policies,
-                                                                                               ob_rms=ob_rms, env=eval_env,
-                                                                                               master=eval_master, render=args.render)
+            eval_results = evaluate(args, None, master.all_policies,
+                                    ob_rms=ob_rms, env=eval_env,
+                                    master=eval_master, render=args.render)
+            eval_perstep_rewards = eval_results[1]
+            eval_high_perstep_rewards = eval_results[3]
+            final_min_dists = eval_results[4]
+            num_success = eval_results[5]
+            eval_episode_len = eval_results[6]
             print('Evaluation {:d} | Mean per-step reward {:.2f}'.format(j//args.eval_interval, eval_perstep_rewards.mean()))
             print('Mean high-level per-step reward {:.2f}'.format(eval_high_perstep_rewards.mean()))
             print('Num success {:d}/{:d} | Episode Length {:.2f}'.format(num_success, args.num_eval_episodes, eval_episode_len))
