@@ -140,6 +140,7 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
     all_et_values = []
     all_success_rates = []
     all_steps = []
+    all_success_steps = []
     
     # ⭐ 新增指标统计
     all_time_to_cover_1 = []  # 覆盖第1个landmark的时间
@@ -417,6 +418,8 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         all_steps.append(step)
         is_success = info.get('is_success', False)
         all_success_rates.append(1.0 if is_success else 0.0)
+        if is_success:
+            all_success_steps.append(step)
         
         # ⭐ 记录新增指标
         all_time_to_cover_1.append(time_to_cover_1 if time_to_cover_1 is not None else step)
@@ -473,13 +476,17 @@ def evaluate_aco_mts(args, seed=None, render=True, num_eval_episodes=5, policies
         print(f"  Final Step Avg Search Efficiency: {final_eff:.4f}")
         print(f"  CSV Saved: {search_eff_csv_path}")
     print(f"\n【总体性能】")
-    print(f"  Average Episode Length: {np.mean(all_steps):.2f} ± {np.std(all_steps):.2f} steps")
+    if all_success_steps:
+        print(f"  Average Episode Length (Success Only): {np.mean(all_success_steps):.2f} ± {np.std(all_success_steps):.2f} steps")
+    else:
+        print(f"  Average Episode Length (Success Only): N/A (0 successful episodes)")
     print("="*60)
     
     return {
         'et_values': all_et_values,
         'success_rates': all_success_rates,
         'steps': all_steps,
+        'success_steps': all_success_steps,
         'time_to_cover_1': all_time_to_cover_1,
         'time_to_cover_2': all_time_to_cover_2,
         'time_to_cover_3': all_time_to_cover_3,
