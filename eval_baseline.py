@@ -166,6 +166,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     # 新增变量，用于计算成功回合的平均步数
     successful_steps_total = 0
     successful_episodes_count = 0
+    successful_episode_lengths = []
     
     # ⭐ 新增指标统计
     all_time_to_cover_1 = []  # 覆盖第1个landmark的时间
@@ -433,6 +434,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         if info['is_success']:
             successful_steps_total += info['n'][0]['world_steps']
             successful_episodes_count += 1
+            successful_episode_lengths.append(info['n'][0]['world_steps'])
         
         # ⭐ 记录新增指标
         all_time_to_cover_1.append(time_to_cover_1 if time_to_cover_1 is not None else episode_steps)
@@ -489,8 +491,10 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     
     # 计算成功回合的平均步数
     successful_average_length = 0
+    successful_length_std = 0
     if successful_episodes_count > 0:
         successful_average_length = successful_steps_total / successful_episodes_count
+        successful_length_std = float(np.std(successful_episode_lengths))
 
     # ⭐ 导出每一步平均搜索效率到CSV
     search_efficiency_avg = []
@@ -511,7 +515,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
     print(f"Saved search efficiency CSV: {search_eff_csv_path}")
 
     return (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
-            final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
+            final_min_dists, num_success, episode_length, successful_average_length, successful_length_std, successful_episodes_count,
             all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_k, all_avg_velocities,
             search_efficiency_avg, search_efficiency_counts)
 
@@ -522,7 +526,7 @@ if __name__ == '__main__':
     policies_list = checkpoint['models']
     ob_rms = checkpoint['ob_rms']
     (all_episode_rewards, per_step_rewards, all_high_episode_rewards, per_high_step_rewards, 
-     final_min_dists, num_success, episode_length, successful_average_length, successful_episodes_count,
+     final_min_dists, num_success, episode_length, successful_average_length, successful_length_std, successful_episodes_count,
      all_time_to_cover_1, all_time_to_cover_2, all_time_to_cover_3, all_time_to_discover_k, all_avg_velocities,
      search_efficiency_avg, search_efficiency_counts) = evaluate(
         args, args.seed, policies_list, ob_rms, args.render, render_attn=args.masking)
@@ -533,7 +537,7 @@ if __name__ == '__main__':
     print(f"Average Per Step Reward: {per_step_rewards.mean(0)}")
     print(f"\n【任务完成率】")
     print(f"  Success Rate: {num_success/args.num_eval_episodes*100:.1f}% ({num_success}/{args.num_eval_episodes})")
-    print(f"  Successful Episodes Avg Length: {successful_average_length:.2f} ({successful_episodes_count}/{args.num_eval_episodes})")
+    print(f"  Successful Episodes Avg Length: {successful_average_length:.2f} ± {successful_length_std:.2f} ({successful_episodes_count}/{args.num_eval_episodes})")
     print(f"\n【覆盖时间】")
     print(f"  Cover 1st Landmark: {np.mean(all_time_to_cover_1):.2f} ± {np.std(all_time_to_cover_1):.2f} steps")
     print(f"  Cover 2nd Landmark: {np.mean(all_time_to_cover_2):.2f} ± {np.std(all_time_to_cover_2):.2f} steps")
