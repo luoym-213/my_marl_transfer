@@ -124,31 +124,18 @@ class MultiAgentEnv(gym.Env):
         info_n = {'n': [], 'map': [], 'world_steps': self.world.steps}
         done = {}
         self.agents = self.world.policy_agents
-        last_reward_n = []
-        current_reward_n = []
-        last_goal_n = []
         action_n = data['agents_actions']
-        goal_n = data['agents_goals']
-        task_n = data['agents_tasks']
 
-        # 获取step前全局状态，智能体速度、位置，landmark位置
+        # 获取step前全局状态
         state = self._get_state(self.world)
 
-        # set action and goal for each agent
+        # set action for each agent
         for i, agent in enumerate(self.agents):
-            # 如果智能体已经退役，设置其速度为0，不执行新动作
             if self.agents_done[i]:
                 agent.state.p_vel = np.zeros(self.world.dim_p)
                 agent.action.u = np.zeros(self.world.dim_p)
             else:
-                ## 设置agent.action,留给world.step()使用
                 self._set_action(action_n[i], agent, self.action_space[i])
-                ## 设置agent.state.g_pos, 供reward计算使用
-                self._set_goal(goal_n[i], agent)
-        
-        # 计算step前的距离奖励，即上一步智能体距离目标点的距离，以便后续计算差分奖励
-        for agent in self.agents:
-            last_reward_n.append(self._get_goal_reward(agent))
 
         # advance world state
         self.world.step()
@@ -156,15 +143,27 @@ class MultiAgentEnv(gym.Env):
         # 收集当前智能体位置
         agents_pos = np.array([a.state.p_pos for a in self.agents])
 
-        # 必须在更新全图信息图前获取高层奖励，因为高层奖励依赖于step前的全局信息图
-        agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
-        agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
-        # 到达目标点奖励，需要满足当前当前task = 1，即collect模式，且距离目标点小于阈值
-        goal_dones = self._get_goal_dones(self.agents) # 获取当前step后，智能体是否达到目标点的布尔列表
-        agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, goal_dones)
-        total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards)
+        # ===== 新增：即使不计算奖励，也更新覆盖状态 =====
+        cover_threshold = getattr(self.world, "dist_thres", 0.1)
+        if not hasattr(self, "landmark_visited"):
+            self.landmark_visited = np.zeros(len(self.world.landmarks), dtype=bool)
 
-        # 根据获取的全局状态更新全局信息图
+        for lm_idx, landmark in enumerate(self.world.landmarks):
+            if self.landmark_visited[lm_idx]:
+                continue
+            lm_pos = landmark.state.p_pos
+            dists = np.linalg.norm(agents_pos - lm_pos, axis=1)
+            if np.any(dists < cover_threshold):
+                self.landmark_visited[lm_idx] = True
+                self.visited_landmarks.add(lm_idx)
+        # ===========================================
+
+        # ===== 奖励占位：全部替换为零，保持形状一致 =====
+        all_reward = np.zeros(self.n, dtype=np.float32)
+        total_high_rewards = np.zeros(self.n, dtype=np.float32)
+        # ============================================
+
+        # 如果还需要维护地图信息，可保留更新
         if self.enable_exploration_reward:
             self.global_belief_map.update_beliefs(agents_pos, self.world.mask_obs_dist)
 
@@ -182,44 +181,35 @@ class MultiAgentEnv(gym.Env):
         info_n['belief_map'] = self.global_belief_map.belief_grid
         info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos, self.agents_done)
-        info_n['goal_done'] = self._get_goal_dones(self.agents)
-        info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
+        # info_n['goal_done'] = self._get_goal_dones(self.agents)
+        info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos, 0.05)
         info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
-
-        # 碰撞惩罚、边界惩罚
-        common_penaltie = self._compute_penaltie()
 
         for agent in self.agents:
             obs_n.append(self._get_obs(agent))
-            reward_n.append(self._get_goal_reward(agent))
-            done_n.append(self._get_done(agent)) # 相当于整个episode是否结束
+            done_n.append(self._get_done(agent))
             info_n['n'].append(self._get_info(agent))
 
         # 获取全局状态，智能体速度、位置，landmark位置
         state = self._get_state(self.world)
 
-        # # all agents get total reward in cooperative case
-        # reward = np.sum(reward_n)
-        # if self.shared_reward:
-        #     reward_n = [reward] * self.n
-
-        # 差分奖励
-        reward_n = np.array(reward_n) - np.array(last_reward_n)
-
-        # 势能奖励+碰撞惩罚
-        all_reward =  reward_n + common_penaltie
-
         done['all'] = done_n
-        # 如果done_n全为True，则表示episode结束，则设置done['agent']全为True
-        if np.all(done_n):
+
+        # 成功即提前结束
+        if np.all(self.landmark_visited):
+            done_n = [True] * self.n
+            done['all'] = done_n
             done['agent'] = [True] * self.n
         else:
-            done['agent'] = self.agents_done
+            if np.all(done_n):
+                done['agent'] = [True] * self.n
+            else:
+                done['agent'] = self.agents_done
 
-        info_n['is_success'] = np.all(self.agents_done)
-        
+        info_n['is_success'] = np.all(self.landmark_visited)  # 用覆盖状态判成功更合理
+
         return obs_n, all_reward, total_high_rewards, done, info_n, state
-
+    
     def reset(self):
         # reset world
         self.reset_callback(self.world)
@@ -227,8 +217,7 @@ class MultiAgentEnv(gym.Env):
 
         # 重置已访问目标集合
         self.visited_landmarks = set()
-        
-        # 重置智能体退役状态
+        self.landmark_visited = np.zeros(len(self.world.landmarks), dtype=bool)  # 新增
         self.agents_done = [False] * self.n
 
         # 重置global_belief_map
