@@ -733,7 +733,27 @@ class MPNN(nn.Module):
         entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])  # [B_pro*B_agents, H, W]
         
         batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=rrt_max_iter, top_k=top_k)  # [B_pro*B_agents, K, 3]
-        batch_rtt = torch.tensor(batch_rtt, dtype=torch.float32, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
+        sanitized_batch_rtt = []
+        fallback_count = 0
+        for start_node, sample in zip(starte_nodes.tolist(), batch_rtt):
+            normalized_sample = []
+            for node in sample[:top_k]:
+                if len(node) < 3:
+                    continue
+                normalized_sample.append([float(node[0]), float(node[1]), float(node[2])])
+
+            while len(normalized_sample) < top_k:
+                fallback_count += 1
+                fallback_x = float(np.clip(start_node[0] + np.random.randint(-5, 6), 0, voronoi_inp.shape[-2] - 1))
+                fallback_y = float(np.clip(start_node[1] + np.random.randint(-5, 6), 0, voronoi_inp.shape[-1] - 1))
+                normalized_sample.append([fallback_x, fallback_y, 0.0])
+
+            sanitized_batch_rtt.append(normalized_sample)
+
+        if fallback_count > 0:
+            print(f"Warning: padded {fallback_count} RRT candidate slots to keep fixed top_k={top_k}")
+
+        batch_rtt = torch.tensor(sanitized_batch_rtt, dtype=torch.float32, device=vec_inp.device).view(B_pro, B_agents, top_k, 3)  # [B_pro, B_agents, K, 3]
         
         ## 转为世界坐标
         explore_nodes_world = self._grid_to_world_torch(batch_rtt[..., :2], H=100, W=100)  # [B_pro, B_agents, K, 2]

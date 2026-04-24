@@ -292,6 +292,21 @@ class RRT_GNN:
         
         return new_node
 
+    def _make_fallback_node(self) -> List[float]:
+        """Return a safe fallback candidate near the start position."""
+        rand_x = min(max(self.start.x + random.randint(-5, 5), 0), self.map_size[0] - 1)
+        rand_y = min(max(self.start.y + random.randint(-5, 5), 0), self.map_size[1] - 1)
+        return [rand_x, rand_y, 0.0]
+
+    def _ensure_top_k(self, nodes: List[List[float]]) -> List[List[float]]:
+        """Normalize planner output to a fixed-length top-k candidate list."""
+        normalized = [list(node[:3]) for node in nodes if len(node) >= 3]
+        if len(normalized) > self.top_k:
+            normalized = normalized[:self.top_k]
+        while len(normalized) < self.top_k:
+            normalized.append(self._make_fallback_node())
+        return normalized
+
     def planning(self) -> List[List[float]]:
         """
         执行RRT规划，返回价值最高的K个节点
@@ -335,17 +350,12 @@ class RRT_GNN:
                 for node in top_k_nodes
             ]
             
-            return result
+            return self._ensure_top_k(result)
         
         except Exception as e:
             print(f"RRT规划出错: {e}")
             # 返回智能体周围随机小范围k个节点作为探索节点
-            fallback_nodes = []
-            for _ in range(self.top_k):
-                rand_x = min(max(self.start.x + random.randint(-5, 5), 0), self.map_size[0]-1)
-                rand_y = min(max(self.start.y + random.randint(-5, 5), 0), self.map_size[1]-1)
-                fallback_nodes.append([rand_x, rand_y, 0.0])
-            return fallback_nodes
+            return [self._make_fallback_node() for _ in range(self.top_k)]
 
 
 def compute_voronoi_regions(agent_positions: List[Tuple[int, int]], 
