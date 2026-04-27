@@ -450,6 +450,11 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     all_agent_ids = []  # ⭐ 新增: 记录智能体ID
 
     for agent_id, (rollout, advantages) in enumerate(zip(rollouts_list, advantages_list)):
+        if rollout.map_obs is None or rollout.critic_maps is None:
+            raise RuntimeError(
+                "High-level PPO requires full map rollouts. Re-run with --store-high-maps "
+                "before enabling JointPPO high-level updates."
+            )
         batch_size = num_steps * num_processes
 
         # 展平所有数据 [num_steps, num_processes, ...] -> [num_steps * num_processes, ...]

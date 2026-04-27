@@ -245,7 +245,11 @@ class Learner(object):
             #     distance_fields     # [num_processes, num_agents, H, W]
             # ], dim=2)  # [num_processes, num_agents, 4, H, W]
             # 生成一个占位符all_map_inps
-            all_map_inps = torch.randn((num_processes, num_agents, 4, 100, 100), device=self.device)  # [num_processes, num_agents, 4, H, W]
+            store_high_maps = any(agent.rollouts.store_high_maps for agent in team)
+            if store_high_maps:
+                all_map_inps = torch.randn((num_processes, num_agents, 4, 100, 100), device=self.device)  # [num_processes, num_agents, 4, H, W]
+            else:
+                all_map_inps = None
             
             # all_vec_inps = vec_inps  # [num_processes, num_agents, 5]
             # 生成一个占位符all_vec_inps
@@ -253,7 +257,7 @@ class Learner(object):
 
             #all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_vec_inp) # 计算所有process的高层value： [num_processes, num_agents]
             # 随机生成一个all_critic_map_inp作为占位符
-            all_critic_map_inp = torch.randn((num_processes, 4, 100, 100), device=self.device)  # [num_processes, 4, H, W]
+            all_critic_map_inp = torch.randn((num_processes, 4, 100, 100), device=self.device) if store_high_maps else None  # [num_processes, 4, H, W]
             #随机产生一个all_high_value以避免影响训练
             all_high_value = torch.zeros((num_processes, num_agents), device=self.device)
 
@@ -263,7 +267,8 @@ class Learner(object):
 
             # split all outputs
             n = len(team)
-            all_map_inps = torch.chunk(all_map_inps, n, dim=1)  # 按智能体拆分
+            if all_map_inps is not None:
+                all_map_inps = torch.chunk(all_map_inps, n, dim=1)  # 按智能体拆分
             all_vec_inps = torch.chunk(all_vec_inps, n, dim=1)
             all_goals = torch.chunk(all_goals, n)
             all_tasks = torch.chunk(all_tasks, n)
@@ -280,7 +285,7 @@ class Learner(object):
                 team[i].action_log_prob = all_action_log_prob[i]
 
                 # 高层策略
-                team[i].map_obs = all_map_inps[i].squeeze(1)  # [num_processes, 4, H, W]
+                team[i].map_obs = all_map_inps[i].squeeze(1) if all_map_inps is not None else None  # [num_processes, 4, H, W]
                 team[i].vec_obs = all_vec_inps[i].squeeze(1)  # [num_processes, vec_dim]
                 team[i].critic_map = all_critic_map_inp # [num_processes, 4, H, W], 智能体共享一个全局图
                 team[i].goal = all_goals[i]

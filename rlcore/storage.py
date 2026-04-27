@@ -7,7 +7,8 @@ def _flatten_helper(T, N, _tensor):
 
 
 class RolloutStorage(object):
-    def __init__(self, num_steps, num_processes, obs_shape, action_space, num_agent, recurrent_hidden_state_size):
+    def __init__(self, num_steps, num_processes, obs_shape, action_space, num_agent,
+                 recurrent_hidden_state_size, store_high_maps=False, map_size=100):
         # 环境基础信息
         self.obs = torch.zeros(num_steps + 1, num_processes, *obs_shape)
         self.recurrent_hidden_states = torch.zeros(num_steps + 1, num_processes, recurrent_hidden_state_size)
@@ -15,6 +16,7 @@ class RolloutStorage(object):
         self.masks = torch.ones(num_steps + 1, num_processes, 1)
         self.num_steps = num_steps
         self.step = 0
+        self.store_high_maps = store_high_maps
 
         # 低层策略存储相关
         self.rewards = torch.zeros(num_steps, num_processes, 1)
@@ -26,9 +28,12 @@ class RolloutStorage(object):
         
         # 高层策略存储相关
         self.high_rewards = torch.zeros(num_steps, num_processes, 1)
-        self.map_obs = torch.zeros(num_steps, num_processes, 4, 100, 100)  # 高层输入的地图观测
+        self.map_obs = None
         self.vec_obs = torch.zeros(num_steps, num_processes, 5)  # 高层输入的矢量观测
-        self.critic_maps = torch.zeros(num_steps, num_processes, 4, 100, 100)  # 高层critic的地图输入,用于计算高层价值
+        self.critic_maps = None
+        if self.store_high_maps:
+            self.map_obs = torch.zeros(num_steps, num_processes, 4, map_size, map_size)  # 高层输入的地图观测
+            self.critic_maps = torch.zeros(num_steps, num_processes, 4, map_size, map_size)  # 高层critic的地图输入,用于计算高层价值
         self.tasks = torch.zeros(num_steps, num_processes, 1, dtype=torch.long)   # action_mode: explore=0, collect=1
         self.goals = torch.zeros(num_steps, num_processes, 2)   # final_target: [x_goal, y_goal]
         self.map_log_probs = torch.zeros(num_steps, num_processes, 1)
@@ -54,9 +59,11 @@ class RolloutStorage(object):
         
         # 高层策略存储相关
         self.high_rewards = self.high_rewards.to(device)
-        self.map_obs = self.map_obs.to(device)
+        if self.map_obs is not None:
+            self.map_obs = self.map_obs.to(device)
         self.vec_obs = self.vec_obs.to(device)
-        self.critic_maps = self.critic_maps.to(device)
+        if self.critic_maps is not None:
+            self.critic_maps = self.critic_maps.to(device)
         self.goals = self.goals.to(device)
         self.tasks = self.tasks.to(device)
         self.map_log_probs = self.map_log_probs.to(device)
@@ -84,9 +91,11 @@ class RolloutStorage(object):
         
         # 高层策略存储相关
         self.high_rewards[self.step].copy_(high_rewards)
-        self.map_obs[self.step].copy_(map_obs)
+        if self.store_high_maps:
+            self.map_obs[self.step].copy_(map_obs)
         self.vec_obs[self.step].copy_(vec_obs)
-        self.critic_maps[self.step].copy_(critic_maps)
+        if self.store_high_maps:
+            self.critic_maps[self.step].copy_(critic_maps)
         self.goals[self.step].copy_(goals)
         self.tasks[self.step].copy_(task)
         self.map_log_probs[self.step].copy_(map_log_probs)

@@ -28,6 +28,8 @@ def get_args():
     parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')
     parser.add_argument('--arena-size', type=int, default=1, help='size of arena')
     parser.add_argument('--high-level-interval', type=int, default=5, help='number of steps between high-level decisions')
+    parser.add_argument('--store-high-maps', action='store_true',
+                        help='store full 100x100 high-level map rollouts; only needed when high-level PPO training is enabled')
 
     # evaluation
     parser.add_argument('--num-eval-episodes', type=int, default=30, help='number of episodes to evaluate with')
