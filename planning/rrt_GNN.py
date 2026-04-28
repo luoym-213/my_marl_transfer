@@ -7,7 +7,6 @@ RRT for entropy-based exploration with Voronoi mask sampling
 """
 
 import math
-import random
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Sequence, Optional, Any
@@ -230,6 +229,62 @@ class RRT_GNN:
         """O(1) 查询：直接查表，而不是每次遍历半径邻域。"""
         return float(self.local_entropy_map[x, y])
 
+    def _make_fallback_result(self, existing_nodes: Sequence['RRT_GNN.Node']) -> List[List[float]]:
+        """
+        Return exactly top_k candidate nodes. Existing RRT nodes keep priority; missing
+        slots are filled from high-entropy sample points, then start-neighborhood points.
+        """
+        if self.top_k <= 0:
+            return []
+
+        result: List[List[float]] = []
+        seen = set()
+
+        def add_point(x: int, y: int, value: Optional[float] = None) -> None:
+            if len(result) >= self.top_k:
+                return
+            x = int(np.clip(x, 0, self.map_size[0] - 1))
+            y = int(np.clip(y, 0, self.map_size[1] - 1))
+            key = (x, y)
+            if key in seen:
+                return
+            seen.add(key)
+            node_value = self._calculate_local_entropy(x, y) if value is None else float(value)
+            result.append([x, y, node_value / 1500])
+
+        for node in existing_nodes:
+            add_point(node.x, node.y, node.value)
+
+        if len(result) < self.top_k and len(self.sample_list) > 0:
+            sample_values = [
+                (self._calculate_local_entropy(x, y), x, y)
+                for x, y in self.sample_list
+            ]
+            for value, x, y in sorted(sample_values, reverse=True):
+                add_point(x, y, value)
+                if len(result) >= self.top_k:
+                    break
+
+        max_unique_points = int(self.map_size[0] * self.map_size[1])
+        radius = 1
+        while len(result) < self.top_k:
+            before_count = len(result)
+            for dx in range(-radius, radius + 1):
+                for dy in range(-radius, radius + 1):
+                    add_point(self.start.x + dx, self.start.y + dy)
+                    if len(result) >= self.top_k:
+                        break
+                if len(result) >= self.top_k:
+                    break
+            radius += 1
+            if len(seen) >= max_unique_points or (len(result) == before_count and radius > max(self.map_size) + 1):
+                break
+
+        while len(result) < self.top_k:
+            result.append(result[-1].copy() if result else [self.start.x, self.start.y, 0.0])
+
+        return result
+
     def _get_nearest_node_index(self, node_list: List['RRT_GNN.Node'], 
                                  rnd_node: 'RRT_GNN.Node') -> int:
         """
@@ -328,24 +383,12 @@ class RRT_GNN:
             # 按价值排序，选择Top-K节点
             sorted_nodes = sorted(self.node_list, key=lambda node: node.value, reverse=True)
             top_k_nodes = sorted_nodes[:min(self.top_k, len(sorted_nodes))]
-            
-            # 格式化返回结果，value进行归一化  / 1500
-            result = [
-                [node.x, node.y, node.value / 1500]
-                for node in top_k_nodes
-            ]
-            
-            return result
+
+            return self._make_fallback_result(top_k_nodes)
         
         except Exception as e:
             print(f"RRT规划出错: {e}")
-            # 返回智能体周围随机小范围k个节点作为探索节点
-            fallback_nodes = []
-            for _ in range(self.top_k):
-                rand_x = min(max(self.start.x + random.randint(-5, 5), 0), self.map_size[0]-1)
-                rand_y = min(max(self.start.y + random.randint(-5, 5), 0), self.map_size[1]-1)
-                fallback_nodes.append([rand_x, rand_y, 0.0])
-            return fallback_nodes
+            return self._make_fallback_result([])
 
 
 def compute_voronoi_regions(agent_positions: List[Tuple[int, int]], 
