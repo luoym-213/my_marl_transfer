@@ -36,6 +36,7 @@ def setup_master(args, learner_cls, env=None, return_env=False):
 
     action_space = env.action_space[-1]
     entity_mp = args.entity_mp
+    low_only = getattr(args, "train_stage", "joint") == "low"
     num_entities = _num_entities_for_env(args.env_name, args.num_agents)
     obs_dim_for_policy = _policy_obs_dim(env, entity_mp, num_entities)
     pos_index = args.identity_size + 2
@@ -54,6 +55,7 @@ def setup_master(args, learner_cls, env=None, return_env=False):
                     mask_dist=args.mask_dist,
                     entity_mp=entity_mp,
                     is_recurrent=args.is_recurrent,
+                    low_only=low_only,
                 ).to(args.device)
             team1.append(Neo(args, policy1, (obs_dim,), action_space))
         else:
@@ -68,6 +70,7 @@ def setup_master(args, learner_cls, env=None, return_env=False):
                     mask_obs_dist=args.mask_obs_dist,
                     entity_mp=entity_mp,
                     is_recurrent=args.is_recurrent,
+                    low_only=low_only,
                 ).to(args.device)
             team2.append(Neo(args, policy2, (obs_dim,), action_space))
 
@@ -105,10 +108,14 @@ def _policy_obs_dim(env, entity_mp, num_entities):
 def _load_optional_pretrained_modules(args, policy1, policy2):
     if hasattr(args, "load_low_level_path") and args.load_low_level_path is not None:
         print(f"Loading pretrained low-level model from: {args.load_low_level_path}")
+        freeze_low = getattr(args, "train_stage", "joint") != "low"
         if policy1 is not None:
-            policy1.load_pretrained_low_level(args.load_low_level_path, freeze=True)
+            policy1.load_pretrained_low_level(args.load_low_level_path, freeze=freeze_low)
         if policy2 is not None:
-            policy2.load_pretrained_low_level(args.load_low_level_path, freeze=True)
+            policy2.load_pretrained_low_level(args.load_low_level_path, freeze=freeze_low)
+
+    if getattr(args, "train_stage", "joint") == "low":
+        return
 
     if hasattr(args, "load_high_level_path") and args.load_high_level_path is not None:
         print(f"Loading pretrained high-level model from: {args.load_high_level_path}")

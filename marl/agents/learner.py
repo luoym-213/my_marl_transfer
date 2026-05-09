@@ -29,6 +29,7 @@ def setup_master(args, env=None, return_env=False):
 
 class Learner(object):
     def __init__(self, args, teams_list, policies_list, env):
+        self.args = args
         self.teams_list = [x for x in teams_list if len(x)!=0]
         self.all_agents = [agent for team in teams_list for agent in team]
         self.policies_list = [x for x in policies_list if x is not None]
@@ -38,7 +39,8 @@ class Learner(object):
         # ⭐ 检测是否加载了预训练底层网络
         self.use_pretrained_low_level = (
             hasattr(args, 'load_low_level_path') and 
-            args.load_low_level_path is not None
+            args.load_low_level_path is not None and
+            getattr(args, "train_stage", "joint") != "low"
         )
 
         # 初始化训练器
@@ -46,9 +48,12 @@ class Learner(object):
             self.trainers_list = [IPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                                         args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
                                         use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
-        self.high_trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
-                                       args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
-                                       use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
+        if getattr(args, "train_stage", "joint") == "low":
+            self.high_trainers_list = []
+        else:
+            self.high_trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
+                                           args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
+                                           use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
         self.device = args.device
         self.env = env
         self.envs_info = None
@@ -374,6 +379,125 @@ class Learner(object):
 
         return actions_list, goals_list, tasks_list
 
+    def act_low_level(self, step, goals):
+        """Act with only the low-level goal-conditioned policy.
+
+        goals uses process-major shape [num_processes, num_agents, 2]. The
+        low-level policy consumes agent-major flattened goals [num_agents *
+        num_processes, 2] to match the rollout chunking convention.
+        """
+        actions_list = []
+        goals_list = []
+        tasks_list = []
+        goals_t = torch.as_tensor(goals, dtype=torch.float32, device=self.device)
+
+        agent_offset = 0
+        for team, policy in zip(self.teams_list, self.policies_list):
+            num_agents = len(team)
+            num_processes = goals_t.size(0)
+            all_obs = torch.cat([agent.rollouts.obs[step] for agent in team])
+            team_goals = goals_t[:, agent_offset:agent_offset + num_agents, :]
+            all_goals = flatten_agent_major(team_goals)
+
+            agent_positions = all_obs[:, 2:4].view(
+                num_agents, num_processes, 2
+            ).transpose(0, 1)
+            alive_mask = torch.ones(
+                num_processes, num_agents, device=self.device, dtype=torch.float32
+            )
+            comm_mask = build_comm_mask(
+                agent_positions,
+                self.comm_dist,
+                alive_mask=alive_mask,
+            )
+            low_rel_pos, low_masks = build_low_level_comm_features(
+                agent_positions,
+                comm_mask,
+            )
+            all_low_rel_pos = flatten_agent_major(low_rel_pos)
+            all_low_masks = flatten_agent_major(low_masks)
+
+            low_outputs = policy.low_level_act(
+                all_obs,
+                all_goals,
+                all_low_rel_pos,
+                all_low_masks,
+                deterministic=False,
+            )
+
+            batch_size = num_agents * num_processes
+            dummy_tasks = torch.zeros(
+                batch_size, 1, dtype=torch.long, device=self.device
+            )
+            dummy_goal_log_probs = torch.zeros(
+                batch_size, 1, dtype=torch.float32, device=self.device
+            )
+            dummy_high_values = torch.zeros(
+                num_processes, num_agents, dtype=torch.float32, device=self.device
+            )
+            dummy_critic_map = torch.zeros(
+                num_processes, 3, 100, 100, dtype=torch.float32, device=self.device
+            )
+            dummy_critic_nodes = torch.zeros(
+                num_processes, self.args.num_agents, 4,
+                dtype=torch.float32, device=self.device
+            )
+            dummy_ego_nodes = torch.zeros(
+                batch_size, 5, dtype=torch.float32, device=self.device
+            )
+            dummy_explore_nodes = torch.zeros(
+                batch_size, self.top_k, 4, dtype=torch.float32, device=self.device
+            )
+            dummy_landmarks = torch.zeros(
+                batch_size, self.args.num_agents, 4,
+                dtype=torch.float32, device=self.device
+            )
+            dummy_landmark_masks = torch.zeros(
+                batch_size, self.args.num_agents, 1,
+                dtype=torch.float32, device=self.device
+            )
+            dummy_landmark_timestamps = torch.full(
+                (batch_size, self.args.num_agents, 1),
+                -1.0,
+                dtype=torch.float32,
+                device=self.device,
+            )
+            dummy_teammate_nodes = torch.zeros(
+                batch_size, self.args.num_agents, 5,
+                dtype=torch.float32, device=self.device
+            )
+            dummy_teammate_masks = torch.zeros(
+                batch_size, self.args.num_agents, 1,
+                dtype=torch.float32, device=self.device
+            )
+
+            team_actions, team_goals_out, team_tasks = self.rollout_writer.assign_act_outputs(
+                team=team,
+                low_outputs=low_outputs,
+                goals=all_goals,
+                tasks=dummy_tasks,
+                goal_log_probs=dummy_goal_log_probs,
+                high_values=dummy_high_values,
+                critic_map=dummy_critic_map,
+                critic_nodes=dummy_critic_nodes,
+                ego_nodes=dummy_ego_nodes,
+                explore_nodes=dummy_explore_nodes,
+                teammate_nodes=dummy_teammate_nodes,
+                teammate_masks=dummy_teammate_masks,
+                landmark_data=dummy_landmarks,
+                landmark_mask=dummy_landmark_masks,
+                landmark_timestamp=dummy_landmark_timestamps,
+                landmark_nodes=dummy_landmarks,
+                low_teammate_rel_pos=all_low_rel_pos,
+                low_teammate_masks=all_low_masks,
+            )
+            actions_list.extend(team_actions)
+            goals_list.extend(team_goals_out)
+            tasks_list.extend(team_tasks)
+            agent_offset += num_agents
+
+        return actions_list, goals_list, tasks_list
+
     def update(self):
         trainers_list = None if self.use_pretrained_low_level else self.trainers_list
         return update_policies(
@@ -382,6 +506,14 @@ class Learner(object):
             self.high_trainers_list,
             self.use_pretrained_low_level,
         )
+
+    def update_low_level(self):
+        return_vals = []
+        for i, trainer in enumerate(self.trainers_list):
+            rollouts_list = [agent.rollouts for agent in self.teams_list[i]]
+            vals = trainer.update(rollouts_list)
+            return_vals.extend([vals] * len(rollouts_list))
+        return torch.tensor(return_vals, dtype=torch.float32, device=self.device)
     
     def update_landmark_info(self, prev_landmark_data, prev_landmark_mask,
                              prev_landmark_timestamp, local_detection_list,
@@ -492,6 +624,45 @@ class Learner(object):
             all_low_value = torch.chunk(next_low_value,len(team))
             for i in range(len(team)):
                 team[i].wrap_horizon(all_low_value[i], all_high_value[i])
+
+    def wrap_low_horizon(self, goals):
+        goals_t = torch.as_tensor(goals, dtype=torch.float32, device=self.device)
+        agent_offset = 0
+        for team, policy in zip(self.teams_list, self.policies_list):
+            num_agents = len(team)
+            num_processes = goals_t.size(0)
+            last_obs = torch.cat([agent.rollouts.obs[-1] for agent in team])
+            team_goals = goals_t[:, agent_offset:agent_offset + num_agents, :]
+            last_goals = flatten_agent_major(team_goals)
+
+            agent_positions = last_obs[:, 2:4].view(
+                num_agents, num_processes, 2
+            ).transpose(0, 1)
+            alive_mask = torch.ones(
+                num_processes, num_agents, device=self.device, dtype=torch.float32
+            )
+            comm_mask = build_comm_mask(
+                agent_positions,
+                self.comm_dist,
+                alive_mask=alive_mask,
+            )
+            low_rel_pos, low_masks = build_low_level_comm_features(
+                agent_positions,
+                comm_mask,
+            )
+
+            with torch.no_grad():
+                next_low_value = policy.get_low_value(
+                    last_obs,
+                    last_goals,
+                    flatten_agent_major(low_rel_pos),
+                    flatten_agent_major(low_masks),
+                )
+
+            all_low_value = torch.chunk(next_low_value, num_agents)
+            for i in range(num_agents):
+                team[i].wrap_low_horizon(all_low_value[i])
+            agent_offset += num_agents
 
     def after_update(self):
         for agent in self.all_agents:

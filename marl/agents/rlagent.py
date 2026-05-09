@@ -64,6 +64,9 @@ class Neo(object):
     self.rollouts.compute_returns(next_low_value, True, self.args.gamma, self.args.tau)
     self.rollouts.compute_high_returns(next_high_value, self.args.gamma, self.args.tau)
 
+  def wrap_low_horizon(self, next_low_value):
+    self.rollouts.compute_returns(next_low_value, True, self.args.gamma, self.args.tau)
+
   def after_update(self):
     self.rollouts.after_update()
 

@@ -6,11 +6,14 @@ import random
 from copy import deepcopy
 from marl.config.arguments import get_args
 from marl.train.trainer import Trainer
+from marl.train.low_level_trainer import LowLevelTrainer
 from pprint import pprint
 
 np.set_printoptions(suppress=True, precision=4)
 
 def train(args, return_early=False):
+    if args.train_stage == "low":
+        return LowLevelTrainer(args).train(return_early=return_early)
     return Trainer(args).train(return_early=return_early)
 
 if __name__ == '__main__':

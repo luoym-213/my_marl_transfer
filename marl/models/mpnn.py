@@ -33,6 +33,7 @@ class MPNN(
         mask_obs_dist=None,
         entity_mp=False,
         is_recurrent=True,
+        low_only=False,
     ):
         super().__init__()
 
@@ -51,6 +52,7 @@ class MPNN(
         self.mask_obs_dist = mask_obs_dist
         self.input_size = input_size
         self.entity_mp = entity_mp
+        self.low_only = low_only
         self.pos_index = pos_index
         self.task_dim = 2
         self.h_dim2 = self.h_dim // 2
@@ -58,8 +60,9 @@ class MPNN(
 
         self.modules_dict = nn.ModuleDict()
         self.modules_dict["low_level"] = self._build_low_level_modules(action_space)
-        self.modules_dict["high_level"] = self._build_high_level_modules()
-        self.modules_dict["high_critic"] = self._build_high_critic_modules()
+        if not self.low_only:
+            self.modules_dict["high_level"] = self._build_high_level_modules()
+            self.modules_dict["high_critic"] = self._build_high_critic_modules()
 
         if norm_in:
             self.in_fn = nn.BatchNorm1d(self.input_size)

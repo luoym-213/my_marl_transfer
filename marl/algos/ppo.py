@@ -111,7 +111,11 @@ class IPPO():
         self.max_grad_norm = max_grad_norm
         self.use_clipped_value_loss = use_clipped_value_loss
 
-        self.optimizer = optim.Adam(actor_critic.parameters(), lr=lr)
+        if hasattr(actor_critic, "modules_dict") and "low_level" in actor_critic.modules_dict:
+            params = actor_critic.get_module_params("low_level")
+        else:
+            params = actor_critic.parameters()
+        self.optimizer = optim.Adam(params, lr=lr)
 
     def update(self, rollouts_list):
         # rollouts_list - list of rollouts of different agents
