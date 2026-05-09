@@ -1,11 +1,10 @@
 import gym
 from gym import spaces
-from gym.envs.registration import EnvSpec
 import numpy as np
+from multiagent.agent_lifecycle import AgentLifecycle
 from multiagent.multi_discrete import MultiDiscrete
-from gym.utils import seeding
-from multiagent.global_info_map import GlobalInfoMap
 from multiagent.global_belief_map import GlobalBeliefMap
+from multiagent.reward_engine import RewardEngine
 
 
 
@@ -53,11 +52,9 @@ class MultiAgentEnv(gym.Env):
         # landmarks 位置
         self.landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
 
-        # 初始化已访问目标集合
-        self.visited_landmarks = set()
-        
-        # 初始化智能体退役状态列表
-        self.agents_done = [False] * self.n
+        self.agent_lifecycle = AgentLifecycle(self.n, self.landmark_positions)
+        self.reward_engine = RewardEngine(time_penalty=0.2)
+        self.time_penalty = self.reward_engine.time_penalty
 
         for agent in self.agents:
             total_action_space = []
@@ -90,8 +87,6 @@ class MultiAgentEnv(gym.Env):
             self.observation_space.append(spaces.Box(low=-np.inf, high=+np.inf, shape=(obs_dim,), dtype=np.float32))
             agent.action.c = np.zeros(self.world.dim_c)
 
-            self.time_penalty = 0.2  # 每步时间惩罚
-
         # rendering
         self.cam_range = cam_range
         self.shared_viewer = shared_viewer
@@ -115,6 +110,22 @@ class MultiAgentEnv(gym.Env):
     @property
     def episode_limit(self):
         return self.world.max_steps_episode
+
+    @property
+    def visited_landmarks(self):
+        return self.agent_lifecycle.visited_landmarks
+
+    @visited_landmarks.setter
+    def visited_landmarks(self, value):
+        self.agent_lifecycle.visited_landmarks = value
+
+    @property
+    def agents_done(self):
+        return self.agent_lifecycle.agents_done
+
+    @agents_done.setter
+    def agents_done(self, value):
+        self.agent_lifecycle.agents_done = value
 
     def seed(self, seed=None):
         np.random.seed(seed)
@@ -166,7 +177,11 @@ class MultiAgentEnv(gym.Env):
         agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, goal_dones)
 
         # 总高层奖励
-        total_high_rewards = np.array(agents_explore_rewards) + np.array(agents_discover_target_rewards) + np.array(agents_reach_target_rewards) - self.time_penalty
+        total_high_rewards = self.reward_engine.high_level_rewards(
+            agents_explore_rewards,
+            agents_discover_target_rewards,
+            agents_reach_target_rewards,
+        )
 
         # 根据获取的全局状态更新全局信息图
         if self.enable_exploration_reward:
@@ -207,11 +222,12 @@ class MultiAgentEnv(gym.Env):
         # if self.shared_reward:
         #     reward_n = [reward] * self.n
 
-        # 差分奖励
-        reward_n = np.array(reward_n) - np.array(last_reward_n)
-
         # 势能奖励+碰撞惩罚
-        all_reward =  reward_n + common_penaltie
+        all_reward = self.reward_engine.low_level_rewards(
+            reward_n,
+            last_reward_n,
+            common_penaltie,
+        )
 
         done['all'] = done_n
         # 如果done_n全为True，则表示episode结束，则设置done['agent']全为True
@@ -229,11 +245,7 @@ class MultiAgentEnv(gym.Env):
         self.reset_callback(self.world)
         self.landmark_positions = [landmark.state.p_pos for landmark in self.world.landmarks]
 
-        # 重置已访问目标集合
-        self.visited_landmarks = set()
-        
-        # 重置智能体退役状态
-        self.agents_done = [False] * self.n
+        self.agent_lifecycle.reset(self.landmark_positions)
 
         # 重置global_belief_map
         # 根据智能体初始位置，预先更新地图
@@ -272,41 +284,11 @@ class MultiAgentEnv(gym.Env):
         return obs_n, state, reset_info
     
     def _compute_penaltie(self):
-        num_agents = len(self.agents)
-        penalties = np.zeros(num_agents)
-        
-        # 超参数
-        SAFE_DISTANCE = 0.15  # 安全距离
-        COLLISION_COEF = -20.0  # 碰撞惩罚系数
-        BOUNDARY_PENALTY = -2.0  # 边界惩罚
-        
-        # 获取所有智能体的位置
         agent_positions = np.array([agent.state.p_pos for agent in self.agents])
-        
-        # 1. 计算碰撞惩罚
-        for i in range(num_agents):
-            for j in range(i + 1, num_agents):
-                # 计算智能体i和j之间的距离
-                dist = np.linalg.norm(agent_positions[i] - agent_positions[j])
-                
-                # 如果距离小于安全距离，施加碰撞惩罚
-                if dist < SAFE_DISTANCE:
-                    collision_penalty = COLLISION_COEF * ((1 - dist / SAFE_DISTANCE) ** 2)
-                    penalties[i] += collision_penalty
-                    penalties[j] += collision_penalty
-        
-        # 2. 计算边界惩罚
-        # 边界范围是 [-world_size/2, world_size/2]
-        boundary = self.world_size / 2.0  # 默认是 2.0/2.0 = 1.0
-        
-        for i in range(num_agents):
-            x, y = agent_positions[i]
-            
-            # 检查是否触碰到边界
-            if abs(x) >= boundary or abs(y) >= boundary:
-                penalties[i] += BOUNDARY_PENALTY
-        
-        return penalties
+        return self.reward_engine.collision_boundary_penalties(
+            agent_positions,
+            self.world_size,
+        )
     
     
     # get info used for benchmarking
@@ -401,16 +383,7 @@ class MultiAgentEnv(gym.Env):
         agent.state.g_pos = goal
 
     def _get_goal_dones(self, agents):
-        # check if high-level goal is achieved
-        # agent pos: agent.state.p_pos
-        # goal pos: agent.state.g_pos
-        # threshold: self.world.dist_thres
-        goal_dones = [np.linalg.norm(agent.state.p_pos - agent.state.g_pos) < self.world.dist_thres for agent in agents] 
-        # 如果agent已经退役，则goal_done也设为False
-        for i in range(len(goal_dones)):
-            if self.agents_done[i]:
-                goal_dones[i] = False
-        return goal_dones
+        return self.agent_lifecycle.goal_dones(agents, self.world.dist_thres)
 
     # reset rendering assets
     def _reset_render(self):
@@ -742,86 +715,13 @@ class MultiAgentEnv(gym.Env):
         return [self._get_obs(agent) for agent in self.agents]
     
     def get_target_reward(self, agents_pos, agents_task, goal_dones):
-        """
-        ✨ 改进版：使用 goal_dones 和 task 判断智能体是否到达目标
-        
-        逻辑：
-        1. 只有当 goal_dones[i]=True 且 agents_task[i]=1 (collect模式) 时才判定到达目标
-        2. 判断智能体当前目标点 (agent.state.g_pos) 是否是某个 landmark
-        3. 如果是未访问过的 landmark，给予奖励并标记为已访问，同时退役该智能体
-        
-        参数:
-            agents_pos: 智能体位置数组，shape (n_agents, 2)
-            agents_task: 智能体任务数组，shape (n_agents, 1) 或 (n_agents,)，1=collect，0=explore
-            goal_dones: 布尔列表，shape (n_agents,)，True 表示到达目标点
-        
-        返回:
-            rewards: 列表，每个智能体的目标到达奖励
-        """
-        # 初始化已访问目标集合
-        if not hasattr(self, 'visited_landmarks'):
-            self.visited_landmarks = set()
-        
-        rewards = []
-        TARGET_REWARD = 10.0  # 🔧 可调参数：到达新目标的奖励值
-        LANDMARK_MATCH_THRESHOLD = self.world.dist_thres  # 🔧 可调参数：判断目标是否为 landmark 的距离阈值
-        
-        for agent_idx, agent in enumerate(self.agents):
-            agent_reward = 0.0
-            
-            # ========== 1. 快速过滤：已退役智能体直接跳过 ==========
-            if self.agents_done[agent_idx]:
-                rewards.append(agent_reward)
-                continue
-            
-            # ========== 2. 快速过滤：非 collect 模式直接跳过 ==========
-            agent_task = agents_task[agent_idx]
-            task_value = agent_task[0] if isinstance(agent_task, (list, np.ndarray)) else agent_task
-            
-            if task_value != 1:  # 非 collect 模式
-                rewards.append(agent_reward)
-                continue
-            
-            # ========== 3. 快速过滤：未到达目标点直接跳过 ==========
-            if not goal_dones[agent_idx]:
-                rewards.append(agent_reward)
-                continue
-            
-            # ========== 4. 判断目标点是否为 landmark ==========
-            # 此时：task=1 且 goal_done=True，说明智能体到达了分配的目标
-            current_goal = agent.state.g_pos  # 当前目标位置
-            
-            # 遍历所有 landmark，找到与当前目标最接近的那个
-            min_dist = float('inf')
-            matched_landmark_idx = None
-            
-            for landmark_idx, landmark_pos in enumerate(self.landmark_positions):
-                dist = np.linalg.norm(current_goal - landmark_pos)
-                if dist < min_dist:
-                    min_dist = dist
-                    matched_landmark_idx = landmark_idx
-            
-            # ========== 5. 判断是否成功到达 landmark ==========
-            if min_dist < LANDMARK_MATCH_THRESHOLD:
-                # 当前目标确实是某个 landmark
-                if matched_landmark_idx not in self.visited_landmarks:
-                    # ✅ 首次访问该 landmark，给予递增奖励
-                    # 奖励倍数 = (已退休智能体数量 + 1)，即当前是第几个发现的landmark
-                    num_retired = sum(self.agents_done)
-                    reward_multiplier = num_retired + 1
-                    agent_reward = TARGET_REWARD * reward_multiplier
-                    
-                    self.visited_landmarks.add(matched_landmark_idx)
-                    
-                    # ✅ 标记该智能体为退役状态
-                    self.agents_done[agent_idx] = True
-                    
-                    # 🎯 调试信息（可选）
-                    # print(f"🎉 Agent {agent_idx} collected landmark {matched_landmark_idx} (#{reward_multiplier}) at step {self.world.steps}, reward={agent_reward}")
-            
-            rewards.append(agent_reward)
-        
-        return rewards
+        self.agent_lifecycle.landmark_positions = self.landmark_positions
+        return self.agent_lifecycle.collect_rewards(
+            self.agents,
+            agents_task,
+            goal_dones,
+            self.world.dist_thres,
+        )
 
 # vectorized wrapper for a batch of multi-agent environments
 # assumes all environments have the same observation and action space

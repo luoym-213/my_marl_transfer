@@ -1,0 +1,65 @@
+import numpy as np
+from multiagent.environment import MultiAgentEnv
+import multiagent.scenarios as scenarios
+import gym_vecenv
+
+
+def normalize_obs(obs, mean, std):
+    if mean is not None:
+        return np.divide((obs - mean), std)
+    else:
+        return obs
+
+
+def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None):
+    def _thunk():
+        env = make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist)
+        env.seed(seed + rank)
+        return env
+    return _thunk
+
+
+def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None):
+    scenario = scenarios.load(env_id+".py").Scenario(num_agents=num_agents, dist_threshold=dist_threshold,
+                                                     arena_size=arena_size, identity_size=identity_size)
+    world = scenario.make_world()
+
+    env = MultiAgentEnv(world=world,
+                        reset_callback=scenario.reset_world,
+                        reward_callback=scenario.reward,
+                        observation_callback=scenario.observation,
+                        info_callback=scenario.info if hasattr(scenario, 'info') else None,
+                        state_callback=scenario.state,
+                        discrete_action=True,
+                        done_callback=scenario.done,
+                        cam_range=arena_size,
+                        mask_obs_dist=mask_obs_dist
+                        )
+    return env
+
+
+def make_parallel_envs(args):
+    envs = [make_env(args.env_name, args.seed, i, args.num_agents,
+                     args.dist_threshold, args.arena_size, args.identity_size, args.mask_obs_dist) for i in range(args.num_processes)]
+    if args.num_processes > 1:
+        envs = gym_vecenv.SubprocVecEnv(envs)
+    else:
+        envs = gym_vecenv.DummyVecEnv(envs)
+
+    envs = gym_vecenv.MultiAgentVecNormalize(envs, ob=False, ret=True)
+    return envs
+
+
+def init(module, weight_init, bias_init, gain=1):
+    weight_init(module.weight.data, gain=gain)
+    bias_init(module.bias.data)
+    return module
+
+
+__all__ = [
+    "init",
+    "make_env",
+    "make_multiagent_env",
+    "make_parallel_envs",
+    "normalize_obs",
+]

@@ -1,169 +1,17 @@
 import os
 import json
-import datetime
 import numpy as np
 import torch
-import utils
 import random
 from copy import deepcopy
-from arguments import get_args
-from tensorboardX import SummaryWriter
-from eval import evaluate
-from learner import setup_master
+from marl.config.arguments import get_args
+from marl.train.trainer import Trainer
 from pprint import pprint
 
 np.set_printoptions(suppress=True, precision=4)
 
 def train(args, return_early=False):
-    writer = SummaryWriter(args.log_dir)    
-    envs = utils.make_parallel_envs(args) # make parallel envs
-    master = setup_master(args) # setup learner ，no env
-    # used during evaluation only
-    eval_master, eval_env = setup_master(args, return_env=True)  # setup evaluate learner with SINGLE env
-    obs, env_state, reset_info = envs.reset() # shape - num_processes x num_agents x obs_dim
-
-    print("obs shape: ", obs.shape)
-    print("state shape: ", env_state.shape)
-    master.initialize_obs(obs)
-    master.initialize_env_state(env_state)
-    master.envs_info = reset_info
-
-    n = len(master.all_agents)
-    episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
-    final_rewards = torch.zeros([args.num_processes, n], device=args.device)
-    episode_high_rewards = torch.zeros([args.num_processes, n], device=args.device)
-    final_high_rewards = torch.zeros([args.num_processes, n], device=args.device)
-
-    # start simulations
-    start = datetime.datetime.now()
-    for j in range(args.num_updates):
-        for step in range(args.num_steps):
-            with torch.no_grad():
-                # print("step: ", step)
-                actions_list, goals_list, tasks_list = master.act(step)
-            agent_actions = np.transpose(np.array(actions_list),(1,0,2))
-            agent_goals = np.transpose(np.array(goals_list),(1,0,2))
-            agent_tasks = np.transpose(np.array(tasks_list),(1,0,2))
-            # 这里需要给agent_actions,agent_goals,agent_tasks包装一下，变成字典形式传入env.step()
-            # 需要变成num_processes个环境的列表，每个元素是一个字典，包含键值对: 'agents_actions', 'agents_goals', 'agents_tasks'
-            step_data = [{'agents_actions': agent_actions[i], 'agents_goals': agent_goals[i], 'agents_tasks': agent_tasks[i]} for i in range(args.num_processes)]
-            obs, reward, high_reward, done_info, info, env_state = envs.step(step_data)
-            # 提取done_info信息,将args.num_processes个done['all']和done['agent']分别赋值给done和done_agent
-            done = np.array([done_info[i]['all'] for i in range(args.num_processes)])
-            done_agent = np.array([done_info[i]['agent'] for i in range(args.num_processes)])
-            ### 验证
-            # print(f"Step {step} goal world coord: ", goals_list[0][0][0:2])
-            # print(f"Step {step} obs sample: ", obs[0,0,2:4])  # 打印第一个环境的观测样本
-            master.envs_info = info
-            high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
-            reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
-            episode_rewards += reward
-            episode_high_rewards += high_reward
-            all_masks = torch.FloatTensor(1-1.0*done).to(args.device)
-            masks = torch.FloatTensor(1-1.0*done_agent).to(args.device)
-            goal_dones = torch.FloatTensor([info[i]['goal_done'] for i in range(args.num_processes)]).to(args.device)
-            final_rewards *= all_masks
-            final_rewards += (1 - all_masks) * episode_rewards
-            final_high_rewards *= all_masks
-            final_high_rewards += (1 - all_masks) * episode_high_rewards
-            episode_rewards *= all_masks
-            episode_high_rewards *= all_masks
-            master.update_rollout(obs, reward, high_reward, masks, env_state, goal_dones)
-
-        master.wrap_horizon()
-        return_vals = master.update()
-        value_low_loss = return_vals[:, 0]
-        action_low_loss = return_vals[:, 1]
-        dist_low_entropy = return_vals[:, 2]
-        value_high_loss = return_vals[:, 3]
-        goal_high_loss = return_vals[:, 4]
-        goal_entropy = return_vals[:, 5]
-        master.after_update()
-
-        if j%args.save_interval == 0 and not args.test:
-            savedict = {'models': [agent.actor_critic.state_dict() for agent in master.all_agents]}
-            ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)
-            savedict['ob_rms'] = ob_rms
-            savedir = args.save_dir+'/ep'+str(j)+'.pt'
-            torch.save(savedict, savedir)
-
-
-            # 新增：按模块拆分保存（每个 agent 独立目录）
-            # 修改后：只保存第一个智能体的模块参数（因为参数共享）
-            if len(master.all_agents) > 0:
-                # 创建保存目录，不再区分 agent0, agent1...
-                module_dir = os.path.join(args.save_dir, f'ep{j}_modules')
-                os.makedirs(module_dir, exist_ok=True)
-                
-                # 只调用第一个智能体的保存函数
-                master.all_agents[0].actor_critic.save_all_modules(module_dir)
-                print(f"✅ Saved shared modular checkpoints to {module_dir}")
-
-        total_num_steps = (j + 1) * args.num_processes * args.num_steps
-
-        if j%args.log_interval == 0:
-            end = datetime.datetime.now()
-            seconds = (end-start).total_seconds()
-            mean_low_reward = final_rewards.mean(dim=0).cpu().numpy()
-            mean_high_reward = final_high_rewards.mean(dim=0).cpu().numpy()
-            print("Updates {} | Num timesteps {} | Time {} | FPS {} \
-                  \nMean low reward {} low Entropy {:.4f} low Value loss {:.4f} low level loss {:.4f} \
-                  \nMean high reward {} high Entropy {:.4f}  high Value loss {:.4f} high level loss {:.4f}\n "
-            .format(j, total_num_steps, str(end-start), int(total_num_steps / seconds), 
-                  mean_low_reward, dist_low_entropy[0], value_low_loss[0], action_low_loss[0],
-                  mean_high_reward, goal_entropy[0], value_high_loss[0],
-                  goal_high_loss[0]))
-            
-            if not args.test:
-                for idx in range(n):
-                    writer.add_scalar('agent'+str(idx)+'/training_low_reward', mean_low_reward[idx], j)
-                    writer.add_scalar('agent'+str(idx)+'/training_high_reward', mean_high_reward[idx], j)
-
-                writer.add_scalar('all/low_value_loss', value_low_loss[0], j)
-                writer.add_scalar('all/action_low_loss', action_low_loss[0], j)
-                writer.add_scalar('all/dist_low_entropy', dist_low_entropy[0], j)
-                writer.add_scalar('all/high_value_loss', value_high_loss[0], j)
-                writer.add_scalar('all/goal_high_loss', goal_high_loss[0], j)
-                writer.add_scalar('all/goal_entropy', goal_entropy[0], j)
-
-        if args.eval_interval is not None and j%args.eval_interval==0:
-            ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)
-            print('===========================================================================================')
-            _, eval_perstep_rewards, _, eval_high_perstep_rewards, final_min_dists, num_success, eval_episode_len, _, _ = evaluate(args, None, master.all_policies,
-                                                                                               ob_rms=ob_rms, env=eval_env,
-                                                                                               master=eval_master, render=args.render)
-            print('Evaluation {:d} | Mean per-step reward {:.2f}'.format(j//args.eval_interval, eval_perstep_rewards.mean()))
-            print('Mean high-level per-step reward {:.2f}'.format(eval_high_perstep_rewards.mean()))
-            print('Num success {:d}/{:d} | Episode Length {:.2f}'.format(num_success, args.num_eval_episodes, eval_episode_len))
-            if final_min_dists:
-                print('Final_dists_mean {}'.format(np.stack(final_min_dists).mean(0)))
-                print('Final_dists_var {}'.format(np.stack(final_min_dists).var(0)))
-            print('===========================================================================================\n')
-
-            if not args.test:
-                writer.add_scalar('all/eval_success', 100.0*num_success/args.num_eval_episodes, j)
-                writer.add_scalar('all/episode_length', eval_episode_len, j)
-                for idx in range(n):
-                    writer.add_scalar('agent'+str(idx)+'/eval_per_step_reward', eval_perstep_rewards.mean(0)[idx], j)
-                    writer.add_scalar('agent'+str(idx)+'/eval_high_per_step_reward', eval_high_perstep_rewards.mean(0)[idx], j)
-                    if final_min_dists:
-                        writer.add_scalar('agent'+str(idx)+'/eval_min_dist', np.stack(final_min_dists).mean(0)[idx], j)
-
-            curriculum_success_thres = 0.9
-            if return_early and num_success*1./args.num_eval_episodes > curriculum_success_thres:
-                savedict = {'models': [agent.actor_critic.state_dict() for agent in master.all_agents]}
-                ob_rms = (None, None) if envs.ob_rms is None else (envs.ob_rms[0].mean, envs.ob_rms[0].var)
-                savedict['ob_rms'] = ob_rms
-                savedir = args.save_dir+'/ep'+str(j)+'.pt'
-                torch.save(savedict, savedir)
-                print('===========================================================================================\n')
-                print('{} agents: training complete. Breaking.\n'.format(args.num_agents))
-                print('===========================================================================================\n')
-                break
-
-    writer.close()
-    if return_early:
-        return savedir
+    return Trainer(args).train(return_early=return_early)
 
 if __name__ == '__main__':
     args = get_args()

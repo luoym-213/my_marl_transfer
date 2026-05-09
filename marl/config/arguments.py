@@ -1,0 +1,134 @@
+import argparse
+import os
+import sys
+import torch
+import shutil
+import subprocess
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description='RL')
+    
+    # environment
+    parser.add_argument('--env-name', default='simple_spread', help='one from {simple_spread, simple_formation, simple_line})')
+    parser.add_argument('--num-agents', type=int, default=3)
+    parser.add_argument('--masking', action='store_true', help='restrict communication to within some threshold')
+    parser.add_argument('--mask-dist', type=float, default=1.5, help='distance to restrict comms')
+    parser.add_argument('--mask-obs-dist', type=float, default=1, help='distance to restrict obs')
+    parser.add_argument('--dropout-masking', action='store_true', help='dropout masking enabled')
+    parser.add_argument('--entity-mp', action='store_true', help='enable entity message passing')
+    parser.add_argument('--identity-size', default=0, type=int, help='size of identity vector')
+
+    # RRT
+    #parser.add_argument('--num-rrt-nodes', type=int, default=50, help='number of RRT nodes to sample')
+    #parser.add_argument('--rrt-step-size', type=float, default=0.2, help='step size for RRT extension')
+    #parser.add_argument('--rrt-goal-sample-rate', type=float, default=0.2, help='goal sampling rate for RRT')
+    parser.add_argument('--rrt-max-iter', type=int, default=40, help='maximum number of iterations for RRT')
+    #parser.add_argument('--rrt-search-radius', type=float, default=0.5, help='search radius for RRT rewiring')
+    parser.add_argument('--top-k', type=int, default=5, help='top k paths to consider for action selection')
+
+    # training 
+    parser.add_argument('--seed', type=int, default=None, help='random seed (default: None)')
+    parser.add_argument('--num-processes', type=int, default=32, help='how many training CPU processes to use (default: 32)')
+    parser.add_argument('--num-steps', type=int, default=128, help='number of forward steps in PPO (default: 128)')
+    parser.add_argument('--no-cuda', action='store_true', default=False, help='disables CUDA training')
+    parser.add_argument('--gpu-id', type=int, default=None, help='Specific GPU ID to use (e.g., 0 or 1). Default (None) uses CUDA_VISIBLE_DEVICES setting.')
+    parser.add_argument('--num-frames', type=int, default=int(50e6), help='number of frames to train (default: 50e6)')
+    parser.add_argument('--arena-size', type=int, default=1, help='size of arena')
+    parser.add_argument('--high-level-interval', type=int, default=5, help='number of steps between high-level decisions')
+
+    # evaluation
+    parser.add_argument('--num-eval-episodes', type=int, default=30, help='number of episodes to evaluate with')
+    parser.add_argument('--dist-threshold', type=float, default=0.1, help='distance within landmark is considered covered (for simple_spread)')
+    parser.add_argument('--render', action='store_true')
+    parser.add_argument('--record-video', action='store_true', default=False, help='record evaluation video')
+    parser.add_argument('--gif-save-path', type=str, default='gifs', help='directory to save GIF files (default: gifs)')
+    
+    # PPO
+    parser.add_argument('--algo', default='ppo', help='algorithm to use: a2c | ppo | acktr')
+    parser.add_argument('--lr', type=float, default=1e-4, help='learning rate (default: 1e-4)')
+    parser.add_argument('--gamma', type=float, default=0.99, help='discount factor for rewards (default: 0.99)')
+    parser.add_argument('--tau', type=float, default=0.95, help='gae parameter (default: 0.95)')
+    parser.add_argument('--entropy-coef', type=float, default=0.01, help='entropy term coefficient (default: 0.01)')
+    parser.add_argument('--value-loss-coef', type=float, default=0.5, help='value loss coefficient (default: 0.05)')
+    parser.add_argument('--max-grad-norm', type=float, default=0.5, help='max norm of gradients (default: 0.5)')
+    parser.add_argument('--ppo-epoch', type=int, default=4, help='number of ppo epochs (default: 4)')
+    parser.add_argument('--num-mini-batch', type=int, default=32, help='number of batches for ppo (default: 32)')
+    parser.add_argument('--clip-param', type=float, default=0.2, help='ppo clip parameter (default: 0.2)')
+    parser.add_argument('--recurrent-hidden-state-size', type=int, default=128, help='number of batches for ppo (default: 32)')
+    parser.add_argument('--is-recurrent', action='store_true')
+    parser.add_argument("--load-low-level-path", type=str, default=None, help="Path of pre-trained low-level policy")
+    parser.add_argument("--load-high-level-path", type=str, default=None, help="Path of pre-trained high-level policy")
+    parser.add_argument("--load-high-critic-path", type=str, default=None, help="Path of pre-trained high-level critic")
+
+    # logging
+    parser.add_argument('--save-dir', default='tmp', help='directory to save models (default: tmp)')
+    parser.add_argument('--log-dir', default='logs', help='directory to save logs')
+    parser.add_argument('--save-interval', type=int, default=200, help='save interval, one save per n updates (default: 200)')
+    parser.add_argument('--log-interval', type=int, default=10, help='log interval, one log per n updates (default: 10)')
+    
+    # Miscellaneous
+    parser.add_argument('--test', action='store_true')
+    parser.add_argument('--load-dir', default=None, help='filename to load all policies from')
+    parser.add_argument('--eval-interval', default=50, type=int)
+    parser.add_argument('--continue-training', action='store_true')
+    parser.add_argument('--branch', default=None, help='Git branch name (auto-detected if not provided)')
+
+    # we always set these to TRUE, so automating this
+    parser.add_argument('--no-clipped-value-loss', action='store_true')
+    
+    args = parser.parse_args()
+
+    # add branch
+    if args.branch is None:
+        try:
+            args.branch = subprocess.check_output(['git', 'rev-parse', '--abbrev-ref', 'HEAD']).decode('utf-8').strip()
+        except Exception:
+            args.branch = 'unknown'
+
+
+    args.clipped_value_loss = not args.no_clipped_value_loss
+
+    args.cuda = not args.no_cuda and torch.cuda.is_available()
+    # 【新增逻辑】如果指定了 --gpu-id，则设置环境变量
+    if args.cuda and args.gpu_id is not None:
+        # 核心：使用 os.environ 来设置环境变量，这会影响所有后续的子进程
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_id)
+        # 确保 args.device 指向正确的设备，但请注意，这只是主进程的设备
+        args.device = torch.device(f"cuda:{args.gpu_id}")
+    else:
+        # 如果没有指定 GPU ID，或者禁用 CUDA，则使用默认逻辑
+        args.device = torch.device("cuda" if args.cuda else "cpu")
+    args.log_dir = args.log_dir + '_' + args.save_dir
+    args.save_dir = '../marlsave/save_new/'+args.save_dir
+    args.log_dir = args.save_dir + '/' + args.log_dir
+    args.gif_save_path = args.save_dir + '/' + args.gif_save_path
+
+    if args.continue_training:
+        assert args.load_dir is not None and os.path.exists(args.load_dir), \
+        "Please specify valid model file to load if you want to continue training"
+
+    if args.identity_size > 0:
+        assert args.identity_size >= args.num_agents, 'identity size should either be 0 or >= number of agents!'
+
+    if not args.masking:
+        args.mask_dist = None
+    elif args.masking and args.dropout_masking:
+        args.mask_dist = -10
+        
+    # raise warning if save directory already exists
+    if not args.test:
+        if os.path.exists(args.save_dir):
+            print('\nSave directory exists already! Enter')
+            ch = input('c (rename the existing directory with _old and continue)\ns (stop)!\ndel (delete existing dir): ')
+            if ch == 's':
+                sys.exit(0)
+            elif ch == 'c':
+                os.rename(args.save_dir, args.save_dir+'_old')
+            elif ch == 'del':
+                shutil.rmtree(args.save_dir)
+            else:
+                raise NotImplementedError('Unknown input')
+        os.makedirs(args.save_dir)
+    
+    return args

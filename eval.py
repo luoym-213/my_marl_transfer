@@ -1,8 +1,8 @@
 import numpy as np
 import torch
-from arguments import get_args
-from utils import normalize_obs
-from learner import setup_master
+from marl.config.arguments import get_args
+from marl.utils import normalize_obs
+from marl.agents.learner import setup_master
 import time
 import os
 import imageio
