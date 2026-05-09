@@ -192,6 +192,13 @@ class Learner(object):
         high_teammate_masks = comm_mask.float().unsqueeze(-1)
         batch_indices = torch.arange(num_agents, device=self.device)
         high_teammate_masks[:, batch_indices, batch_indices, 0] = 0.0
+        # Receiver-specific high-level teammate input:
+        # [P, A(receiver), A(sender), 5]. Communication-out teammate nodes,
+        # including self, are zeroed before they reach the graph network.
+        high_teammate_nodes = (
+            agent_context["teammate_nodes"].unsqueeze(1)
+            * high_teammate_masks
+        )
 
         low_rel_pos, low_masks = build_low_level_comm_features(
             agent_positions,
@@ -208,6 +215,7 @@ class Learner(object):
             "landmark_data": new_detected,
             "landmark_mask": new_detected_masks,
             "landmark_timestamp": new_detected_timestamps,
+            "high_teammate_nodes": high_teammate_nodes,
             "high_teammate_masks": high_teammate_masks,
             "low_rel_pos": low_rel_pos,
             "low_masks": low_masks,
@@ -266,8 +274,8 @@ class Learner(object):
             agent_positions = agent_context["agent_positions"]
             agent_nodes = agent_context["agent_nodes"]
             ego_nodes = agent_context["ego_nodes"]
-            teammate_nodes = agent_context["teammate_nodes"]
             comm_mask = prepared["comm_mask"]
+            high_teammate_nodes = prepared["high_teammate_nodes"]
             high_teammate_masks = prepared["high_teammate_masks"]
 
             # landmark node docker: Tensor shape [num_agents * num_processes, Max_L, 4]
@@ -285,7 +293,7 @@ class Learner(object):
                 voronoi_masks=voronoi_masks_t,
                 agent_nodes=agent_nodes,
                 ego_nodes=ego_nodes,
-                teammate_nodes=teammate_nodes,
+                teammate_nodes=high_teammate_nodes,
                 teammate_mask=high_teammate_masks,
                 landmark_data=new_detected,
                 landmark_mask=new_detected_masks,
@@ -311,8 +319,8 @@ class Learner(object):
             # [P, A, D] -> [A, P, D] -> [A*P, D]
             all_ego_nodes = flatten_agent_major(ego_nodes)
             K = self.top_k
-            # ⭐ 使用 repeat 确保环境索引在 chunk 后能正确分配给每个智能体
-            all_teammate_nodes = teammate_nodes.repeat(num_agents, 1, 1)    # [num_agents * num_processes, num_agents, 5]
+            # Receiver-specific teammate nodes are already communication-masked.
+            all_teammate_nodes = flatten_agent_major(high_teammate_nodes)  # [num_agents * num_processes, num_agents, 5]
             all_teammate_masks = flatten_agent_major(high_teammate_masks)  # [num_agents * num_processes, num_agents, 1]
             all_low_rel_pos = flatten_agent_major(prepared["low_rel_pos"])  # [num_agents * num_processes, A-1, 2]
             all_low_masks = flatten_agent_major(prepared["low_masks"])  # [num_agents * num_processes, A-1]
@@ -439,8 +447,8 @@ class Learner(object):
             agent_positions = agent_context["agent_positions"]
             agent_nodes = agent_context["agent_nodes"]
             ego_nodes = agent_context["ego_nodes"]
-            teammate_nodes = agent_context["teammate_nodes"]
             comm_mask = prepared["comm_mask"]
+            high_teammate_nodes = prepared["high_teammate_nodes"]
             high_teammate_masks = prepared["high_teammate_masks"]
 
             high_decision = self.high_level_policy.select_goals(
@@ -455,7 +463,7 @@ class Learner(object):
                 voronoi_masks=voronoi_masks_t,
                 agent_nodes=agent_nodes,
                 ego_nodes=ego_nodes,
-                teammate_nodes=teammate_nodes,
+                teammate_nodes=high_teammate_nodes,
                 teammate_mask=high_teammate_masks,
                 landmark_data=new_detected,
                 landmark_mask=new_detected_masks,

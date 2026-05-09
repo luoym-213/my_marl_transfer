@@ -146,8 +146,8 @@ class LocalMapBank:
                 env_indices = torch.nonzero(env_indices, as_tuple=False).flatten()
             if isinstance(env_indices, torch.Tensor) and env_indices.numel() == 0:
                 return
-            self.belief_maps[env_indices].fill_(self.initial_belief)
-            self.timestamp_maps[env_indices].fill_(self.initial_timestamp)
+            self.belief_maps[env_indices] = self.initial_belief
+            self.timestamp_maps[env_indices] = self.initial_timestamp
         self.entropy_maps = None
 
     def update_from_local_observations(

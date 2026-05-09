@@ -75,7 +75,7 @@ class EvalController:
                 voronoi_masks=prepared["local_voronoi_masks"],
                 agent_nodes=agent_context["agent_nodes"],
                 ego_nodes=agent_context["ego_nodes"],
-                teammate_nodes=agent_context["teammate_nodes"],
+                teammate_nodes=prepared["high_teammate_nodes"],
                 teammate_mask=prepared["high_teammate_masks"],
                 landmark_data=new_detected,
                 landmark_mask=new_detected_masks,

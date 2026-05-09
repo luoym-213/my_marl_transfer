@@ -313,7 +313,10 @@ class HighLevelPolicy:
             voronoi_masks[proc_indices],
         ], dim=0)
         agent_vec_inputs = agent_nodes[proc_indices]
-        batch_teammate_nodes = teammate_nodes[proc_indices]
+        if teammate_nodes.dim() == 4:
+            batch_teammate_nodes = teammate_nodes[proc_indices, agent_indices]
+        else:
+            batch_teammate_nodes = teammate_nodes[proc_indices]
         if teammate_mask.dim() == 4:
             batch_teammate_masks = teammate_mask[
                 proc_indices, agent_indices
