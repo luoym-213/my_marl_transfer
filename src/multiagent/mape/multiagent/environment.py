@@ -18,13 +18,16 @@ class MultiAgentEnv(gym.Env):
     def __init__(self, world, reset_callback=None, reward_callback=None,
                  observation_callback=None, info_callback=None,
                  done_callback=None, state_callback=None, discrete_action=False, shared_viewer=True,
-                 cam_range=1, enable_exploration_reward=True, mask_obs_dist=None
+                 cam_range=1, enable_exploration_reward=True, mask_obs_dist=None,
+                 sensor_dist=None
                  ):
 
         self.world = world
         # Set observation range if provided
         if mask_obs_dist is not None:
             self.world.mask_obs_dist = mask_obs_dist
+        self.sensor_dist = sensor_dist if sensor_dist is not None else self.world.mask_obs_dist
+        self.world.sensor_dist = self.sensor_dist
         self.agents = self.world.policy_agents
         # set required vectorized gym env property
         self.n = len(world.policy_agents)
@@ -168,7 +171,10 @@ class MultiAgentEnv(gym.Env):
 
         # 收集当前智能体位置
         agents_pos = np.array([a.state.p_pos for a in self.agents])
+        agents_vel = np.array([a.state.p_vel for a in self.agents])
 
+        # Centralized/debug reward setting: policy inputs no longer read this
+        # global map, but rewards/rendering still use env truth for now.
         # 必须在更新全图信息图前获取高层奖励，因为高层奖励依赖于step前的全局信息图
         agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
         agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
@@ -193,11 +199,16 @@ class MultiAgentEnv(gym.Env):
 
         # 添加world_steps到info_n中
         info_n['world_steps'] = self.world.steps
+        info_n['agent_positions'] = agents_pos
+        info_n['agent_velocities'] = agents_vel
+        info_n['agent_alive_mask'] = np.array([not done for done in self.agents_done], dtype=np.float32)
+        info_n['local_detections'] = self._get_local_detections(agents_pos, self.sensor_dist)
 
         # 将centroids和target_positions添加到info_n中
         info_n['map'].append(centroids)
         info_n['map'].append(target_positions)
-        # 将高层策略需要的通道图、是否达到目标点分别加入
+        # These global map fields are kept for debug/render/reward inspection.
+        # The learner-side policy path uses local_detections and LocalMapBank.
         info_n['belief_map'] = self.global_belief_map.belief_grid
         info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos, self.agents_done)
@@ -265,13 +276,19 @@ class MultiAgentEnv(gym.Env):
 
         # 获取当前智能体的位置，[num_agents, 2]
         agent_positions = np.array([agent.state.p_pos for agent in self.agents])
+        agent_velocities = np.array([agent.state.p_vel for agent in self.agents])
         # 获取reset后的voronoi加权质心以及目标位置
         centroids = []
         target_positions = self.global_belief_map.get_target_positions() if self.enable_exploration_reward else None
         reset_info['map'].append(centroids)
         reset_info['map'].append(target_positions)
+        reset_info['agent_positions'] = agent_positions
+        reset_info['agent_velocities'] = agent_velocities
+        reset_info['agent_alive_mask'] = np.ones(len(self.agents), dtype=np.float32)
+        reset_info['local_detections'] = self._get_local_detections(agent_positions, self.sensor_dist)
 
-        # 将高层策略需要的通道图、是否达到目标点分别加入
+        # These global map fields are kept for debug/render/reward inspection.
+        # The learner-side policy path uses local_detections and LocalMapBank.
         
         reset_info['belief_map'] = self.global_belief_map.belief_grid
         reset_info['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
@@ -282,6 +299,26 @@ class MultiAgentEnv(gym.Env):
         reset_info['goal_done'] = [True] * len(self.agents)
 
         return obs_n, state, reset_info
+
+    def _get_local_detections(self, agent_positions, sensor_dist):
+        """Return per-agent landmark detections visible within sensor_dist.
+
+        Shape by convention:
+            local_detections: list[A] of np.ndarray[num_visible, 2]
+        The learner may use these detections, but not the global target map.
+        """
+        landmark_positions = np.array(
+            [landmark.state.p_pos for landmark in self.world.landmarks],
+            dtype=np.float32,
+        )
+        detections = []
+        for agent_pos in agent_positions:
+            if landmark_positions.size == 0:
+                detections.append(np.zeros((0, self.world.dim_p), dtype=np.float32))
+                continue
+            dists = np.linalg.norm(landmark_positions - agent_pos, axis=1)
+            detections.append(landmark_positions[dists <= sensor_dist].astype(np.float32))
+        return detections
     
     def _compute_penaltie(self):
         agent_positions = np.array([agent.state.p_pos for agent in self.agents])

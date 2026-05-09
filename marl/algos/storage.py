@@ -23,6 +23,10 @@ class RolloutStorage(object):
         self.action_log_probs = torch.zeros(num_steps, num_processes, 1)
         self.value_preds = torch.zeros(num_steps + 1, num_processes, 1)
         self.returns = torch.zeros(num_steps + 1, num_processes, 1)
+        # Stored low-level communication input at action time:
+        # low_teammate_rel_pos [T, P, A-1, 2], low_teammate_masks [T, P, A-1].
+        self.low_teammate_rel_pos = torch.zeros(num_steps, num_processes, max(num_agent - 1, 0), 2)
+        self.low_teammate_masks = torch.zeros(num_steps, num_processes, max(num_agent - 1, 0))
         
         # 高层策略存储相关
         self.high_rewards = torch.zeros(num_steps, num_processes, 1)
@@ -52,6 +56,11 @@ class RolloutStorage(object):
         # Landmark 有效性掩码: [num_steps+1, num_processes, max_landmarks, 1]
         # 1 表示该位置有有效的 landmark，0 表示该位置为空
         self.landmark_masks = torch.zeros(num_steps + 1, num_processes, self.max_landmarks, 1)
+        # Landmark timestamp: [num_steps+1, num_processes, max_landmarks, 1]
+        self.landmark_timestamps = torch.full(
+            (num_steps + 1, num_processes, self.max_landmarks, 1),
+            -1.0,
+        )
 
     def to(self, device):
         # 环境基础信息
@@ -66,6 +75,8 @@ class RolloutStorage(object):
         self.action_log_probs = self.action_log_probs.to(device)
         self.value_preds = self.value_preds.to(device)
         self.returns = self.returns.to(device)
+        self.low_teammate_rel_pos = self.low_teammate_rel_pos.to(device)
+        self.low_teammate_masks = self.low_teammate_masks.to(device)
         
         # 高层策略存储相关
         self.high_rewards = self.high_rewards.to(device)
@@ -81,6 +92,7 @@ class RolloutStorage(object):
         self.explore_nodes = self.explore_nodes.to(device)
         self.landmark_datas = self.landmark_datas.to(device)
         self.landmark_masks = self.landmark_masks.to(device)
+        self.landmark_timestamps = self.landmark_timestamps.to(device)
         self.landmark_nodes = self.landmark_nodes.to(device)
         self.teammate_nodes = self.teammate_nodes.to(device)
         self.teammate_masks = self.teammate_masks.to(device)
@@ -90,8 +102,9 @@ class RolloutStorage(object):
                 critic_maps, critic_nodes, goals, task,
                higoal_log_probs, high_values, 
                 ego_nodes, explore_nodes,
-                landmark_data, landmark_mask, landmark_nodes,
+                landmark_data, landmark_mask, landmark_timestamp, landmark_nodes,
                 teammate_nodes, teammate_masks,
+                low_teammate_rel_pos, low_teammate_masks,
                goal_dones):
         # 环境基础信息
         self.obs[self.step + 1].copy_(obs)
@@ -103,6 +116,8 @@ class RolloutStorage(object):
         self.actions[self.step].copy_(actions)
         self.action_log_probs[self.step].copy_(action_log_probs)
         self.value_preds[self.step].copy_(value_preds)
+        self.low_teammate_rel_pos[self.step].copy_(low_teammate_rel_pos)
+        self.low_teammate_masks[self.step].copy_(low_teammate_masks)
         
         # 高层策略存储相关
         self.high_rewards[self.step].copy_(high_rewards)
@@ -118,6 +133,7 @@ class RolloutStorage(object):
         self.explore_nodes[self.step].copy_(explore_nodes)
         self.landmark_datas[self.step + 1].copy_(landmark_data)
         self.landmark_masks[self.step + 1].copy_(landmark_mask)
+        self.landmark_timestamps[self.step + 1].copy_(landmark_timestamp)
         self.landmark_nodes[self.step].copy_(landmark_nodes)
         self.teammate_nodes[self.step].copy_(teammate_nodes)
         self.teammate_masks[self.step].copy_(teammate_masks)
@@ -130,6 +146,9 @@ class RolloutStorage(object):
         self.masks[0].copy_(self.masks[-1])
         self.env_states[0].copy_(self.env_states[-1])
         self.goal_dones[0].copy_(self.goal_dones[-1])
+        self.landmark_datas[0].copy_(self.landmark_datas[-1])
+        self.landmark_masks[0].copy_(self.landmark_masks[-1])
+        self.landmark_timestamps[0].copy_(self.landmark_timestamps[-1])
 
     def compute_returns(self, next_value, use_gae, gamma, tau):
         if use_gae:

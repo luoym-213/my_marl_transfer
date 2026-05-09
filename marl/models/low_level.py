@@ -8,9 +8,11 @@ class LowLevelPolicy:
     def _low_policy(self, x): # h_dim -> h_dim
         return self.policy_head(x)
 
-    def data_processing_low_level(self, inp, goals):
+    def data_processing_low_level(self, inp, goals, teammate_rel_pos, teammate_masks):
         # inp: [num_agents*batch_size, dim_o]
         # goals: [num_agents*batch_size, 2], assigned goals for agents
+        # teammate_rel_pos: [num_agents*batch_size, A-1, 2]
+        # teammate_masks: [num_agents*batch_size, A-1]
 
         batch_size = inp.size(0)
 
@@ -23,35 +25,37 @@ class LowLevelPolicy:
         # 计算与目标的相对位置 [batch_size, 2]
         relative_goal_pos = goals - self_pos
 
-        # 提取其他智能体的绝对位置
-        # 从 inp 中提取：跳过速度(2)、自身位置(2)、landmarks(num_agents*2)
-        other_agents_start_idx = 4 + self.num_agents * 2
-        other_agents_pos = inp[:, other_agents_start_idx:other_agents_start_idx + (self.num_agents - 1) * 2]
+        if teammate_rel_pos is None or teammate_masks is None:
+            teammate_rel_pos = torch.zeros(
+                batch_size,
+                self.num_agents - 1,
+                2,
+                device=inp.device,
+                dtype=inp.dtype,
+            )
+            teammate_masks = torch.zeros(
+                batch_size,
+                self.num_agents - 1,
+                device=inp.device,
+                dtype=inp.dtype,
+            )
 
-        # 将其他智能体位置重塑为 [batch_size, num_agents-1, 2]
-        other_agents_pos = other_agents_pos.view(batch_size, self.num_agents - 1, 2)
-
-        # 计算与其他智能体的相对位置
-        # 扩展 self_pos 以便广播: [batch_size, 1, 2]
-        self_pos_expanded = self_pos.unsqueeze(1)
-
-        # 相对位置 [batch_size, num_agents-1, 2]
-        relative_other_agents_pos = other_agents_pos - self_pos_expanded
-
-        # 展平其他智能体的相对位置 [batch_size, (num_agents-1)*2]
-        relative_other_agents_pos = relative_other_agents_pos.view(batch_size, -1)
+        teammate_rel_pos = teammate_rel_pos.to(device=inp.device, dtype=inp.dtype)
+        teammate_masks = teammate_masks.to(device=inp.device, dtype=inp.dtype)
+        relative_other_agents_pos = teammate_rel_pos.view(batch_size, -1)
 
         # 拼接新的观测向量
-        # [batch_size, 2 + 2 + (num_agents-1)*2]
+        # [batch_size, 2 + 2 + (A-1)*2 + (A-1)]
         new_inp = torch.cat([
             velocities,                    # 速度 (2)
             relative_goal_pos,             # 与目标的相对位置 (2)
-            relative_other_agents_pos      # 与其他智能体的相对位置 ((num_agents-1)*2)
+            relative_other_agents_pos,     # 与通信内队友的相对位置 ((A-1)*2)
+            teammate_masks                 # 通信内队友mask (A-1)
         ], dim=1)
 
         return new_inp
 
-    def low_level_act(self, inp, goals, deterministic=False):
+    def low_level_act(self, inp, goals, teammate_rel_pos=None, teammate_masks=None, deterministic=False):
         """
         inp: [num_agents*batch_size, dim_o]
         state: [num_agents*batch_size, dim_h]
@@ -60,7 +64,9 @@ class LowLevelPolicy:
         
         """
         # 处理观测和目标，得到新的输入
-        new_inp = self.data_processing_low_level(inp, goals)  
+        new_inp = self.data_processing_low_level(
+            inp, goals, teammate_rel_pos, teammate_masks
+        )
 
         # 前向传播
         x = self.low_agent_encoder(new_inp)  # should be [batch_size, h_dim]
@@ -76,8 +82,10 @@ class LowLevelPolicy:
 
         return value, action, action_log_probs
 
-    def evaluate_low_actions(self, inp, goals, action):
-        new_inp = self.data_processing_low_level(inp, goals)
+    def evaluate_low_actions(self, inp, goals, action, teammate_rel_pos=None, teammate_masks=None):
+        new_inp = self.data_processing_low_level(
+            inp, goals, teammate_rel_pos, teammate_masks
+        )
         x = self.low_agent_encoder(new_inp)
         value = self._low_value(x)
         dist = self.dist(self._low_policy(x))
@@ -86,8 +94,10 @@ class LowLevelPolicy:
         
         return value, action_log_probs, dist_entropy
     
-    def get_low_value(self, inp, goals):
-        new_inp = self.data_processing_low_level(inp, goals)
+    def get_low_value(self, inp, goals, teammate_rel_pos=None, teammate_masks=None):
+        new_inp = self.data_processing_low_level(
+            inp, goals, teammate_rel_pos, teammate_masks
+        )
         x = self.low_agent_encoder(new_inp)
         value = self._low_value(x)
         return value

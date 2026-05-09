@@ -40,7 +40,9 @@ class MPNN(
         self.nonlin = nonlin
         self.num_agents = num_agents
         self.num_entities = num_entities
-        self.low_level_input = 2 + 2 * num_agents
+        # Low-level input: self_vel(2) + relative_goal(2)
+        # + relative teammate positions [A-1, 2] + teammate masks [A-1].
+        self.low_level_input = 2 + 2 + 2 * (num_agents - 1) + (num_agents - 1)
         self.K = 3
         self.embed_dim = self.h_dim if embed_dim is None else embed_dim
         self.n_heads = n_heads

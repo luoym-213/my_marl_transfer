@@ -19,6 +19,7 @@ def setup_master(args, learner_cls, env=None, return_env=False):
             arena_size=args.arena_size,
             identity_size=args.identity_size,
             mask_obs_dist=args.mask_obs_dist if hasattr(args, "mask_obs_dist") else None,
+            sensor_dist=args.sensor_dist if hasattr(args, "sensor_dist") else None,
         )
 
     team1, team2 = [], []

@@ -201,6 +201,7 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
         tasks = torch.zeros((len(obs), 1), dtype=torch.long, device=args.device)
         landmark_data = torch.zeros((len(obs), args.num_agents, 4), dtype=torch.float32, device=args.device)
         landmark_mask = torch.zeros((len(obs), args.num_agents, 1), dtype=torch.float32, device=args.device)
+        landmark_timestamp = torch.full((len(obs), args.num_agents, 1), -1.0, dtype=torch.float32, device=args.device)
 
         # Initial render for GIF saving (if needed)
         if should_save_gif:
@@ -241,10 +242,16 @@ def evaluate(args, seed, policies_list, ob_rms=None, render=False, env=None, mas
             actions = []
             with torch.no_grad():
                 # print("step:", info['world_steps'])
-                actions, goals, tasks, landmark_data, landmark_mask = master.eval_act(obs, env_states, masks,
-                                                                                      goals, tasks, 
-                                                                                      landmark_data, 
-                                                                                      landmark_mask)
+                actions, goals, tasks, landmark_data, landmark_mask, landmark_timestamp = master.eval_act(
+                    obs,
+                    env_states,
+                    masks,
+                    goals,
+                    tasks,
+                    landmark_data,
+                    landmark_mask,
+                    landmark_timestamp,
+                )
             episode_steps += 1
             step_data = {'agents_actions': actions, 'agents_goals': goals, 'agents_tasks': tasks} 
             if isinstance(step_data['agents_goals'], torch.Tensor):

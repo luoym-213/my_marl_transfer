@@ -11,15 +11,15 @@ def normalize_obs(obs, mean, std):
         return obs
 
 
-def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None):
+def make_env(env_id, seed, rank, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None, sensor_dist=None):
     def _thunk():
-        env = make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist)
+        env = make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist, sensor_dist)
         env.seed(seed + rank)
         return env
     return _thunk
 
 
-def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None):
+def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity_size, mask_obs_dist=None, sensor_dist=None):
     scenario = scenarios.load(env_id+".py").Scenario(num_agents=num_agents, dist_threshold=dist_threshold,
                                                      arena_size=arena_size, identity_size=identity_size)
     world = scenario.make_world()
@@ -33,14 +33,16 @@ def make_multiagent_env(env_id, num_agents, dist_threshold, arena_size, identity
                         discrete_action=True,
                         done_callback=scenario.done,
                         cam_range=arena_size,
-                        mask_obs_dist=mask_obs_dist
+                        mask_obs_dist=mask_obs_dist,
+                        sensor_dist=sensor_dist,
                         )
     return env
 
 
 def make_parallel_envs(args):
     envs = [make_env(args.env_name, args.seed, i, args.num_agents,
-                     args.dist_threshold, args.arena_size, args.identity_size, args.mask_obs_dist) for i in range(args.num_processes)]
+                     args.dist_threshold, args.arena_size, args.identity_size,
+                     args.mask_obs_dist, args.sensor_dist) for i in range(args.num_processes)]
     if args.num_processes > 1:
         envs = gym_vecenv.SubprocVecEnv(envs)
     else:

@@ -2,13 +2,9 @@ import numpy as np
 import torch
 
 from marl.controllers.high_level_context import (
-    agent_batteries,
-    build_agent_context,
-    detected_maps as build_detected_maps,
     goal_done_mask as build_goal_done_mask,
-    stack_global_maps,
-    voronoi_masks as build_voronoi_masks,
 )
+from marl.controllers.local_maps import flatten_agent_major
 
 
 class EvalController:
@@ -28,6 +24,7 @@ class EvalController:
         tasks,
         landmark_data,
         landmark_mask,
+        landmark_timestamp,
         deterministic=True,
     ):
         grouped_obs = self._group_observations_by_team(learner, obs)
@@ -42,31 +39,29 @@ class EvalController:
             num_agents = len(team)
             obs_tensor = torch.cat(team_obs, dim=0).to(self.device)
 
-            envs_info = [learner.envs_info]
-            entropy_maps, _, _, _ = stack_global_maps(envs_info, self.device)
+            envs_info = [learner.envs_info] if isinstance(learner.envs_info, dict) else learner.envs_info
+            learner.envs_info = envs_info
+            if envs_info[0].get("world_steps", 0) == 0:
+                learner.local_map_bank.reset()
+
             current_goal_done_mask = build_goal_done_mask(envs_info, self.device)
-            batteries = agent_batteries(envs_info, num_agents, self.device)
-
-            detected_maps = build_detected_maps(envs_info, self.device)
-            new_detected, new_detected_masks = learner.update_landmark_info(
-                landmark_data,
-                landmark_mask,
-                detected_maps,
-                self.device,
-            )
-
-            agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(
-                1, num_agents, 1, 1
-            )
-            voronoi_masks = build_voronoi_masks(envs_info, num_agents, self.device)
-            agent_context = build_agent_context(
+            env_dones = learner._env_dones_from_masks(masks, num_agents, 1)
+            prepared = learner._prepare_local_policy_inputs(
                 obs_tensor,
                 all_goals,
                 masks,
-                batteries,
+                landmark_data,
+                landmark_mask,
+                landmark_timestamp,
                 num_agents,
                 1,
+                env_dones,
             )
+
+            new_detected = prepared["landmark_data"]
+            new_detected_masks = prepared["landmark_mask"]
+            new_detected_timestamps = prepared["landmark_timestamp"]
+            agent_context = prepared["agent_context"]
 
             decision = self.high_level_policy.select_goals(
                 policy=policy,
@@ -76,14 +71,15 @@ class EvalController:
                 tasks=all_tasks,
                 goal_log_probs=None,
                 goal_done_mask=current_goal_done_mask,
-                agent_entropy_maps=agent_entropy_maps,
-                voronoi_masks=voronoi_masks,
+                agent_entropy_maps=prepared["agent_entropy_maps"],
+                voronoi_masks=prepared["local_voronoi_masks"],
                 agent_nodes=agent_context["agent_nodes"],
                 ego_nodes=agent_context["ego_nodes"],
                 teammate_nodes=agent_context["teammate_nodes"],
-                teammate_mask=agent_context["teammate_mask"],
+                teammate_mask=prepared["high_teammate_masks"],
                 landmark_data=new_detected,
                 landmark_mask=new_detected_masks,
+                goal_visibility_mask=prepared["comm_mask"],
                 num_processes=1,
                 deterministic=deterministic,
                 update_tasks=True,
@@ -93,14 +89,26 @@ class EvalController:
             )
             landmark_data = decision["landmark_data"]
             landmark_mask = decision["landmark_mask"]
+            landmark_timestamp = new_detected_timestamps
 
             if len(team_obs) != 0:
                 _, action, _ = policy.low_level_act(
-                    obs_tensor, all_goals, deterministic=True
+                    obs_tensor,
+                    all_goals,
+                    flatten_agent_major(prepared["low_rel_pos"]),
+                    flatten_agent_major(prepared["low_masks"]),
+                    deterministic=True,
                 )
                 actions.append(action.squeeze(1).cpu().numpy())
 
-        return np.hstack(actions), all_goals, all_tasks, landmark_data, landmark_mask
+        return (
+            np.hstack(actions),
+            all_goals,
+            all_tasks,
+            landmark_data,
+            landmark_mask,
+            landmark_timestamp,
+        )
 
     def _group_observations_by_team(self, learner, obs):
         obs1 = []

@@ -45,6 +45,22 @@ def detected_maps(envs_info, device):
     ]
 
 
+def local_detections(envs_info):
+    return [info.get("local_detections", []) for info in envs_info]
+
+
+def agent_alive_masks(envs_info, num_agents, device):
+    return torch.from_numpy(
+        np.array([
+            info.get("agent_alive_mask", np.ones(num_agents, dtype=np.float32))
+            for info in envs_info
+        ], dtype=np.float32)
+    ).to(
+        dtype=torch.float32,
+        device=device,
+    )
+
+
 def voronoi_masks(envs_info, num_agents, device):
     return torch.stack([
         torch.stack([

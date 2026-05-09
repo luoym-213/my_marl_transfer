@@ -91,6 +91,10 @@ class Trainer:
         finally:
             if self.writer is not None:
                 self.writer.close()
+            if self.envs is not None:
+                self.envs.close()
+            if self.eval_env is not None and hasattr(self.eval_env, "close"):
+                self.eval_env.close()
 
         if return_early:
             return self.savedir

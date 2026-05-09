@@ -10,6 +10,7 @@ def build_explore_nodes(
     vec_inp,
     map_inp,
     agent_indices=None,
+    goal_visibility_mask=None,
 ):
     """
     Generate explore-node candidates with RRT planning.
@@ -17,6 +18,8 @@ def build_explore_nodes(
     vec_inp: [Batch, num_agents, 4], world coords [x, y, goal_x, goal_y]
     map_inp: [2, Batch, num_agents, H, W], 0 entropy, 1 voronoi mask
     agent_indices: [N], optional subset of agents to update
+    goal_visibility_mask: optional bool [Batch, num_agents, num_agents],
+        receiver-source mask for occupied-goal features
     """
     batch_processes = vec_inp.size(0)
     if agent_indices is not None:
@@ -86,15 +89,32 @@ def build_explore_nodes(
     mask = torch.ones_like(dists, dtype=torch.bool)
     if agent_indices is not None:
         batch_idx = torch.arange(batch_processes, device=vec_inp.device)
+        if goal_visibility_mask is not None:
+            receiver_visible = goal_visibility_mask[
+                batch_idx, agent_indices
+            ].bool()
+            mask = receiver_visible.view(
+                batch_processes, 1, 1, -1
+            ).expand_as(dists).clone()
         mask[batch_idx, 0, :, agent_indices] = False
     else:
-        diag_mask = torch.eye(batch_agents, device=vec_inp.device).bool()
-        mask = ~diag_mask.view(1, batch_agents, 1, batch_agents).expand(
-            batch_processes,
-            batch_agents,
-            top_k,
-            batch_agents,
-        )
+        if goal_visibility_mask is not None:
+            mask = goal_visibility_mask.bool().unsqueeze(2).expand(
+                batch_processes,
+                batch_agents,
+                top_k,
+                batch_agents,
+            ).clone()
+            diag_mask = torch.eye(batch_agents, device=vec_inp.device).bool()
+            mask = mask & ~diag_mask.view(1, batch_agents, 1, batch_agents)
+        else:
+            diag_mask = torch.eye(batch_agents, device=vec_inp.device).bool()
+            mask = ~diag_mask.view(1, batch_agents, 1, batch_agents).expand(
+                batch_processes,
+                batch_agents,
+                top_k,
+                batch_agents,
+            )
 
     dists = torch.where(
         mask,
@@ -264,6 +284,7 @@ class HighLevelPolicy:
         landmark_data,
         landmark_mask,
         num_processes,
+        goal_visibility_mask=None,
         deterministic=False,
         update_tasks=True,
         update_log_probs=True,
@@ -293,7 +314,12 @@ class HighLevelPolicy:
         ], dim=0)
         agent_vec_inputs = agent_nodes[proc_indices]
         batch_teammate_nodes = teammate_nodes[proc_indices]
-        batch_teammate_masks = teammate_mask[proc_indices].clone()
+        if teammate_mask.dim() == 4:
+            batch_teammate_masks = teammate_mask[
+                proc_indices, agent_indices
+            ].clone()
+        else:
+            batch_teammate_masks = teammate_mask[proc_indices].clone()
 
         batch_indices = torch.arange(len(proc_indices), device=self.device)
         batch_teammate_masks[batch_indices, agent_indices, 0] = 0.0
@@ -304,6 +330,9 @@ class HighLevelPolicy:
             agent_vec_inputs,
             map_inputs,
             agent_indices,
+            goal_visibility_mask=goal_visibility_mask[proc_indices]
+            if goal_visibility_mask is not None
+            else None,
         )
         batch_explore_nodes = batch_explore_nodes.reshape(
             -1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1]
@@ -398,12 +427,4 @@ class HighLevelPolicy:
             distances = distances.masked_fill(~valid_mask, float("inf"))
             min_idx = distances.argmin()
             if distances[min_idx] < 0.05:
-                landmark_data[:, min_idx, 3] = 1.0
-                current_proc_idx = linear_idx % num_processes
-                process_agent_indices = torch.arange(
-                    current_proc_idx,
-                    landmark_data.shape[0],
-                    num_processes,
-                    device=self.device,
-                )
-                landmark_data[process_agent_indices, min_idx, 3] = 1.0
+                landmark_data[linear_idx, min_idx, 3] = 1.0

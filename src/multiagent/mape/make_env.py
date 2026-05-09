@@ -13,7 +13,7 @@ communication actions in this array. See environment.py for more details.
 """
 
 def make_env(scenario_name, num_agents=2, dist_threshold=0.1, arena_size=1, identity_size=0, 
-             discrete_action=True, cam_range=1, mask_obs_dist=None):
+             discrete_action=True, cam_range=1, mask_obs_dist=None, sensor_dist=None):
     '''
     Creates a MultiAgentEnv object as env. This can be used similar to a gym
     environment by calling env.reset() and env.step().
@@ -45,5 +45,6 @@ def make_env(scenario_name, num_agents=2, dist_threshold=0.1, arena_size=1, iden
     # create multiagent environment
     env = MultiAgentEnv(world, scenario.reset_world, scenario.reward, scenario.observation, 
                         scenario.info, scenario.done, discrete_action=discrete_action, 
-                        cam_range=cam_range, mask_obs_dist=mask_obs_dist)
+                        cam_range=cam_range, mask_obs_dist=mask_obs_dist,
+                        sensor_dist=sensor_dist)
     return env

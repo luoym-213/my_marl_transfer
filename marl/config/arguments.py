@@ -15,6 +15,10 @@ def get_args():
     parser.add_argument('--masking', action='store_true', help='restrict communication to within some threshold')
     parser.add_argument('--mask-dist', type=float, default=1.5, help='distance to restrict comms')
     parser.add_argument('--mask-obs-dist', type=float, default=1, help='distance to restrict obs')
+    parser.add_argument('--comm-dist', type=float, default=0.5, help='communication radius for local map sharing')
+    parser.add_argument('--sensor-dist', type=float, default=None, help='local sensing radius for per-agent map updates; defaults to --mask-obs-dist')
+    parser.add_argument('--local-voronoi-scope', choices=['self', 'comm'], default='comm',
+                        help='self: plan without teammate Voronoi sites; comm: use only communication-range teammates')
     parser.add_argument('--dropout-masking', action='store_true', help='dropout masking enabled')
     parser.add_argument('--entity-mp', action='store_true', help='enable entity message passing')
     parser.add_argument('--identity-size', default=0, type=int, help='size of identity vector')
@@ -110,6 +114,9 @@ def get_args():
 
     if args.identity_size > 0:
         assert args.identity_size >= args.num_agents, 'identity size should either be 0 or >= number of agents!'
+
+    if args.sensor_dist is None:
+        args.sensor_dist = args.mask_obs_dist
 
     if not args.masking:
         args.mask_dist = None

@@ -134,11 +134,14 @@ class IPPO():
 
             for sample in data_generator:
                 obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, \
-                return_batch, masks_batch, old_action_log_probs_batch, adv_targ, goal = sample
+                return_batch, masks_batch, old_action_log_probs_batch, adv_targ, goal, \
+                low_teammate_rel_pos_batch, low_teammate_masks_batch = sample
 
                 # Reshape to do in a single forward pass for all steps
                 values, action_log_probs, dist_entropy = self.actor_critic.evaluate_low_actions(obs_batch,
-                                             goal, actions_batch)
+                                             goal, actions_batch,
+                                             low_teammate_rel_pos_batch,
+                                             low_teammate_masks_batch)
 
                 ratio = torch.exp(action_log_probs - old_action_log_probs_batch)
                 surr1 = ratio * adv_targ
@@ -347,9 +350,18 @@ def feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         old_action_log_probs_batch=torch.cat([rollout.action_log_probs.view(-1,1)[indices] for rollout in rollouts_list],0)
         adv_targ = torch.cat([advantages.view(-1, 1)[indices] for advantages in advantages_list],0)
         goal = torch.cat([rollout.goals.view(-1, rollout.goals.size(-1))[indices] for rollout in rollouts_list],0)
+        low_teammate_rel_pos = torch.cat([
+            rollout.low_teammate_rel_pos.view(-1, *rollout.low_teammate_rel_pos.size()[2:])[indices]
+            for rollout in rollouts_list
+        ], 0)
+        low_teammate_masks = torch.cat([
+            rollout.low_teammate_masks.view(-1, rollout.low_teammate_masks.size(-1))[indices]
+            for rollout in rollouts_list
+        ], 0)
 
         yield obs_batch, recurrent_hidden_states_batch, actions_batch, value_preds_batch, return_batch,\
-              masks_batch, old_action_log_probs_batch, adv_targ, goal
+              masks_batch, old_action_log_probs_batch, adv_targ, goal, \
+              low_teammate_rel_pos, low_teammate_masks
 
 def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     """
@@ -437,9 +449,9 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     if decision_mask.sum() > 0:
         # 只对决策点的 advantage 进行归一化，只在决策点上计算均值和方差
         adv_mean = advantages_all[decision_mask].mean()
-        adv_std = advantages_all[decision_mask].std()
+        adv_std = advantages_all[decision_mask].std(unbiased=False).clamp_min(1e-5)
         # 归一化所有 advantage（但统计量只来自决策点）
-        advantages_all = (advantages_all - adv_mean) / (adv_std + 1e-5)
+        advantages_all = (advantages_all - adv_mean) / adv_std
     else:
         print("Warning: No decision points found in rollouts")
         # 如果没有决策点，仍然做归一化（虽然这些数据不会用于 Actor 更新）

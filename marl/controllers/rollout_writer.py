@@ -23,7 +23,10 @@ class RolloutWriter:
         teammate_masks,
         landmark_data,
         landmark_mask,
+        landmark_timestamp,
         landmark_nodes,
+        low_teammate_rel_pos,
+        low_teammate_masks,
     ):
         num_agents = len(team)
         values, actions, action_log_probs = [
@@ -40,7 +43,10 @@ class RolloutWriter:
         teammate_masks_split = torch.chunk(teammate_masks, num_agents)
         landmark_data_split = torch.chunk(landmark_data, num_agents)
         landmark_mask_split = torch.chunk(landmark_mask, num_agents)
+        landmark_timestamp_split = torch.chunk(landmark_timestamp, num_agents)
         landmark_nodes_split = torch.chunk(landmark_nodes, num_agents)
+        low_teammate_rel_pos_split = torch.chunk(low_teammate_rel_pos, num_agents)
+        low_teammate_masks_split = torch.chunk(low_teammate_masks, num_agents)
 
         actions_list = []
         goals_list = []
@@ -62,9 +68,12 @@ class RolloutWriter:
             agent.explore_nodes = explore_nodes_split[i]
             agent.landmark_data = landmark_data_split[i]
             agent.landmark_mask = landmark_mask_split[i]
+            agent.landmark_timestamp = landmark_timestamp_split[i]
             agent.teammate_nodes = teammate_nodes_split[i]
             agent.teammate_masks = teammate_masks_split[i]
             agent.landmark_nodes = landmark_nodes_split[i]
+            agent.low_teammate_rel_pos = low_teammate_rel_pos_split[i]
+            agent.low_teammate_masks = low_teammate_masks_split[i]
 
             actions_list.append(actions[i].cpu().numpy())
             goals_list.append(goals_split[i].cpu().numpy())
