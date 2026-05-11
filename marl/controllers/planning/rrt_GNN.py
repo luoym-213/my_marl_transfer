@@ -84,7 +84,8 @@ class RRT_GNN:
         self.map_size = entropy_map.shape
 
         # 生成采样列表和初始概率分布
-        self.sample_list, self.sample_probs = self._generate_sample_distribution()
+        self.sample_points, self.sample_probs = self._generate_sample_distribution()
+        self.sample_list = [tuple(point) for point in self.sample_points.tolist()]
         
         # 新增：记录采样历史，用于动态调整概率
         self.sample_counts = np.zeros(len(self.sample_list))  # 每个点被采样的次数
@@ -113,7 +114,7 @@ class RRT_GNN:
         kernel = mask.astype(np.float32)
         return kernel
 
-    def _generate_sample_distribution(self) -> Tuple[List[Tuple[int, int]], np.ndarray]:
+    def _generate_sample_distribution(self) -> Tuple[np.ndarray, np.ndarray]:
         """
         生成采样列表和对应的概率分布（基于熵值的softmax）
 
@@ -133,15 +134,16 @@ class RRT_GNN:
                     x = np.clip(self.start.x + dx, 0, self.map_size[0] - 1)
                     y = np.clip(self.start.y + dy, 0, self.map_size[1] - 1)
                     nearby_points.append((int(x), int(y)))
-            sample_list = list(set(nearby_points))
-            sample_probs = np.ones(len(sample_list)) / len(sample_list)
-            return sample_list, sample_probs
-        
-        # 转换为列表 [(x, y), ...]
-        sample_list = [(int(idx[0]), int(idx[1])) for idx in voronoi_indices]
+            sample_points = np.array(list(set(nearby_points)), dtype=np.int16)
+            sample_probs = np.ones(len(sample_points)) / len(sample_points)
+            return sample_points, sample_probs
         
         # 获取每个栅格的熵值
-        entropy_values = np.array([self.entropy_map[x, y] for x, y in sample_list])
+        sample_points = voronoi_indices.astype(np.int16, copy=False)
+        entropy_values = self.entropy_map[
+            sample_points[:, 0],
+            sample_points[:, 1],
+        ]
         
         # 过滤掉熵值过低的点（可选，保留一定的探索性）
         # # 如果想完全基于熵值采样，可以注释掉这部分
@@ -166,7 +168,7 @@ class RRT_GNN:
         # 确保概率和为1（数值稳定性）
         sample_probs = sample_probs / np.sum(sample_probs)
         
-        return sample_list, sample_probs
+        return sample_points, sample_probs
 
     def _update_sample_probs(self, sampled_point: Tuple[int, int]):
         """
@@ -199,7 +201,7 @@ class RRT_GNN:
         返回:
             rnd_node: 采样的节点
         """
-        if len(self.sample_list) == 0:
+        if len(self.sample_points) == 0:
             print("⚠️ sample_list empty, using random point near start")
             x = self.start.x + np.random.randint(-10, 10)
             y = self.start.y + np.random.randint(-10, 10)
@@ -213,18 +215,45 @@ class RRT_GNN:
         # 以一定概率进行均匀采样
         if np.random.random() < self.uniform_ratio:
             # 均匀随机采样
-            idx = np.random.randint(0, len(self.sample_list))
+            idx = np.random.randint(0, len(self.sample_points))
         else:
             # 基于熵值概率采样
-            idx = np.random.choice(len(self.sample_list), p=self.sample_probs)
+            idx = np.random.choice(len(self.sample_points), p=self.sample_probs)
 
-        x, y = self.sample_list[idx]
+        x, y = self.sample_points[idx]
         rnd_node = self.Node(x, y)
         
         # 更新采样概率（降低该点周围的概率）
         # self._update_sample_probs((x, y))
         
         return rnd_node
+
+    def _sample_random_points(self, count: int) -> np.ndarray:
+        if len(self.sample_points) == 0:
+            offsets = np.random.randint(-10, 10, size=(count, 2))
+            points = offsets + np.array([self.start.x, self.start.y])
+            points[:, 0] = np.clip(points[:, 0], 0, self.map_size[0] - 1)
+            points[:, 1] = np.clip(points[:, 1], 0, self.map_size[1] - 1)
+            return points.astype(np.int16, copy=False)
+
+        sample_count = len(self.sample_points)
+        use_uniform = np.random.random(count) < self.uniform_ratio
+        indices = np.empty(count, dtype=np.int64)
+        uniform_count = int(use_uniform.sum())
+        if uniform_count > 0:
+            indices[use_uniform] = np.random.randint(
+                0,
+                sample_count,
+                size=uniform_count,
+            )
+        weighted_count = count - uniform_count
+        if weighted_count > 0:
+            indices[~use_uniform] = np.random.choice(
+                sample_count,
+                size=weighted_count,
+                p=self.sample_probs,
+            )
+        return self.sample_points[indices]
 
     def _calculate_local_entropy(self, x: int, y: int) -> float:
         """O(1) 查询：直接查表，而不是每次遍历半径邻域。"""
@@ -361,10 +390,14 @@ class RRT_GNN:
             self.node_list = [self.start]
             
             # 迭代扩展
+            random_points = self._sample_random_points(self.max_iterations)
             for i in range(self.max_iterations):
                 try:
                     # 随机采样一个节点
-                    rnd_node = self._get_random_node()
+                    rnd_node = self.Node(
+                        random_points[i, 0],
+                        random_points[i, 1],
+                    )
                     
                     # 找到最近的节点
                     nearest_ind = self._get_nearest_node_index(self.node_list, rnd_node)

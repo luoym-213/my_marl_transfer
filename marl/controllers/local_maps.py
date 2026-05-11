@@ -226,36 +226,77 @@ class LocalMapBank:
         Ties keep the receiver value because the receiver is placed first in
         the source set before torch.argmax is applied.
         """
-        comm_mask = comm_mask.bool()
-        fused_beliefs = self.belief_maps.clone()
-        fused_timestamps = self.timestamp_maps.clone()
+        comm_mask = comm_mask.bool().clone()
+        num_processes, num_agents = comm_mask.shape[:2]
+        eye = torch.eye(num_agents, device=self.device, dtype=torch.bool)
+        comm_mask = comm_mask | eye.unsqueeze(0)
 
-        for proc_idx in range(self.num_processes):
-            for receiver_idx in range(self.num_agents):
-                neighbor_indices = torch.nonzero(
-                    comm_mask[proc_idx, receiver_idx],
-                    as_tuple=False,
-                ).flatten()
-                if neighbor_indices.numel() == 0:
-                    neighbor_indices = torch.tensor(
-                        [receiver_idx], device=self.device, dtype=torch.long
-                    )
+        source_order = []
+        for receiver_idx in range(num_agents):
+            ordered = [receiver_idx]
+            ordered.extend(idx for idx in range(num_agents) if idx != receiver_idx)
+            source_order.append(ordered)
+        source_order = torch.tensor(
+            source_order,
+            device=self.device,
+            dtype=torch.long,
+        )
+        ordered_comm_mask = torch.gather(
+            comm_mask,
+            2,
+            source_order.unsqueeze(0).expand(num_processes, -1, -1),
+        )
+        source_timestamps = self.timestamp_maps.unsqueeze(1).expand(
+            num_processes,
+            num_agents,
+            num_agents,
+            self.height,
+            self.width,
+        )
+        source_timestamps = torch.gather(
+            source_timestamps,
+            2,
+            source_order.view(1, num_agents, num_agents, 1, 1).expand(
+                num_processes,
+                num_agents,
+                num_agents,
+                self.height,
+                self.width,
+            ),
+        )
+        valid_sources = ordered_comm_mask.view(
+            num_processes,
+            num_agents,
+            num_agents,
+            1,
+            1,
+        )
+        scores = source_timestamps.masked_fill(~valid_sources, float("-inf"))
+        winner_indices = scores.argmax(dim=2)
 
-                ordered_sources = self._receiver_first_sources(
-                    receiver_idx, neighbor_indices
-                )
-                source_timestamps = self.timestamp_maps[proc_idx, ordered_sources]
-                source_beliefs = self.belief_maps[proc_idx, ordered_sources]
-                winner_indices = source_timestamps.argmax(dim=0)
-                fused_timestamps[proc_idx, receiver_idx] = torch.gather(
-                    source_timestamps, 0, winner_indices.unsqueeze(0)
-                ).squeeze(0)
-                fused_beliefs[proc_idx, receiver_idx] = torch.gather(
-                    source_beliefs, 0, winner_indices.unsqueeze(0)
-                ).squeeze(0)
-
-        self.belief_maps = fused_beliefs
-        self.timestamp_maps = fused_timestamps
+        gather_indices = winner_indices.unsqueeze(2)
+        source_beliefs = self.belief_maps.unsqueeze(1).expand_as(source_timestamps)
+        source_beliefs = torch.gather(
+            source_beliefs,
+            2,
+            source_order.view(1, num_agents, num_agents, 1, 1).expand(
+                num_processes,
+                num_agents,
+                num_agents,
+                self.height,
+                self.width,
+            ),
+        )
+        self.timestamp_maps = torch.gather(
+            source_timestamps,
+            2,
+            gather_indices,
+        ).squeeze(2)
+        self.belief_maps = torch.gather(
+            source_beliefs,
+            2,
+            gather_indices,
+        ).squeeze(2)
         self.entropy_maps = None
         return self.belief_maps, self.timestamp_maps
 
