@@ -26,20 +26,22 @@ class LandmarkMemory:
         match_threshold=0.05,
     ):
         target_device = self.device if device is None else device
-        updated_data = prev_landmark_data.clone().to(target_device)
-        updated_mask = prev_landmark_mask.clone().to(target_device)
-        updated_timestamp = prev_landmark_timestamp.clone().to(target_device)
+        work_device = torch.device("cpu")
+        updated_data = prev_landmark_data.detach().to(work_device).clone()
+        updated_mask = prev_landmark_mask.detach().to(work_device).clone()
+        updated_timestamp = prev_landmark_timestamp.detach().to(work_device).clone()
 
         num_agents_processes, max_landmarks, _ = updated_data.shape
         num_processes = len(local_detection_list)
         num_agents = num_agents_processes // num_processes
-        step_values = self._step_values(step_id, num_processes, target_device)
+        step_values = self._step_values(step_id, num_processes, work_device)
+        comm_mask_cpu = comm_mask.detach().to(work_device).bool()
 
         if env_dones is not None and env_dones.any():
-            proc_indices = torch.arange(num_processes, device=target_device)[
-                env_dones.to(target_device)
+            proc_indices = torch.arange(num_processes, device=work_device)[
+                env_dones.to(work_device)
             ]
-            agent_indices = torch.arange(num_agents, device=target_device)
+            agent_indices = torch.arange(num_agents, device=work_device)
             proc_mesh, agent_mesh = torch.meshgrid(
                 proc_indices, agent_indices, indexing="ij"
             )
@@ -48,33 +50,33 @@ class LandmarkMemory:
             updated_data[linear_indices, :, :] = 0.0
             updated_timestamp[linear_indices, :, 0] = -1.0
 
-        for proc_idx in range(num_processes):
-            for agent_idx in range(num_agents):
-                linear_idx = agent_idx * num_processes + proc_idx
-                detections = self._detections_tensor(
-                    local_detection_list, proc_idx, agent_idx, target_device
-                )
-                for det_pos in detections:
-                    self._upsert_local_detection(
-                        updated_data[linear_idx],
-                        updated_mask[linear_idx],
-                        updated_timestamp[linear_idx],
-                        det_pos,
-                        step_values[proc_idx],
-                        match_threshold,
-                    )
+        self._batch_upsert_local_detections(
+            updated_data,
+            updated_mask,
+            updated_timestamp,
+            local_detection_list,
+            step_values,
+            num_processes,
+            num_agents,
+            work_device,
+            match_threshold,
+        )
 
         self._fuse_by_comm_mask(
             updated_data,
             updated_mask,
             updated_timestamp,
-            comm_mask.to(target_device).bool(),
+            comm_mask_cpu,
             num_processes,
             num_agents,
             match_threshold,
         )
 
-        return updated_data, updated_mask, updated_timestamp
+        return (
+            updated_data.to(target_device),
+            updated_mask.to(target_device),
+            updated_timestamp.to(target_device),
+        )
 
     def _upsert_local_detection(
         self,
@@ -102,6 +104,71 @@ class LandmarkMemory:
         data[empty_idx, 3] = 0.0
         mask[empty_idx, 0] = 1.0
         timestamp[empty_idx, 0] = step_value
+
+    def _batch_upsert_local_detections(
+        self,
+        data,
+        mask,
+        timestamp,
+        local_detection_list,
+        step_values,
+        num_processes,
+        num_agents,
+        device,
+        match_threshold,
+    ):
+        detections, detection_mask = self._detections_batch_tensor(
+            local_detection_list,
+            num_processes,
+            num_agents,
+            device,
+        )
+        if detections.numel() == 0:
+            return
+
+        num_rows, max_detections = detections.shape[:2]
+        row_indices = torch.arange(num_rows, device=device)
+        row_step_values = step_values.repeat(num_agents)
+
+        for det_idx in range(max_detections):
+            active = detection_mask[:, det_idx]
+            if not active.any():
+                continue
+
+            det_pos = detections[:, det_idx]
+            valid_slots = mask[:, :, 0] > 0.5
+            dists = torch.norm(data[:, :, 0:2] - det_pos.unsqueeze(1), dim=2)
+            dists = dists.masked_fill(~valid_slots, float("inf"))
+            min_dists, matched_slots = dists.min(dim=1)
+            matched = active & (min_dists < match_threshold)
+            if matched.any():
+                matched_rows = row_indices[matched]
+                matched_cols = matched_slots[matched]
+                data[matched_rows, matched_cols, 0:2] = det_pos[matched_rows]
+                data[matched_rows, matched_cols, 2] = 2.0
+                timestamp[matched_rows, matched_cols, 0] = row_step_values[
+                    matched_rows
+                ]
+                mask[matched_rows, matched_cols, 0] = 1.0
+
+            unmatched = active & (~matched)
+            if not unmatched.any():
+                continue
+
+            empty_mask = mask[:, :, 0] < 0.5
+            has_empty = empty_mask.any(dim=1)
+            first_empty = empty_mask.float().argmax(dim=1)
+            oldest = torch.argmin(timestamp[:, :, 0], dim=1)
+            insert_slots = torch.where(has_empty, first_empty, oldest)
+            insert_rows = row_indices[unmatched]
+            insert_cols = insert_slots[unmatched]
+            data[insert_rows, insert_cols, 0:2] = det_pos[insert_rows]
+            data[insert_rows, insert_cols, 2] = 2.0
+            data[insert_rows, insert_cols, 3] = 0.0
+            mask[insert_rows, insert_cols, 0] = 1.0
+            timestamp[insert_rows, insert_cols, 0] = row_step_values[
+                insert_rows
+            ]
 
     def _fuse_by_comm_mask(
         self,
@@ -218,6 +285,66 @@ class LandmarkMemory:
         if len(detections) == 0:
             return torch.zeros(0, 2, device=device)
         return torch.as_tensor(detections, dtype=torch.float32, device=device).view(-1, 2)
+
+    def _detections_batch_tensor(
+        self,
+        local_detection_list,
+        num_processes,
+        num_agents,
+        device,
+    ):
+        max_detections = 0
+        for proc_idx in range(num_processes):
+            for agent_idx in range(num_agents):
+                max_detections = max(
+                    max_detections,
+                    len(local_detection_list[proc_idx][agent_idx]),
+                )
+        if max_detections == 0:
+            return (
+                torch.zeros(
+                    num_processes * num_agents,
+                    0,
+                    2,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                torch.zeros(
+                    num_processes * num_agents,
+                    0,
+                    device=device,
+                    dtype=torch.bool,
+                ),
+            )
+
+        positions = torch.zeros(
+            num_processes * num_agents,
+            max_detections,
+            2,
+            device=device,
+            dtype=torch.float32,
+        )
+        detection_mask = torch.zeros(
+            num_processes * num_agents,
+            max_detections,
+            device=device,
+            dtype=torch.bool,
+        )
+        for proc_idx in range(num_processes):
+            for agent_idx in range(num_agents):
+                detections = self._detections_tensor(
+                    local_detection_list,
+                    proc_idx,
+                    agent_idx,
+                    device,
+                )
+                if detections.numel() == 0:
+                    continue
+                linear_idx = agent_idx * num_processes + proc_idx
+                count = detections.size(0)
+                positions[linear_idx, :count] = detections
+                detection_mask[linear_idx, :count] = True
+        return positions, detection_mask
 
     def _step_values(self, step_id, num_processes, device):
         if isinstance(step_id, torch.Tensor):
