@@ -165,35 +165,57 @@ class LocalMapBank:
         sensor_dist: scalar local observation radius
         """
         step_values = self._step_values(step_id, agent_positions.shape[0])
-        for proc_idx in range(agent_positions.shape[0]):
-            for agent_idx in range(agent_positions.shape[1]):
-                pos = agent_positions[proc_idx, agent_idx]
-                fov_mask = self.get_fov_mask(pos, sensor_dist)
-                fov_mask = fov_mask & (
-                    self.timestamp_maps[proc_idx, agent_idx]
-                    != step_values[proc_idx]
-                )
-                if not fov_mask.any():
-                    continue
+        num_processes, num_agents = agent_positions.shape[:2]
+        grid_x = self.cell_world_x.view(1, 1, self.height, self.width)
+        grid_y = self.cell_world_y.view(1, 1, self.height, self.width)
+        pos_x = agent_positions[..., 0].view(num_processes, num_agents, 1, 1)
+        pos_y = agent_positions[..., 1].view(num_processes, num_agents, 1, 1)
+        fov_mask = (grid_x - pos_x).square() + (grid_y - pos_y).square()
+        fov_mask = fov_mask <= float(sensor_dist) ** 2
+        fov_mask = fov_mask & (
+            self.timestamp_maps
+            != step_values.view(num_processes, 1, 1, 1)
+        )
+        if not fov_mask.any():
+            return
 
-                detections = self._detections_tensor(
-                    local_detections, proc_idx, agent_idx
-                )
-                positive_mask = torch.zeros_like(fov_mask)
-                if detections.numel() > 0:
-                    dx = self.cell_world_x.unsqueeze(0) - detections[:, 0].view(-1, 1, 1)
-                    dy = self.cell_world_y.unsqueeze(0) - detections[:, 1].view(-1, 1, 1)
-                    detection_mask = (dx.square() + dy.square()).le(
-                        self.landmark_radius ** 2
-                    ).any(dim=0)
-                    positive_mask = fov_mask & detection_mask
+        detection_pos, detection_mask = self._detections_batch_tensor(
+            local_detections,
+            num_processes,
+            num_agents,
+        )
+        positive_mask = torch.zeros_like(fov_mask)
+        if detection_pos.numel() > 0 and detection_mask.any():
+            det_x = detection_pos[..., 0].view(num_processes, num_agents, -1, 1, 1)
+            det_y = detection_pos[..., 1].view(num_processes, num_agents, -1, 1, 1)
+            dist_sq = (
+                (grid_x.unsqueeze(2) - det_x).square()
+                + (grid_y.unsqueeze(2) - det_y).square()
+            )
+            detected_cells = (
+                dist_sq <= self.landmark_radius ** 2
+            ) & detection_mask.view(num_processes, num_agents, -1, 1, 1)
+            positive_mask = fov_mask & detected_cells.any(dim=2)
 
-                negative_mask = fov_mask & (~positive_mask)
-                self._bayesian_update(proc_idx, agent_idx, positive_mask, True)
-                self._bayesian_update(proc_idx, agent_idx, negative_mask, False)
-                self.timestamp_maps[proc_idx, agent_idx][fov_mask] = step_values[
-                    proc_idx
-                ]
+        b_prev = self.belief_maps
+        p_s = self.sensor_fidelity
+        pos_den = p_s * b_prev + (1.0 - p_s) * (1.0 - b_prev)
+        pos_update = (p_s * b_prev / pos_den.clamp_min(self.epsilon)).clamp(0.0, 1.0)
+        neg_den = (1.0 - p_s) * b_prev + p_s * (1.0 - b_prev)
+        neg_update = (
+            (1.0 - p_s) * b_prev / neg_den.clamp_min(self.epsilon)
+        ).clamp(0.0, 1.0)
+        negative_mask = fov_mask & (~positive_mask)
+        self.belief_maps = torch.where(
+            positive_mask,
+            pos_update,
+            torch.where(negative_mask, neg_update, self.belief_maps),
+        )
+        self.timestamp_maps = torch.where(
+            fov_mask,
+            step_values.view(num_processes, 1, 1, 1).expand_as(self.timestamp_maps),
+            self.timestamp_maps,
+        )
 
         self.entropy_maps = None
 
@@ -371,6 +393,62 @@ class LocalMapBank:
         return torch.as_tensor(
             detections, dtype=torch.float32, device=self.device
         ).view(-1, 2)
+
+    def _detections_batch_tensor(self, local_detections, num_processes, num_agents):
+        max_detections = 0
+        for proc_idx in range(num_processes):
+            for agent_idx in range(num_agents):
+                max_detections = max(
+                    max_detections,
+                    len(local_detections[proc_idx][agent_idx]),
+                )
+        if max_detections == 0:
+            return (
+                torch.zeros(
+                    num_processes,
+                    num_agents,
+                    0,
+                    2,
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                torch.zeros(
+                    num_processes,
+                    num_agents,
+                    0,
+                    device=self.device,
+                    dtype=torch.bool,
+                ),
+            )
+
+        positions = torch.zeros(
+            num_processes,
+            num_agents,
+            max_detections,
+            2,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        mask = torch.zeros(
+            num_processes,
+            num_agents,
+            max_detections,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        for proc_idx in range(num_processes):
+            for agent_idx in range(num_agents):
+                detections = self._detections_tensor(
+                    local_detections,
+                    proc_idx,
+                    agent_idx,
+                )
+                if detections.numel() == 0:
+                    continue
+                count = detections.size(0)
+                positions[proc_idx, agent_idx, :count] = detections
+                mask[proc_idx, agent_idx, :count] = True
+        return positions, mask
 
     def _step_values(self, step_id, num_processes):
         if isinstance(step_id, torch.Tensor):

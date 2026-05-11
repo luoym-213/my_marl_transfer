@@ -126,32 +126,34 @@ class LandmarkMemory:
                 if source_indices.numel() == 0:
                     continue
 
-                candidates = []
-                for source_idx in source_indices.tolist():
-                    source_linear = source_idx * num_processes + proc_idx
-                    for slot_idx in range(base_data.shape[1]):
-                        if base_mask[source_linear, slot_idx, 0] < 0.5:
-                            continue
-                        candidates.append((
-                            float(base_timestamp[source_linear, slot_idx, 0].item()),
-                            source_idx,
-                            slot_idx,
-                            base_data[source_linear, slot_idx].clone(),
-                        ))
+                source_linear = source_indices * num_processes + proc_idx
+                cand_data = base_data[source_linear].reshape(-1, base_data.size(-1))
+                cand_mask = base_mask[source_linear, :, 0].reshape(-1) > 0.5
+                cand_timestamp = base_timestamp[source_linear, :, 0].reshape(-1)
+                valid = cand_mask & (cand_timestamp >= 0)
+                if not valid.any():
+                    continue
 
-                candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-                for cand_timestamp, _, _, cand_data in candidates:
-                    if cand_timestamp < 0:
-                        continue
-                    cand_ts = torch.tensor(
-                        cand_timestamp, device=data.device, dtype=timestamp.dtype
-                    )
+                cand_data = cand_data[valid]
+                cand_timestamp = cand_timestamp[valid]
+                source_rank = source_indices.repeat_interleave(base_data.size(1))[valid]
+                slot_rank = torch.arange(
+                    base_data.size(1),
+                    device=data.device,
+                ).repeat(source_indices.numel())[valid]
+                sort_key = (
+                    -cand_timestamp * (num_agents * base_data.size(1))
+                    + source_rank.float() * base_data.size(1)
+                    + slot_rank.float()
+                )
+                order = torch.argsort(sort_key)
+                for idx in order.tolist():
                     self._merge_candidate(
                         data[receiver_linear],
                         mask[receiver_linear],
                         timestamp[receiver_linear],
-                        cand_data,
-                        cand_ts,
+                        cand_data[idx],
+                        cand_timestamp[idx],
                         match_threshold,
                     )
 
