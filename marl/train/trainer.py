@@ -8,6 +8,7 @@ from tensorboardX import SummaryWriter
 from eval import evaluate as evaluate_policy
 from marl.agents.learner import setup_master
 from marl import utils
+from marl.timing import TimingProfiler
 
 
 class Trainer:
@@ -35,11 +36,17 @@ class Trainer:
         self.start_time = None
         self.savedir = None
         self.return_early = False
+        self.timer = TimingProfiler(
+            enabled=getattr(args, "timing_profile", False),
+            cuda=getattr(args, "cuda", False),
+            log_interval=getattr(args, "timing_log_interval", 10),
+        )
 
     def setup(self):
         args = self.args
 
         self.writer = SummaryWriter(args.log_dir)
+        args.timing_timer = self.timer
         self.envs = utils.make_parallel_envs(args)
         self.master = setup_master(args)
         self.eval_master, self.eval_env = setup_master(args, return_env=True)
@@ -75,19 +82,25 @@ class Trainer:
 
         try:
             for update_idx in range(self.args.num_updates):
+                self.timer.reset()
                 self.collect_rollout()
                 losses = self.update()
 
                 if update_idx % self.args.save_interval == 0 and not self.args.test:
-                    self.save_checkpoint(update_idx)
+                    with self.timer.time("save_checkpoint"):
+                        self.save_checkpoint(update_idx)
 
                 if update_idx % self.args.log_interval == 0:
                     self.log_training(update_idx, losses)
 
+                should_stop = False
                 if self.should_evaluate(update_idx):
-                    should_stop = self.evaluate(update_idx)
-                    if should_stop:
-                        break
+                    with self.timer.time("evaluation_total"):
+                        should_stop = self.evaluate(update_idx)
+
+                self.timer.finish_update(update_idx, writer=None if self.args.test else self.writer)
+                if should_stop:
+                    break
         finally:
             if self.writer is not None:
                 self.writer.close()
@@ -107,56 +120,62 @@ class Trainer:
 
         args = self.args
 
-        for step in range(args.num_steps):
-            with torch.no_grad():
-                actions_list, goals_list, tasks_list = self.master.act(step)
+        with self.timer.time("rollout_total"):
+            for step in range(args.num_steps):
+                with torch.no_grad():
+                    with self.timer.time("master_act_total"):
+                        actions_list, goals_list, tasks_list = self.master.act(step)
 
-            agent_actions = np.transpose(np.array(actions_list), (1, 0, 2))
-            agent_goals = np.transpose(np.array(goals_list), (1, 0, 2))
-            agent_tasks = np.transpose(np.array(tasks_list), (1, 0, 2))
+                agent_actions = np.transpose(np.array(actions_list), (1, 0, 2))
+                agent_goals = np.transpose(np.array(goals_list), (1, 0, 2))
+                agent_tasks = np.transpose(np.array(tasks_list), (1, 0, 2))
 
-            step_data = [
-                {
-                    "agents_actions": agent_actions[i],
-                    "agents_goals": agent_goals[i],
-                    "agents_tasks": agent_tasks[i],
-                }
-                for i in range(args.num_processes)
-            ]
+                step_data = [
+                    {
+                        "agents_actions": agent_actions[i],
+                        "agents_goals": agent_goals[i],
+                        "agents_tasks": agent_tasks[i],
+                    }
+                    for i in range(args.num_processes)
+                ]
 
-            obs, reward, high_reward, done_info, info, env_state = self.envs.step(step_data)
-            done = np.array([done_info[i]["all"] for i in range(args.num_processes)])
-            done_agent = np.array([done_info[i]["agent"] for i in range(args.num_processes)])
+                with self.timer.time("env_step", sync_cuda=False):
+                    obs, reward, high_reward, done_info, info, env_state = self.envs.step(step_data)
+                done = np.array([done_info[i]["all"] for i in range(args.num_processes)])
+                done_agent = np.array([done_info[i]["agent"] for i in range(args.num_processes)])
 
-            self.master.envs_info = info
+                self.master.envs_info = info
 
-            high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
-            reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
+                high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
+                reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
 
-            self.episode_rewards += reward
-            self.episode_high_rewards += high_reward
+                self.episode_rewards += reward
+                self.episode_high_rewards += high_reward
 
-            all_masks = torch.FloatTensor(1 - 1.0 * done).to(args.device)
-            masks = torch.FloatTensor(1 - 1.0 * done_agent).to(args.device)
-            goal_dones = torch.FloatTensor(
-                [info[i]["goal_done"] for i in range(args.num_processes)]
-            ).to(args.device)
+                all_masks = torch.FloatTensor(1 - 1.0 * done).to(args.device)
+                masks = torch.FloatTensor(1 - 1.0 * done_agent).to(args.device)
+                goal_dones = torch.FloatTensor(
+                    [info[i]["goal_done"] for i in range(args.num_processes)]
+                ).to(args.device)
 
-            self.final_rewards *= all_masks
-            self.final_rewards += (1 - all_masks) * self.episode_rewards
-            self.final_high_rewards *= all_masks
-            self.final_high_rewards += (1 - all_masks) * self.episode_high_rewards
+                self.final_rewards *= all_masks
+                self.final_rewards += (1 - all_masks) * self.episode_rewards
+                self.final_high_rewards *= all_masks
+                self.final_high_rewards += (1 - all_masks) * self.episode_high_rewards
 
-            self.episode_rewards *= all_masks
-            self.episode_high_rewards *= all_masks
+                self.episode_rewards *= all_masks
+                self.episode_high_rewards *= all_masks
 
-            self.master.update_rollout(
-                obs, reward, high_reward, masks, env_state, goal_dones
-            )
+                with self.timer.time("rollout_write/update_rollout"):
+                    self.master.update_rollout(
+                        obs, reward, high_reward, masks, env_state, goal_dones
+                    )
 
     def update(self):
-        self.master.wrap_horizon()
-        return_vals = self.master.update()
+        with self.timer.time("wrap_horizon"):
+            self.master.wrap_horizon()
+        with self.timer.time("ppo_update_total"):
+            return_vals = self.master.update()
         self.master.after_update()
 
         return {

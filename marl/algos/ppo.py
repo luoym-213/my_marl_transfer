@@ -1,8 +1,12 @@
+import time
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data.sampler import BatchSampler, SubsetRandomSampler
+
+from marl.timing import TimingProfiler
 
 def _flatten_helper(T, N, _tensor):
     return _tensor.reshape(T * N, *_tensor.size()[2:])
@@ -191,9 +195,11 @@ class JointPPO():
                  max_grad_norm=None,
                  use_clipped_value_loss=False,
                  parallel_batch_size=4,
-                 dense_critic=True):  # 新增参数：并行处理的batch数量
+                 dense_critic=True,
+                 timing_timer=None):  # 新增参数：并行处理的batch数量
 
         self.actor_critic = actor_critic
+        self.timer = timing_timer if timing_timer is not None else TimingProfiler()
         self.clip_param = clip_param
         self.ppo_epoch = ppo_epoch
         self.num_mini_batch = num_mini_batch
@@ -220,7 +226,12 @@ class JointPPO():
         node_entropy_epoch = 0
 
         for e in range(self.ppo_epoch):
-            data_generator = smdp_feed_forward_generator(rollouts_list, advantages_list, self.num_mini_batch)
+            data_generator = smdp_feed_forward_generator(
+                rollouts_list,
+                advantages_list,
+                self.num_mini_batch,
+                timing_timer=self.timer,
+            )
             
             for sample in data_generator:
                 (env_states_batch, obs_batch, critic_maps_batch, critic_nodes_batch,
@@ -243,16 +254,17 @@ class JointPPO():
                 # 返回: high_values, new_decision_log_probs, new_map_log_probs, 
                 #       decision_dist_entropy, waypoint_dist_entropy
                 # 评估高层动作（全部数据都forward）
-                (high_values, new_higoal_log_probs, higoal_dist_entropy) = \
-                    self.actor_critic.evaluate_high_actions(
-                        env_states_batch, obs_batch, masks_batch,
-                        critic_maps_batch, critic_nodes_batch,
-                        goals_batch, tasks_batch,
-                        ego_nodes_batch, explore_nodes_batch,
-                        landmark_datas_batch, landmark_masks_batch, landmark_nodes_batch,
-                        teammate_nodes_batch, teammate_masks_batch,
-                        agent_ids=agent_ids_batch   # ⭐ 传入智能体ID
-                    )
+                with self.timer.time("ppo_high_forward_backward"):
+                    (high_values, new_higoal_log_probs, higoal_dist_entropy) = \
+                        self.actor_critic.evaluate_high_actions(
+                            env_states_batch, obs_batch, masks_batch,
+                            critic_maps_batch, critic_nodes_batch,
+                            goals_batch, tasks_batch,
+                            ego_nodes_batch, explore_nodes_batch,
+                            landmark_datas_batch, landmark_masks_batch, landmark_nodes_batch,
+                            teammate_nodes_batch, teammate_masks_batch,
+                            agent_ids=agent_ids_batch   # ⭐ 传入智能体ID
+                        )
                 
                 # high_values: [batch_size, 1]
                 # new_higoal_log_probs: [batch_size, 1] - 决策log prob
@@ -312,12 +324,13 @@ class JointPPO():
                              decision_entropy_masked * self.entropy_coef)
 
                 # === 7. 反向传播和优化 ===
-                self.optimizer.zero_grad()
-                
-                if total_loss.requires_grad:
-                    total_loss.backward()
-                    nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
-                    self.optimizer.step()
+                with self.timer.time("ppo_high_forward_backward"):
+                    self.optimizer.zero_grad()
+                    
+                    if total_loss.requires_grad:
+                        total_loss.backward()
+                        nn.utils.clip_grad_norm_(self.actor_critic.parameters(), self.max_grad_norm)
+                        self.optimizer.step()
 
                 # 统计loss
                 value_loss_epoch += value_loss.item()
@@ -363,7 +376,12 @@ def feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
               masks_batch, old_action_log_probs_batch, adv_targ, goal, \
               low_teammate_rel_pos, low_teammate_masks
 
-def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
+def smdp_feed_forward_generator(
+    rollouts_list,
+    advantages_list,
+    num_mini_batch,
+    timing_timer=None,
+):
     """
     为高层策略生成训练样本（Dense Critic + Sparse Actor）
     - Yield 全量数据（包括决策点和非决策点）
@@ -371,6 +389,11 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
     - Actor Loss 只在决策点计算
     - Critic Loss 可以在所有点计算（密集）
     """
+    concat_start = (
+        time.perf_counter()
+        if timing_timer is not None and timing_timer.enabled
+        else None
+    )
     num_steps, num_processes = rollouts_list[0].high_rewards.size()[0:2]
     
     # 收集所有agent的数据
@@ -471,6 +494,8 @@ def smdp_feed_forward_generator(rollouts_list, advantages_list, num_mini_batch):
         mini_batch_size, 
         drop_last=False
     )
+    if concat_start is not None:
+        timing_timer.add("smdp_generator_concat", time.perf_counter() - concat_start)
     
     for indices in sampler:
         env_states_batch = env_states_all[indices]  # [mini_batch_size, env_state_dim]

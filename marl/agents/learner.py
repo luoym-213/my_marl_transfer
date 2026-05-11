@@ -19,6 +19,7 @@ from marl.controllers.local_maps import (
     flatten_agent_major,
 )
 from marl.controllers.rollout_writer import RolloutWriter
+from marl.timing import TimingProfiler
 
 
 def setup_master(args, env=None, return_env=False):
@@ -29,6 +30,7 @@ def setup_master(args, env=None, return_env=False):
 
 class Learner(object):
     def __init__(self, args, teams_list, policies_list, env):
+        self.timer = getattr(args, "timing_timer", TimingProfiler())
         self.teams_list = [x for x in teams_list if len(x)!=0]
         self.all_agents = [agent for team in teams_list for agent in team]
         self.policies_list = [x for x in policies_list if x is not None]
@@ -48,7 +50,8 @@ class Learner(object):
                                         use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
         self.high_trainers_list = [JointPPO(policy, args.clip_param, args.ppo_epoch, args.num_mini_batch, args.value_loss_coef,
                                        args.entropy_coef, lr=args.lr, max_grad_norm=args.max_grad_norm,
-                                       use_clipped_value_loss=args.clipped_value_loss) for policy in self.policies_list]
+                                       use_clipped_value_loss=args.clipped_value_loss,
+                                       timing_timer=self.timer) for policy in self.policies_list]
         self.device = args.device
         self.env = env
         self.envs_info = None
@@ -63,7 +66,7 @@ class Learner(object):
         )
         self.landmark_memory = LandmarkMemory(self.device)
         self.high_level_policy = HighLevelPolicy(
-            args.top_k, args.rrt_max_iter, self.device
+            args.top_k, args.rrt_max_iter, self.device, timing_timer=self.timer
         )
         self.rollout_writer = RolloutWriter(self.device)
         self.eval_controller = EvalController(self.high_level_policy, self.device)
@@ -125,101 +128,107 @@ class Learner(object):
         num_processes,
         env_dones,
     ):
-        self._ensure_local_map_bank(num_processes, num_agents)
-        if env_dones.any():
-            self.local_map_bank.reset(env_dones)
+        with self.timer.time("prepare_local_policy_inputs"):
+            self._ensure_local_map_bank(num_processes, num_agents)
+            if env_dones.any():
+                self.local_map_bank.reset(env_dones)
 
-        goal_done_mask = build_goal_done_mask(self.envs_info, self.device)
-        batteries = agent_batteries(self.envs_info, num_agents, self.device)
-        agent_context = build_agent_context(
-            all_obs,
-            all_goals,
-            all_masks,
-            batteries,
-            num_agents,
-            num_processes,
-        )
-        agent_positions = agent_context["agent_positions"]
-        alive_mask = agent_alive_masks(self.envs_info, num_agents, self.device)
-        comm_mask = build_comm_mask(
-            agent_positions,
-            self.comm_dist,
-            alive_mask=alive_mask,
-        )
-        local_detection_list = build_local_detections(self.envs_info)
-        step_ids = self._world_steps_tensor()
-
-        self.local_map_bank.update_from_local_observations(
-            agent_positions,
-            local_detection_list,
-            step_ids,
-            self.sensor_dist,
-        )
-        self.local_map_bank.fuse_by_timestamp(comm_mask)
-
-        # Actor map inputs are per-agent local maps: [P, A, 100, 100].
-        agent_entropy_maps = self.local_map_bank.compute_entropy_maps()
-        local_voronoi_masks = self.local_map_bank.get_local_voronoi_masks(
-            agent_positions,
-            comm_mask,
-            self.local_voronoi_scope,
-            alive_mask=alive_mask,
-        ).float()
-
-        new_detected, new_detected_masks, new_detected_timestamps = (
-            self.update_landmark_info(
-                prev_landmark_data,
-                prev_landmark_mask,
-                prev_landmark_timestamp,
-                local_detection_list,
-                comm_mask,
-                step_ids,
-                self.device,
-                env_dones,
+            goal_done_mask = build_goal_done_mask(self.envs_info, self.device)
+            batteries = agent_batteries(self.envs_info, num_agents, self.device)
+            agent_context = build_agent_context(
+                all_obs,
+                all_goals,
+                all_masks,
+                batteries,
+                num_agents,
+                num_processes,
             )
-        )
+            agent_positions = agent_context["agent_positions"]
+            alive_mask = agent_alive_masks(self.envs_info, num_agents, self.device)
+            comm_mask = build_comm_mask(
+                agent_positions,
+                self.comm_dist,
+                alive_mask=alive_mask,
+            )
+            local_detection_list = build_local_detections(self.envs_info)
+            step_ids = self._world_steps_tensor()
 
-        # Critic no longer reads env global maps. It uses an aggregate of
-        # learner-owned local maps; env global maps remain debug/render only.
-        critic_entropy = agent_entropy_maps.mean(dim=1)
-        critic_heatmap = self.local_map_bank.get_agents_heatmap(agent_positions)
-        critic_belief = self.local_map_bank.belief_maps.mean(dim=1)
-        critic_map_input = torch.stack(
-            [critic_entropy, critic_heatmap, critic_belief],
-            dim=1,
-        )
+            with self.timer.time("local_map_update"):
+                self.local_map_bank.update_from_local_observations(
+                    agent_positions,
+                    local_detection_list,
+                    step_ids,
+                    self.sensor_dist,
+                )
+            with self.timer.time("local_map_fuse"):
+                self.local_map_bank.fuse_by_timestamp(comm_mask)
 
-        high_teammate_masks = comm_mask.float().unsqueeze(-1)
-        batch_indices = torch.arange(num_agents, device=self.device)
-        high_teammate_masks[:, batch_indices, batch_indices, 0] = 0.0
-        # Receiver-specific high-level teammate input:
-        # [P, A(receiver), A(sender), 5]. Communication-out teammate nodes,
-        # including self, are zeroed before they reach the graph network.
-        high_teammate_nodes = (
-            agent_context["teammate_nodes"].unsqueeze(1)
-            * high_teammate_masks
-        )
+            # Actor map inputs are per-agent local maps: [P, A, 100, 100].
+            with self.timer.time("entropy_map_compute"):
+                agent_entropy_maps = self.local_map_bank.compute_entropy_maps()
+            with self.timer.time("voronoi_mask_compute"):
+                local_voronoi_masks = self.local_map_bank.get_local_voronoi_masks(
+                    agent_positions,
+                    comm_mask,
+                    self.local_voronoi_scope,
+                    alive_mask=alive_mask,
+                ).float()
 
-        low_rel_pos, low_masks = build_low_level_comm_features(
-            agent_positions,
-            comm_mask,
-        )
+            with self.timer.time("landmark_memory_update"):
+                new_detected, new_detected_masks, new_detected_timestamps = (
+                    self.update_landmark_info(
+                        prev_landmark_data,
+                        prev_landmark_mask,
+                        prev_landmark_timestamp,
+                        local_detection_list,
+                        comm_mask,
+                        step_ids,
+                        self.device,
+                        env_dones,
+                    )
+                )
 
-        return {
-            "goal_done_mask": goal_done_mask,
-            "agent_context": agent_context,
-            "agent_entropy_maps": agent_entropy_maps,
-            "local_voronoi_masks": local_voronoi_masks,
-            "comm_mask": comm_mask,
-            "critic_map_input": critic_map_input,
-            "landmark_data": new_detected,
-            "landmark_mask": new_detected_masks,
-            "landmark_timestamp": new_detected_timestamps,
-            "high_teammate_nodes": high_teammate_nodes,
-            "high_teammate_masks": high_teammate_masks,
-            "low_rel_pos": low_rel_pos,
-            "low_masks": low_masks,
-        }
+            # Critic no longer reads env global maps. It uses an aggregate of
+            # learner-owned local maps; env global maps remain debug/render only.
+            critic_entropy = agent_entropy_maps.mean(dim=1)
+            critic_heatmap = self.local_map_bank.get_agents_heatmap(agent_positions)
+            critic_belief = self.local_map_bank.belief_maps.mean(dim=1)
+            critic_map_input = torch.stack(
+                [critic_entropy, critic_heatmap, critic_belief],
+                dim=1,
+            )
+
+            high_teammate_masks = comm_mask.float().unsqueeze(-1)
+            batch_indices = torch.arange(num_agents, device=self.device)
+            high_teammate_masks[:, batch_indices, batch_indices, 0] = 0.0
+            # Receiver-specific high-level teammate input:
+            # [P, A(receiver), A(sender), 5]. Communication-out teammate nodes,
+            # including self, are zeroed before they reach the graph network.
+            high_teammate_nodes = (
+                agent_context["teammate_nodes"].unsqueeze(1)
+                * high_teammate_masks
+            )
+
+            low_rel_pos, low_masks = build_low_level_comm_features(
+                agent_positions,
+                comm_mask,
+            )
+
+            return {
+                "goal_done_mask": goal_done_mask,
+                "agent_context": agent_context,
+                "agent_entropy_maps": agent_entropy_maps,
+                "local_voronoi_masks": local_voronoi_masks,
+                "comm_mask": comm_mask,
+                "critic_map_input": critic_map_input,
+                "landmark_data": new_detected,
+                "landmark_mask": new_detected_masks,
+                "landmark_timestamp": new_detected_timestamps,
+                "high_teammate_nodes": high_teammate_nodes,
+                "high_teammate_masks": high_teammate_masks,
+                "low_rel_pos": low_rel_pos,
+                "low_masks": low_masks,
+            }
 
     def act(self, step):
         # 根据当前的环境中智能体的状态进行决策，生成下一步的动作列表，这里可以直接当作分层网络的总启，下面再进行细分是high还是low
@@ -281,31 +290,32 @@ class Learner(object):
             # landmark node docker: Tensor shape [num_agents * num_processes, Max_L, 4]
             all_landmark_nodes = torch.zeros(num_processes * num_agents, new_detected.shape[1], 4, device=self.device)
 
-            high_decision = self.high_level_policy.select_goals(
-                policy=policy,
-                obs_positions=all_obs[:, 2:4],
-                all_masks=all_masks,
-                goals=all_goals,
-                tasks=all_tasks,
-                goal_log_probs=all_higoal_log_probs,
-                goal_done_mask=goal_done_mask,
-                agent_entropy_maps=agent_entropy_maps,
-                voronoi_masks=voronoi_masks_t,
-                agent_nodes=agent_nodes,
-                ego_nodes=ego_nodes,
-                teammate_nodes=high_teammate_nodes,
-                teammate_mask=high_teammate_masks,
-                landmark_data=new_detected,
-                landmark_mask=new_detected_masks,
-                goal_visibility_mask=comm_mask,
-                num_processes=num_processes,
-                deterministic=False,
-                update_tasks=True,
-                update_log_probs=True,
-                update_targeted=True,
-                store_landmark_nodes=True,
-                landmark_nodes_out=all_landmark_nodes,
-            )
+            with self.timer.time("high_select_goals"):
+                high_decision = self.high_level_policy.select_goals(
+                    policy=policy,
+                    obs_positions=all_obs[:, 2:4],
+                    all_masks=all_masks,
+                    goals=all_goals,
+                    tasks=all_tasks,
+                    goal_log_probs=all_higoal_log_probs,
+                    goal_done_mask=goal_done_mask,
+                    agent_entropy_maps=agent_entropy_maps,
+                    voronoi_masks=voronoi_masks_t,
+                    agent_nodes=agent_nodes,
+                    ego_nodes=ego_nodes,
+                    teammate_nodes=high_teammate_nodes,
+                    teammate_mask=high_teammate_masks,
+                    landmark_data=new_detected,
+                    landmark_mask=new_detected_masks,
+                    goal_visibility_mask=comm_mask,
+                    num_processes=num_processes,
+                    deterministic=False,
+                    update_tasks=True,
+                    update_log_probs=True,
+                    update_targeted=True,
+                    store_landmark_nodes=True,
+                    landmark_nodes_out=all_landmark_nodes,
+                )
             all_goals = high_decision["goals"]
             all_tasks = high_decision["tasks"]
             all_higoal_log_probs = high_decision["goal_log_probs"]
@@ -337,16 +347,18 @@ class Learner(object):
             # all_critic_vec_inp = [x,y,x_g,y_g]
             ## 拼接成[num_processes, num_agents, 4]
             all_critic_nodes = torch.cat([agent_positions, all_goals.view(num_agents, num_processes, 2).transpose(0, 1)], dim=-1)  # [num_processes, num_agents, 4]
-            all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_nodes) # 计算所有process的高层value： [num_processes, num_agents]
+            with self.timer.time("high_value_forward"):
+                all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_nodes) # 计算所有process的高层value： [num_processes, num_agents]
 
             # ⭐ 底层策略
-            props = policy.low_level_act(
-                all_obs,
-                all_goals,
-                all_low_rel_pos,
-                all_low_masks,
-                deterministic=False,
-            )
+            with self.timer.time("low_policy_forward"):
+                props = policy.low_level_act(
+                    all_obs,
+                    all_goals,
+                    all_low_rel_pos,
+                    all_low_masks,
+                    deterministic=False,
+                )
 
             team_actions, team_goals, team_tasks = self.rollout_writer.assign_act_outputs(
                 team=team,
@@ -451,42 +463,45 @@ class Learner(object):
             high_teammate_nodes = prepared["high_teammate_nodes"]
             high_teammate_masks = prepared["high_teammate_masks"]
 
-            high_decision = self.high_level_policy.select_goals(
-                policy=policy,
-                obs_positions=last_obs[:, 2:4],
-                all_masks=None,
-                goals=last_goals,
-                tasks=None,
-                goal_log_probs=None,
-                goal_done_mask=goal_done_mask,
-                agent_entropy_maps=agent_entropy_maps,
-                voronoi_masks=voronoi_masks_t,
-                agent_nodes=agent_nodes,
-                ego_nodes=ego_nodes,
-                teammate_nodes=high_teammate_nodes,
-                teammate_mask=high_teammate_masks,
-                landmark_data=new_detected,
-                landmark_mask=new_detected_masks,
-                goal_visibility_mask=comm_mask,
-                num_processes=num_processes,
-                deterministic=False,
-                update_tasks=False,
-                update_log_probs=False,
-                update_targeted=False,
-                store_landmark_nodes=False,
-            )
+            with self.timer.time("high_select_goals"):
+                high_decision = self.high_level_policy.select_goals(
+                    policy=policy,
+                    obs_positions=last_obs[:, 2:4],
+                    all_masks=None,
+                    goals=last_goals,
+                    tasks=None,
+                    goal_log_probs=None,
+                    goal_done_mask=goal_done_mask,
+                    agent_entropy_maps=agent_entropy_maps,
+                    voronoi_masks=voronoi_masks_t,
+                    agent_nodes=agent_nodes,
+                    ego_nodes=ego_nodes,
+                    teammate_nodes=high_teammate_nodes,
+                    teammate_mask=high_teammate_masks,
+                    landmark_data=new_detected,
+                    landmark_mask=new_detected_masks,
+                    goal_visibility_mask=comm_mask,
+                    num_processes=num_processes,
+                    deterministic=False,
+                    update_tasks=False,
+                    update_log_probs=False,
+                    update_targeted=False,
+                    store_landmark_nodes=False,
+                )
             last_goals = high_decision["goals"]
             
             all_critic_nodes = torch.cat([last_obs[:,2:4].view(num_agents, num_processes, -1).transpose(0, 1), 
                                           last_goals.view(num_agents, num_processes, 2).transpose(0, 1)], dim=-1)
             with torch.no_grad():
-                next_high_value = policy.get_high_value(all_critic_map_inp, all_critic_nodes) # 计算所有process的高层value： [num_processes, num_agents]
-                next_low_value = policy.get_low_value(
-                    last_obs,
-                    last_goals,
-                    flatten_agent_major(prepared["low_rel_pos"]),
-                    flatten_agent_major(prepared["low_masks"]),
-                )
+                with self.timer.time("high_value_forward"):
+                    next_high_value = policy.get_high_value(all_critic_map_inp, all_critic_nodes) # 计算所有process的高层value： [num_processes, num_agents]
+                with self.timer.time("low_policy_forward"):
+                    next_low_value = policy.get_low_value(
+                        last_obs,
+                        last_goals,
+                        flatten_agent_major(prepared["low_rel_pos"]),
+                        flatten_agent_major(prepared["low_masks"]),
+                    )
 
             all_high_value = torch.chunk(next_high_value,len(team), dim=1)
             all_low_value = torch.chunk(next_low_value,len(team))

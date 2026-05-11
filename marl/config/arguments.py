@@ -70,6 +70,8 @@ def get_args():
     parser.add_argument('--log-dir', default='logs', help='directory to save logs')
     parser.add_argument('--save-interval', type=int, default=200, help='save interval, one save per n updates (default: 200)')
     parser.add_argument('--log-interval', type=int, default=10, help='log interval, one log per n updates (default: 10)')
+    parser.add_argument('--timing-profile', action='store_true', default=False, help='enable low-overhead timing instrumentation')
+    parser.add_argument('--timing-log-interval', type=int, default=10, help='timing summary interval in updates (default: 10)')
     
     # Miscellaneous
     parser.add_argument('--test', action='store_true')

@@ -7,6 +7,7 @@ RRT for entropy-based exploration with Voronoi mask sampling
 """
 
 import math
+import time
 import numpy as np
 import matplotlib.pyplot as plt
 from typing import List, Tuple, Sequence, Optional, Any
@@ -607,6 +608,7 @@ def plan_batch(
     expand_dis: int = 4,
     max_iterations: int = 50,
     top_k: int = 10,
+    timing_timer: Optional[Any] = None,
 ) -> List[List[List[float]]]:
     """
     Batch 版本：对 B 份数据逐个运行 RRT_GNN（不是向量化并行，只是统一入口）
@@ -627,6 +629,8 @@ def plan_batch(
 
     results: List[List[dict]] = []
     B = voronoi_masks.shape[0]
+    item_times = [] if timing_timer is not None and timing_timer.enabled else None
+    total_start = time.perf_counter() if item_times is not None else None
     for b in range(B):
         rrt = RRT_GNN(
             start=list(starts[b]),
@@ -638,7 +642,16 @@ def plan_batch(
             max_iterations=max_iterations,
             top_k=top_k,
         )
+        item_start = time.perf_counter() if item_times is not None else None
         results.append(rrt.planning())
+        if item_times is not None:
+            item_times.append(time.perf_counter() - item_start)
+    if item_times is not None:
+        total_time = time.perf_counter() - total_start
+        timing_timer.add_value("rrt_plan_batch_B", B)
+        timing_timer.add_value("rrt_plan_batch_total", total_time)
+        timing_timer.add_value("rrt_plan_batch_per_rrt_avg", total_time / max(B, 1))
+        timing_timer.add_value("rrt_plan_batch_per_rrt_max", max(item_times, default=0.0))
     return results
 
 

@@ -1,7 +1,10 @@
+from contextlib import nullcontext
+
 import numpy as np
 import torch
 
 from marl.controllers.planning.rrt_GNN import plan_batch
+from marl.timing import TimingProfiler
 
 
 def build_explore_nodes(
@@ -11,6 +14,7 @@ def build_explore_nodes(
     map_inp,
     agent_indices=None,
     goal_visibility_mask=None,
+    timing_timer=None,
 ):
     """
     Generate explore-node candidates with RRT planning.
@@ -21,116 +25,142 @@ def build_explore_nodes(
     goal_visibility_mask: optional bool [Batch, num_agents, num_agents],
         receiver-source mask for occupied-goal features
     """
-    batch_processes = vec_inp.size(0)
-    if agent_indices is not None:
-        batch_idx = torch.arange(batch_processes, device=vec_inp.device)
-        update_nodes = vec_inp[batch_idx, agent_indices].unsqueeze(1)
-        voronoi_np = (
-            map_inp[1, batch_idx, agent_indices]
-            .unsqueeze(1)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(bool)
-        )
-        entropy_np = (
-            map_inp[0, batch_idx, agent_indices]
-            .unsqueeze(1)
-            .detach()
-            .cpu()
-            .numpy()
-            .astype(np.float32)
-        )
-    else:
-        update_nodes = vec_inp
-        voronoi_np = map_inp[1].detach().cpu().numpy().astype(bool)
-        entropy_np = map_inp[0].detach().cpu().numpy().astype(np.float32)
-
-    batch_agents = update_nodes.size(1)
-    start_nodes = world_to_grid_torch(
-        update_nodes.view(-1, update_nodes.size(2))[:, :2],
-        H=100,
-        W=100,
+    timer = timing_timer
+    outer_context = (
+        timer.time("rrt_build_explore_nodes") if timer is not None else nullcontext()
     )
-    voronoi_inp = voronoi_np.reshape(-1, voronoi_np.shape[-2], voronoi_np.shape[-1])
-    entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])
-
-    batch_rrt = plan_batch(
-        start_nodes,
-        voronoi_inp,
-        entropy_inp,
-        max_iterations=rrt_max_iter,
-        top_k=top_k,
-    )
-    batch_rrt = torch.tensor(
-        batch_rrt,
-        dtype=torch.float32,
-        device=vec_inp.device,
-    ).view(batch_processes, batch_agents, -1, 3)
-
-    explore_nodes_world = grid_to_world_torch(batch_rrt[..., :2], H=100, W=100)
-    ego_positions = update_nodes[..., :2]
-    relative_explore_positions = (
-        explore_nodes_world - ego_positions.unsqueeze(2)
-    )
-    explore_nodes = torch.cat(
-        [relative_explore_positions, batch_rrt[..., 2:3]],
-        dim=-1,
-    )
-
-    distance_threshold = 0.3
-    all_goals = vec_inp[..., 2:4]
-    dists = torch.norm(
-        explore_nodes_world.unsqueeze(3)
-        - all_goals.unsqueeze(1).unsqueeze(1),
-        dim=-1,
-    )
-
-    mask = torch.ones_like(dists, dtype=torch.bool)
-    if agent_indices is not None:
-        batch_idx = torch.arange(batch_processes, device=vec_inp.device)
-        if goal_visibility_mask is not None:
-            receiver_visible = goal_visibility_mask[
-                batch_idx, agent_indices
-            ].bool()
-            mask = receiver_visible.view(
-                batch_processes, 1, 1, -1
-            ).expand_as(dists).clone()
-        mask[batch_idx, 0, :, agent_indices] = False
-    else:
-        if goal_visibility_mask is not None:
-            mask = goal_visibility_mask.bool().unsqueeze(2).expand(
-                batch_processes,
-                batch_agents,
-                top_k,
-                batch_agents,
-            ).clone()
-            diag_mask = torch.eye(batch_agents, device=vec_inp.device).bool()
-            mask = mask & ~diag_mask.view(1, batch_agents, 1, batch_agents)
+    with outer_context:
+        batch_processes = vec_inp.size(0)
+        if agent_indices is not None:
+            batch_idx = torch.arange(batch_processes, device=vec_inp.device)
+            update_nodes = vec_inp[batch_idx, agent_indices].unsqueeze(1)
+            with (
+                timer.time("rrt_cpu_numpy_transfer")
+                if timer is not None
+                else nullcontext()
+            ):
+                voronoi_np = (
+                    map_inp[1, batch_idx, agent_indices]
+                    .unsqueeze(1)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(bool)
+                )
+                entropy_np = (
+                    map_inp[0, batch_idx, agent_indices]
+                    .unsqueeze(1)
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float32)
+                )
         else:
-            diag_mask = torch.eye(batch_agents, device=vec_inp.device).bool()
-            mask = ~diag_mask.view(1, batch_agents, 1, batch_agents).expand(
-                batch_processes,
-                batch_agents,
-                top_k,
-                batch_agents,
+            update_nodes = vec_inp
+            with (
+                timer.time("rrt_cpu_numpy_transfer")
+                if timer is not None
+                else nullcontext()
+            ):
+                voronoi_np = map_inp[1].detach().cpu().numpy().astype(bool)
+                entropy_np = map_inp[0].detach().cpu().numpy().astype(np.float32)
+
+        batch_agents = update_nodes.size(1)
+        start_nodes = world_to_grid_torch(
+            update_nodes.view(-1, update_nodes.size(2))[:, :2],
+            H=100,
+            W=100,
+        )
+        voronoi_inp = voronoi_np.reshape(-1, voronoi_np.shape[-2], voronoi_np.shape[-1])
+        entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])
+
+        with (
+            timer.time("rrt_plan_batch", sync_cuda=False)
+            if timer is not None
+            else nullcontext()
+        ):
+            batch_rrt = plan_batch(
+                start_nodes,
+                voronoi_inp,
+                entropy_inp,
+                max_iterations=rrt_max_iter,
+                top_k=top_k,
+                timing_timer=timer,
             )
+        with (
+            timer.time("rrt_gpu_tensor_transfer")
+            if timer is not None
+            else nullcontext()
+        ):
+            batch_rrt = torch.tensor(
+                batch_rrt,
+                dtype=torch.float32,
+                device=vec_inp.device,
+            ).view(batch_processes, batch_agents, -1, 3)
 
-    dists = torch.where(
-        mask,
-        dists,
-        torch.tensor(float("inf"), device=dists.device),
-    )
-    valid_mask = dists < distance_threshold
-    occupied_values = ((distance_threshold - dists) / distance_threshold).pow(2)
-    occupied_values = torch.where(
-        valid_mask,
-        occupied_values,
-        torch.tensor(0.0, device=dists.device),
-    )
-    occupied_feature = occupied_values.sum(dim=-1, keepdim=True)
+        explore_nodes_world = grid_to_world_torch(batch_rrt[..., :2], H=100, W=100)
+        ego_positions = update_nodes[..., :2]
+        relative_explore_positions = (
+            explore_nodes_world - ego_positions.unsqueeze(2)
+        )
+        explore_nodes = torch.cat(
+            [relative_explore_positions, batch_rrt[..., 2:3]],
+            dim=-1,
+        )
 
-    return torch.cat([explore_nodes, occupied_feature], dim=-1)
+        distance_threshold = 0.3
+        all_goals = vec_inp[..., 2:4]
+        dists = torch.norm(
+            explore_nodes_world.unsqueeze(3)
+            - all_goals.unsqueeze(1).unsqueeze(1),
+            dim=-1,
+        )
+
+        mask = torch.ones_like(dists, dtype=torch.bool)
+        if agent_indices is not None:
+            batch_idx = torch.arange(batch_processes, device=vec_inp.device)
+            if goal_visibility_mask is not None:
+                receiver_visible = goal_visibility_mask[
+                    batch_idx, agent_indices
+                ].bool()
+                mask = receiver_visible.view(
+                    batch_processes, 1, 1, -1
+                ).expand_as(dists).clone()
+            mask[batch_idx, 0, :, agent_indices] = False
+        else:
+            if goal_visibility_mask is not None:
+                mask = goal_visibility_mask.bool().unsqueeze(2).expand(
+                    batch_processes,
+                    batch_agents,
+                    top_k,
+                    batch_agents,
+                ).clone()
+                diag_mask = torch.eye(batch_agents, device=vec_inp.device).bool()
+                mask = mask & ~diag_mask.view(1, batch_agents, 1, batch_agents)
+            else:
+                diag_mask = torch.eye(batch_agents, device=vec_inp.device).bool()
+                mask = ~diag_mask.view(1, batch_agents, 1, batch_agents).expand(
+                    batch_processes,
+                    batch_agents,
+                    top_k,
+                    batch_agents,
+                )
+
+        dists = torch.where(
+            mask,
+            dists,
+            torch.tensor(float("inf"), device=dists.device),
+        )
+        valid_mask = dists < distance_threshold
+        occupied_values = ((distance_threshold - dists) / distance_threshold).pow(2)
+        occupied_values = torch.where(
+            valid_mask,
+            occupied_values,
+            torch.tensor(0.0, device=dists.device),
+        )
+        occupied_feature = occupied_values.sum(dim=-1, keepdim=True)
+
+        return torch.cat([explore_nodes, occupied_feature], dim=-1)
 
 
 def build_landmark_nodes(
@@ -261,10 +291,11 @@ _grid_to_world_torch = grid_to_world_torch
 class HighLevelPolicy:
     """Runs the high-level goal selection path for a batch of agents."""
 
-    def __init__(self, top_k, rrt_max_iter, device):
+    def __init__(self, top_k, rrt_max_iter, device, timing_timer=None):
         self.top_k = top_k
         self.rrt_max_iter = rrt_max_iter
         self.device = device
+        self.timer = timing_timer if timing_timer is not None else TimingProfiler()
 
     def select_goals(
         self,
@@ -336,6 +367,7 @@ class HighLevelPolicy:
             goal_visibility_mask=goal_visibility_mask[proc_indices]
             if goal_visibility_mask is not None
             else None,
+            timing_timer=self.timer,
         )
         batch_explore_nodes = batch_explore_nodes.reshape(
             -1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1]
@@ -365,18 +397,19 @@ class HighLevelPolicy:
             batch_ego_to_landmark_edge_masks,
         ) = edge_outputs
 
-        batch_goals = policy.get_high_level_goal(
-            batch_ego_nodes,
-            batch_teammate_nodes,
-            batch_teammate_masks,
-            batch_explore_nodes,
-            batch_ego_to_explore_edges,
-            batch_landmark_nodes,
-            batch_landmark_node_masks,
-            batch_ego_to_landmark_edges,
-            batch_ego_to_landmark_edge_masks,
-            deterministic=deterministic,
-        )
+        with self.timer.time("high_policy_forward"):
+            batch_goals = policy.get_high_level_goal(
+                batch_ego_nodes,
+                batch_teammate_nodes,
+                batch_teammate_masks,
+                batch_explore_nodes,
+                batch_ego_to_explore_edges,
+                batch_landmark_nodes,
+                batch_landmark_node_masks,
+                batch_ego_to_landmark_edges,
+                batch_ego_to_landmark_edge_masks,
+                deterministic=deterministic,
+            )
 
         goals[linear_indices] = batch_goals["waypoints"]
         if update_tasks:
