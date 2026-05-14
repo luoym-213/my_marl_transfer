@@ -324,51 +324,52 @@ class LocalMapBank:
         comm_mask: [P, A, A]
         returns: bool [P, A, H, W], receiver-owned local Voronoi cells
         """
-        masks = torch.zeros(
-            self.num_processes,
-            self.num_agents,
-            self.height,
-            self.width,
-            device=self.device,
-            dtype=torch.bool,
-        )
-        grid_xy = torch.stack([self.cell_world_x, self.cell_world_y], dim=-1)
+        num_processes, num_agents = agent_positions.shape[:2]
         alive_bool = None if alive_mask is None else alive_mask > 0.5
 
-        for proc_idx in range(self.num_processes):
-            for receiver_idx in range(self.num_agents):
-                if alive_bool is not None and not alive_bool[proc_idx, receiver_idx]:
-                    continue
-                if scope == "self":
-                    masks[proc_idx, receiver_idx].fill_(True)
-                    continue
+        if scope == "self":
+            masks = torch.ones(
+                num_processes,
+                num_agents,
+                self.height,
+                self.width,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if alive_bool is not None:
+                masks = masks & alive_bool.view(num_processes, num_agents, 1, 1)
+            return masks
 
-                source_indices = torch.nonzero(
-                    comm_mask[proc_idx, receiver_idx],
-                    as_tuple=False,
-                ).flatten()
-                if source_indices.numel() == 0:
-                    source_indices = torch.tensor(
-                        [receiver_idx], device=self.device, dtype=torch.long
-                    )
-                if not (source_indices == receiver_idx).any():
-                    source_indices = torch.cat([
-                        torch.tensor(
-                            [receiver_idx], device=self.device, dtype=torch.long
-                        ),
-                        source_indices,
-                    ])
+        comm_mask = comm_mask.bool().clone()
+        eye = torch.eye(num_agents, device=self.device, dtype=torch.bool)
+        comm_mask = comm_mask | eye.unsqueeze(0)
 
-                source_positions = agent_positions[proc_idx, source_indices]
-                dist_sq = (
-                    grid_xy.unsqueeze(0) - source_positions.view(-1, 1, 1, 2)
-                ).square().sum(dim=-1)
-                closest_source = dist_sq.argmin(dim=0)
-                receiver_source_idx = torch.nonzero(
-                    source_indices == receiver_idx, as_tuple=False
-                ).flatten()[0]
-                masks[proc_idx, receiver_idx] = closest_source == receiver_source_idx
+        grid_x = self.cell_world_x.view(1, 1, self.height, self.width)
+        grid_y = self.cell_world_y.view(1, 1, self.height, self.width)
+        pos_x = agent_positions[..., 0].view(num_processes, num_agents, 1, 1)
+        pos_y = agent_positions[..., 1].view(num_processes, num_agents, 1, 1)
+        source_dist_sq = (grid_x - pos_x).square() + (grid_y - pos_y).square()
 
+        scores = source_dist_sq.unsqueeze(1).expand(
+            num_processes,
+            num_agents,
+            num_agents,
+            self.height,
+            self.width,
+        )
+        scores = scores.masked_fill(
+            ~comm_mask.view(num_processes, num_agents, num_agents, 1, 1),
+            float("inf"),
+        )
+        closest_source = scores.argmin(dim=2)
+        receiver_ids = torch.arange(
+            num_agents,
+            device=self.device,
+            dtype=closest_source.dtype,
+        ).view(1, num_agents, 1, 1)
+        masks = closest_source == receiver_ids
+        if alive_bool is not None:
+            masks = masks & alive_bool.view(num_processes, num_agents, 1, 1)
         return masks
 
     def get_agents_heatmap(self, agent_positions, radius=0.05):

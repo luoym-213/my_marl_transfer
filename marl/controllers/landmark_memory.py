@@ -265,7 +265,10 @@ class LandmarkMemory:
         threshold_sq,
     ):
         max_landmarks = receiver_data.size(0)
-        clusters = []
+        cluster_data = []
+        cluster_timestamp = []
+        cluster_ts = []
+        cluster_order = []
 
         for slot_idx in range(max_landmarks):
             if float(receiver_mask[slot_idx, 0]) <= 0.5:
@@ -273,14 +276,10 @@ class LandmarkMemory:
             slot_ts = float(receiver_timestamp[slot_idx, 0])
             if slot_ts < 0:
                 continue
-            clusters.append(
-                {
-                    "data": receiver_data[slot_idx].clone(),
-                    "timestamp": receiver_timestamp[slot_idx, 0].clone(),
-                    "ts": slot_ts,
-                    "order": slot_idx,
-                }
-            )
+            cluster_data.append(receiver_data[slot_idx])
+            cluster_timestamp.append(receiver_timestamp[slot_idx, 0])
+            cluster_ts.append(slot_ts)
+            cluster_order.append(slot_idx)
 
         next_order = max_landmarks
         for _, source_idx, slot_idx, cand_data, cand_timestamp, candidate_ts in candidates:
@@ -288,45 +287,54 @@ class LandmarkMemory:
             candidate_y = float(cand_data[1])
             matched_cluster = None
             best_dist_sq = float("inf")
-            for cluster_idx, cluster in enumerate(clusters):
-                dx = float(cluster["data"][0]) - candidate_x
-                dy = float(cluster["data"][1]) - candidate_y
+            for cluster_idx, data_ref in enumerate(cluster_data):
+                dx = float(data_ref[0]) - candidate_x
+                dy = float(data_ref[1]) - candidate_y
                 dist_sq = dx * dx + dy * dy
                 if dist_sq < best_dist_sq:
                     best_dist_sq = dist_sq
                     matched_cluster = cluster_idx
 
             if matched_cluster is not None and best_dist_sq < threshold_sq:
-                cluster = clusters[matched_cluster]
-                if candidate_ts > cluster["ts"]:
-                    cluster["data"] = cand_data.clone()
-                    cluster["timestamp"] = cand_timestamp.clone()
-                    cluster["ts"] = candidate_ts
+                if candidate_ts > cluster_ts[matched_cluster]:
+                    cluster_data[matched_cluster] = cand_data
+                    cluster_timestamp[matched_cluster] = cand_timestamp
+                    cluster_ts[matched_cluster] = candidate_ts
                 continue
 
-            clusters.append(
-                {
-                    "data": cand_data.clone(),
-                    "timestamp": cand_timestamp.clone(),
-                    "ts": candidate_ts,
-                    "order": next_order + source_idx * max_landmarks + slot_idx,
-                }
-            )
+            cluster_data.append(cand_data)
+            cluster_timestamp.append(cand_timestamp)
+            cluster_ts.append(candidate_ts)
+            cluster_order.append(next_order + source_idx * max_landmarks + slot_idx)
 
-        if len(clusters) > max_landmarks:
-            clusters = sorted(
-                clusters,
-                key=lambda cluster: (-cluster["ts"], cluster["order"]),
+        if len(cluster_data) > max_landmarks:
+            keep_indices = sorted(
+                range(len(cluster_data)),
+                key=lambda idx: (-cluster_ts[idx], cluster_order[idx]),
             )[:max_landmarks]
+        else:
+            keep_indices = list(range(len(cluster_data)))
 
-        clusters.sort(key=lambda cluster: cluster["order"])
+        keep_indices.sort(key=lambda idx: cluster_order[idx])
+        if keep_indices:
+            output_data = torch.stack([cluster_data[idx] for idx in keep_indices])
+            output_timestamp = torch.stack([
+                cluster_timestamp[idx] for idx in keep_indices
+            ])
+        else:
+            output_data = None
+            output_timestamp = None
+
         receiver_data.zero_()
         receiver_mask.zero_()
         receiver_timestamp.fill_(-1.0)
-        for slot_idx, cluster in enumerate(clusters[:max_landmarks]):
-            receiver_data[slot_idx] = cluster["data"]
+        if output_data is None:
+            return
+        slot_count = output_data.size(0)
+        receiver_data[:slot_count] = output_data
+        receiver_timestamp[:slot_count, 0] = output_timestamp
+        for slot_idx in range(slot_count):
             receiver_mask[slot_idx, 0] = 1.0
-            receiver_timestamp[slot_idx, 0] = cluster["timestamp"]
 
     def _merge_candidate(
         self,
