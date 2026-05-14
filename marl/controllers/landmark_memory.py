@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import torch
 
 
@@ -24,18 +26,28 @@ class LandmarkMemory:
         device=None,
         env_dones=None,
         match_threshold=0.05,
+        timing_timer=None,
     ):
         target_device = self.device if device is None else device
         work_device = torch.device("cpu")
-        updated_data = prev_landmark_data.detach().to(work_device).clone()
-        updated_mask = prev_landmark_mask.detach().to(work_device).clone()
-        updated_timestamp = prev_landmark_timestamp.detach().to(work_device).clone()
+        timer = timing_timer
+        timer_enabled = timer is not None and timer.enabled
+        time_ctx = timer.time if timer_enabled else None
 
-        num_agents_processes, max_landmarks, _ = updated_data.shape
-        num_processes = len(local_detection_list)
-        num_agents = num_agents_processes // num_processes
-        step_values = self._step_values(step_id, num_processes, work_device)
-        comm_mask_cpu = comm_mask.detach().to(work_device).bool()
+        with (
+            time_ctx("landmark_to_cpu") if timer_enabled else nullcontext()
+        ):
+            updated_data = prev_landmark_data.detach().to(work_device).clone()
+            updated_mask = prev_landmark_mask.detach().to(work_device).clone()
+            updated_timestamp = (
+                prev_landmark_timestamp.detach().to(work_device).clone()
+            )
+
+            num_agents_processes, max_landmarks, _ = updated_data.shape
+            num_processes = len(local_detection_list)
+            num_agents = num_agents_processes // num_processes
+            step_values = self._step_values(step_id, num_processes, work_device)
+            comm_mask_cpu = comm_mask.detach().to(work_device).bool()
 
         if env_dones is not None and env_dones.any():
             proc_indices = torch.arange(num_processes, device=work_device)[
@@ -50,33 +62,48 @@ class LandmarkMemory:
             updated_data[linear_indices, :, :] = 0.0
             updated_timestamp[linear_indices, :, 0] = -1.0
 
-        self._batch_upsert_local_detections(
-            updated_data,
-            updated_mask,
-            updated_timestamp,
-            local_detection_list,
-            step_values,
-            num_processes,
-            num_agents,
-            work_device,
-            match_threshold,
-        )
+        with (
+            time_ctx("landmark_local_upsert", sync_cuda=False)
+            if timer_enabled
+            else nullcontext()
+        ):
+            self._batch_upsert_local_detections(
+                updated_data,
+                updated_mask,
+                updated_timestamp,
+                local_detection_list,
+                step_values,
+                num_processes,
+                num_agents,
+                work_device,
+                match_threshold,
+            )
 
-        self._fuse_by_comm_mask(
-            updated_data,
-            updated_mask,
-            updated_timestamp,
-            comm_mask_cpu,
-            num_processes,
-            num_agents,
-            match_threshold,
-        )
+        with (
+            time_ctx("landmark_comm_fuse", sync_cuda=False)
+            if timer_enabled
+            else nullcontext()
+        ):
+            self._fuse_by_comm_mask(
+                updated_data,
+                updated_mask,
+                updated_timestamp,
+                comm_mask_cpu,
+                num_processes,
+                num_agents,
+                match_threshold,
+                timing_timer=timer,
+            )
 
-        return (
-            updated_data.to(target_device),
-            updated_mask.to(target_device),
-            updated_timestamp.to(target_device),
-        )
+        with (
+            time_ctx("landmark_to_device") if timer_enabled else nullcontext()
+        ):
+            result = (
+                updated_data.to(target_device),
+                updated_mask.to(target_device),
+                updated_timestamp.to(target_device),
+            )
+        return result
 
     def _upsert_local_detection(
         self,
@@ -179,10 +206,12 @@ class LandmarkMemory:
         num_processes,
         num_agents,
         match_threshold,
+        timing_timer=None,
     ):
         base_data = data.clone()
         base_mask = mask.clone()
         base_timestamp = timestamp.clone()
+        candidate_count = 0
 
         for proc_idx in range(num_processes):
             for receiver_idx in range(num_agents):
@@ -201,6 +230,7 @@ class LandmarkMemory:
                 if not valid.any():
                     continue
 
+                candidate_count += int(valid.sum().item())
                 cand_data = cand_data[valid]
                 cand_timestamp = cand_timestamp[valid]
                 source_rank = source_indices.repeat_interleave(base_data.size(1))[valid]
@@ -223,6 +253,8 @@ class LandmarkMemory:
                         cand_timestamp[idx],
                         match_threshold,
                     )
+        if timing_timer is not None and timing_timer.enabled:
+            timing_timer.add_stat("landmark_fuse_candidates", candidate_count)
 
     def _merge_candidate(
         self,

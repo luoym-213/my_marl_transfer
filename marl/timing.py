@@ -18,8 +18,10 @@ class TimingProfiler:
         self.log_interval = max(1, int(log_interval))
         self.current = defaultdict(float)
         self.current_values = defaultdict(list)
+        self.current_stats = defaultdict(float)
         self.interval_totals = defaultdict(float)
         self.interval_values = defaultdict(list)
+        self.interval_stats = defaultdict(list)
         self.interval_updates = 0
         self.update_start = None
 
@@ -28,6 +30,7 @@ class TimingProfiler:
             return
         self.current = defaultdict(float)
         self.current_values = defaultdict(list)
+        self.current_stats = defaultdict(float)
         self.update_start = time.perf_counter()
 
     @contextmanager
@@ -52,6 +55,10 @@ class TimingProfiler:
         if self.enabled:
             self.current_values[name].append(float(value))
 
+    def add_stat(self, name, value):
+        if self.enabled:
+            self.current_stats[name] += float(value)
+
     def finish_update(self, update_idx, writer=None):
         if not self.enabled:
             return
@@ -71,6 +78,11 @@ class TimingProfiler:
             self.interval_values[name].append(mean_value)
             if writer is not None:
                 writer.add_scalar("timing/" + name, mean_value, update_idx)
+
+        for name, value in self.current_stats.items():
+            self.interval_stats[name].append(value)
+            if writer is not None:
+                writer.add_scalar("timing/" + name, value, update_idx)
 
         self.interval_updates += 1
         if self.interval_updates >= self.log_interval:
@@ -124,6 +136,12 @@ class TimingProfiler:
                 vals = self.interval_values[name]
                 mean_value = sum(vals) / len(vals)
                 print("  {:<32} {:>.4f}".format(name, mean_value))
+        if self.interval_stats:
+            print("Timing counters:")
+            for name in sorted(self.interval_stats):
+                vals = self.interval_stats[name]
+                mean_value = sum(vals) / len(vals)
+                print("  {:<32} {:>.4f}".format(name, mean_value))
         print("")
 
     def reset_interval(self):
@@ -131,6 +149,7 @@ class TimingProfiler:
             return
         self.interval_totals = defaultdict(float)
         self.interval_values = defaultdict(list)
+        self.interval_stats = defaultdict(list)
         self.interval_updates = 0
 
     def _sync(self, sync_cuda=True):

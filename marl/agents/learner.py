@@ -409,6 +409,7 @@ class Learner(object):
             device=device,
             env_dones=env_dones,
             match_threshold=match_threshold,
+            timing_timer=self.timer,
         )
     
     def wrap_horizon(self):

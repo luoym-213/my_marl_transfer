@@ -51,7 +51,8 @@ class RRT_GNN:
                  top_k: int = 10,
                  temperature: float = 1.0,
                  uniform_ratio: float = 0.3,  # 新增：均匀采样的比例
-                 decay_radius: int = 3):  # 新增：采样后概率衰减半径
+                 decay_radius: int = 3,  # 新增：采样后概率衰减半径
+                 timing_timer: Optional[Any] = None):
         """
         初始化RRT_GNN
 
@@ -79,13 +80,23 @@ class RRT_GNN:
         self.temperature = temperature
         self.decay_radius = decay_radius
         self.uniform_ratio = uniform_ratio
+        self.timing_timer = timing_timer
+        self.timing_enabled = (
+            timing_timer is not None and timing_timer.enabled
+        )
         
         # 地图尺寸
         self.map_size = entropy_map.shape
 
         # 生成采样列表和初始概率分布
+        init_start = time.perf_counter() if self.timing_enabled else None
         self.sample_points, self.sample_probs = self._generate_sample_distribution()
         self.sample_list = [tuple(point) for point in self.sample_points.tolist()]
+        if self.timing_enabled:
+            self.timing_timer.add(
+                "rrt_init_distribution",
+                time.perf_counter() - init_start,
+            )
         
         # 新增：记录采样历史，用于动态调整概率
         self.sample_counts = np.zeros(len(self.sample_list))  # 每个点被采样的次数
@@ -95,12 +106,18 @@ class RRT_GNN:
 
         # 预计算"半径内熵累计和"整图
         self._disk_kernel = self._make_disk_kernel(self.radius)
+        convolve_start = time.perf_counter() if self.timing_enabled else None
         self.local_entropy_map = convolve(
             self.entropy_map.astype(np.float32),
             self._disk_kernel,
             mode="constant",
             cval=0.0,
         )
+        if self.timing_enabled:
+            self.timing_timer.add(
+                "rrt_entropy_convolve",
+                time.perf_counter() - convolve_start,
+            )
 
     @staticmethod
     def _make_disk_kernel(radius: int) -> np.ndarray:
@@ -264,7 +281,13 @@ class RRT_GNN:
         Return exactly top_k candidate nodes. Existing RRT nodes keep priority; missing
         slots are filled from high-entropy sample points, then start-neighborhood points.
         """
+        fallback_start = time.perf_counter() if self.timing_enabled else None
         if self.top_k <= 0:
+            if self.timing_enabled:
+                self.timing_timer.add(
+                    "rrt_fallback",
+                    time.perf_counter() - fallback_start,
+                )
             return []
 
         result: List[List[float]] = []
@@ -313,6 +336,11 @@ class RRT_GNN:
         while len(result) < self.top_k:
             result.append(result[-1].copy() if result else [self.start.x, self.start.y, 0.0])
 
+        if self.timing_enabled:
+            self.timing_timer.add(
+                "rrt_fallback",
+                time.perf_counter() - fallback_start,
+            )
         return result
 
     def _get_nearest_node_index(self, node_list: List['RRT_GNN.Node'], 
@@ -327,9 +355,15 @@ class RRT_GNN:
         返回:
             minind: 最近节点的索引
         """
+        nearest_start = time.perf_counter() if self.timing_enabled else None
         dlist = [(node.x - rnd_node.x) ** 2 + (node.y - rnd_node.y) ** 2
                  for node in node_list]
         minind = dlist.index(min(dlist))
+        if self.timing_enabled:
+            self.timing_timer.add(
+                "rrt_nearest_search",
+                time.perf_counter() - nearest_start,
+            )
         
         return minind
 
@@ -415,8 +449,14 @@ class RRT_GNN:
                     continue
             
             # 按价值排序，选择Top-K节点
+            sort_start = time.perf_counter() if self.timing_enabled else None
             sorted_nodes = sorted(self.node_list, key=lambda node: node.value, reverse=True)
             top_k_nodes = sorted_nodes[:min(self.top_k, len(sorted_nodes))]
+            if self.timing_enabled:
+                self.timing_timer.add(
+                    "rrt_result_sort",
+                    time.perf_counter() - sort_start,
+                )
 
             return self._make_fallback_result(top_k_nodes)
         
@@ -664,7 +704,11 @@ def plan_batch(
     B = voronoi_masks.shape[0]
     item_times = [] if timing_timer is not None and timing_timer.enabled else None
     total_start = time.perf_counter() if item_times is not None else None
+    if item_times is not None:
+        timing_timer.add_stat("rrt_plan_batch_calls", 1)
+        timing_timer.add_stat("rrt_total_instances", B)
     for b in range(B):
+        item_start = time.perf_counter() if item_times is not None else None
         rrt = RRT_GNN(
             start=list(starts[b]),
             voronoi_mask=voronoi_masks[b],
@@ -674,8 +718,8 @@ def plan_batch(
             expand_dis=expand_dis,
             max_iterations=max_iterations,
             top_k=top_k,
+            timing_timer=timing_timer,
         )
-        item_start = time.perf_counter() if item_times is not None else None
         results.append(rrt.planning())
         if item_times is not None:
             item_times.append(time.perf_counter() - item_start)
