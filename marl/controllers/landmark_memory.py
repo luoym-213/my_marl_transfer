@@ -265,31 +265,73 @@ class LandmarkMemory:
         candidate_timestamp,
         match_threshold,
     ):
-        candidate_pos = candidate_data[0:2]
-        matched_idx = self._find_landmark_match(
-            candidate_pos,
+        candidate_x = float(candidate_data[0])
+        candidate_y = float(candidate_data[1])
+        candidate_ts = float(candidate_timestamp)
+        matched_idx = self._find_landmark_match_scalar(
+            candidate_x,
+            candidate_y,
             receiver_data,
             receiver_mask,
-            match_threshold,
+            match_threshold * match_threshold,
         )
 
         if matched_idx is not None:
-            if candidate_timestamp > receiver_timestamp[matched_idx, 0]:
+            if candidate_ts > float(receiver_timestamp[matched_idx, 0]):
                 receiver_data[matched_idx] = candidate_data
                 receiver_mask[matched_idx, 0] = 1.0
                 receiver_timestamp[matched_idx, 0] = candidate_timestamp
             return
 
-        empty_idx = self._find_empty_slot(receiver_mask)
+        empty_idx = self._find_empty_slot_scalar(receiver_mask)
         if empty_idx is None:
-            oldest_idx = torch.argmin(receiver_timestamp[:, 0]).item()
-            if candidate_timestamp <= receiver_timestamp[oldest_idx, 0]:
+            oldest_idx = self._find_oldest_slot_scalar(receiver_timestamp)
+            if candidate_ts <= float(receiver_timestamp[oldest_idx, 0]):
                 return
             empty_idx = oldest_idx
 
         receiver_data[empty_idx] = candidate_data
         receiver_mask[empty_idx, 0] = 1.0
         receiver_timestamp[empty_idx, 0] = candidate_timestamp
+
+    def _find_landmark_match_scalar(
+        self,
+        candidate_x,
+        candidate_y,
+        landmarks_data,
+        landmarks_mask,
+        threshold_sq,
+    ):
+        best_idx = None
+        best_dist_sq = float("inf")
+        for slot_idx in range(landmarks_data.size(0)):
+            if float(landmarks_mask[slot_idx, 0]) <= 0.5:
+                continue
+            dx = float(landmarks_data[slot_idx, 0]) - candidate_x
+            dy = float(landmarks_data[slot_idx, 1]) - candidate_y
+            dist_sq = dx * dx + dy * dy
+            if dist_sq < best_dist_sq:
+                best_dist_sq = dist_sq
+                best_idx = slot_idx
+        if best_idx is not None and best_dist_sq < threshold_sq:
+            return best_idx
+        return None
+
+    def _find_empty_slot_scalar(self, landmarks_mask):
+        for slot_idx in range(landmarks_mask.size(0)):
+            if float(landmarks_mask[slot_idx, 0]) < 0.5:
+                return slot_idx
+        return None
+
+    def _find_oldest_slot_scalar(self, landmarks_timestamp):
+        oldest_idx = 0
+        oldest_ts = float(landmarks_timestamp[0, 0])
+        for slot_idx in range(1, landmarks_timestamp.size(0)):
+            slot_ts = float(landmarks_timestamp[slot_idx, 0])
+            if slot_ts < oldest_ts:
+                oldest_ts = slot_ts
+                oldest_idx = slot_idx
+        return oldest_idx
 
     def _find_landmark_match(self, position, landmarks_data, landmarks_mask, threshold):
         valid_mask = landmarks_mask[:, 0] > 0.5
