@@ -165,35 +165,57 @@ class LocalMapBank:
         sensor_dist: scalar local observation radius
         """
         step_values = self._step_values(step_id, agent_positions.shape[0])
-        for proc_idx in range(agent_positions.shape[0]):
-            for agent_idx in range(agent_positions.shape[1]):
-                pos = agent_positions[proc_idx, agent_idx]
-                fov_mask = self.get_fov_mask(pos, sensor_dist)
-                fov_mask = fov_mask & (
-                    self.timestamp_maps[proc_idx, agent_idx]
-                    != step_values[proc_idx]
-                )
-                if not fov_mask.any():
-                    continue
+        num_processes, num_agents = agent_positions.shape[:2]
+        grid_x = self.cell_world_x.view(1, 1, self.height, self.width)
+        grid_y = self.cell_world_y.view(1, 1, self.height, self.width)
+        pos_x = agent_positions[..., 0].view(num_processes, num_agents, 1, 1)
+        pos_y = agent_positions[..., 1].view(num_processes, num_agents, 1, 1)
+        fov_mask = (grid_x - pos_x).square() + (grid_y - pos_y).square()
+        fov_mask = fov_mask <= float(sensor_dist) ** 2
+        fov_mask = fov_mask & (
+            self.timestamp_maps
+            != step_values.view(num_processes, 1, 1, 1)
+        )
+        if not fov_mask.any():
+            return
 
-                detections = self._detections_tensor(
-                    local_detections, proc_idx, agent_idx
-                )
-                positive_mask = torch.zeros_like(fov_mask)
-                if detections.numel() > 0:
-                    dx = self.cell_world_x.unsqueeze(0) - detections[:, 0].view(-1, 1, 1)
-                    dy = self.cell_world_y.unsqueeze(0) - detections[:, 1].view(-1, 1, 1)
-                    detection_mask = (dx.square() + dy.square()).le(
-                        self.landmark_radius ** 2
-                    ).any(dim=0)
-                    positive_mask = fov_mask & detection_mask
+        detection_pos, detection_mask = self._detections_batch_tensor(
+            local_detections,
+            num_processes,
+            num_agents,
+        )
+        positive_mask = torch.zeros_like(fov_mask)
+        if detection_pos.numel() > 0 and detection_mask.any():
+            det_x = detection_pos[..., 0].view(num_processes, num_agents, -1, 1, 1)
+            det_y = detection_pos[..., 1].view(num_processes, num_agents, -1, 1, 1)
+            dist_sq = (
+                (grid_x.unsqueeze(2) - det_x).square()
+                + (grid_y.unsqueeze(2) - det_y).square()
+            )
+            detected_cells = (
+                dist_sq <= self.landmark_radius ** 2
+            ) & detection_mask.view(num_processes, num_agents, -1, 1, 1)
+            positive_mask = fov_mask & detected_cells.any(dim=2)
 
-                negative_mask = fov_mask & (~positive_mask)
-                self._bayesian_update(proc_idx, agent_idx, positive_mask, True)
-                self._bayesian_update(proc_idx, agent_idx, negative_mask, False)
-                self.timestamp_maps[proc_idx, agent_idx][fov_mask] = step_values[
-                    proc_idx
-                ]
+        b_prev = self.belief_maps
+        p_s = self.sensor_fidelity
+        pos_den = p_s * b_prev + (1.0 - p_s) * (1.0 - b_prev)
+        pos_update = (p_s * b_prev / pos_den.clamp_min(self.epsilon)).clamp(0.0, 1.0)
+        neg_den = (1.0 - p_s) * b_prev + p_s * (1.0 - b_prev)
+        neg_update = (
+            (1.0 - p_s) * b_prev / neg_den.clamp_min(self.epsilon)
+        ).clamp(0.0, 1.0)
+        negative_mask = fov_mask & (~positive_mask)
+        self.belief_maps = torch.where(
+            positive_mask,
+            pos_update,
+            torch.where(negative_mask, neg_update, self.belief_maps),
+        )
+        self.timestamp_maps = torch.where(
+            fov_mask,
+            step_values.view(num_processes, 1, 1, 1).expand_as(self.timestamp_maps),
+            self.timestamp_maps,
+        )
 
         self.entropy_maps = None
 
@@ -204,36 +226,77 @@ class LocalMapBank:
         Ties keep the receiver value because the receiver is placed first in
         the source set before torch.argmax is applied.
         """
-        comm_mask = comm_mask.bool()
-        fused_beliefs = self.belief_maps.clone()
-        fused_timestamps = self.timestamp_maps.clone()
+        comm_mask = comm_mask.bool().clone()
+        num_processes, num_agents = comm_mask.shape[:2]
+        eye = torch.eye(num_agents, device=self.device, dtype=torch.bool)
+        comm_mask = comm_mask | eye.unsqueeze(0)
 
-        for proc_idx in range(self.num_processes):
-            for receiver_idx in range(self.num_agents):
-                neighbor_indices = torch.nonzero(
-                    comm_mask[proc_idx, receiver_idx],
-                    as_tuple=False,
-                ).flatten()
-                if neighbor_indices.numel() == 0:
-                    neighbor_indices = torch.tensor(
-                        [receiver_idx], device=self.device, dtype=torch.long
-                    )
+        source_order = []
+        for receiver_idx in range(num_agents):
+            ordered = [receiver_idx]
+            ordered.extend(idx for idx in range(num_agents) if idx != receiver_idx)
+            source_order.append(ordered)
+        source_order = torch.tensor(
+            source_order,
+            device=self.device,
+            dtype=torch.long,
+        )
+        ordered_comm_mask = torch.gather(
+            comm_mask,
+            2,
+            source_order.unsqueeze(0).expand(num_processes, -1, -1),
+        )
+        source_timestamps = self.timestamp_maps.unsqueeze(1).expand(
+            num_processes,
+            num_agents,
+            num_agents,
+            self.height,
+            self.width,
+        )
+        source_timestamps = torch.gather(
+            source_timestamps,
+            2,
+            source_order.view(1, num_agents, num_agents, 1, 1).expand(
+                num_processes,
+                num_agents,
+                num_agents,
+                self.height,
+                self.width,
+            ),
+        )
+        valid_sources = ordered_comm_mask.view(
+            num_processes,
+            num_agents,
+            num_agents,
+            1,
+            1,
+        )
+        scores = source_timestamps.masked_fill(~valid_sources, float("-inf"))
+        winner_indices = scores.argmax(dim=2)
 
-                ordered_sources = self._receiver_first_sources(
-                    receiver_idx, neighbor_indices
-                )
-                source_timestamps = self.timestamp_maps[proc_idx, ordered_sources]
-                source_beliefs = self.belief_maps[proc_idx, ordered_sources]
-                winner_indices = source_timestamps.argmax(dim=0)
-                fused_timestamps[proc_idx, receiver_idx] = torch.gather(
-                    source_timestamps, 0, winner_indices.unsqueeze(0)
-                ).squeeze(0)
-                fused_beliefs[proc_idx, receiver_idx] = torch.gather(
-                    source_beliefs, 0, winner_indices.unsqueeze(0)
-                ).squeeze(0)
-
-        self.belief_maps = fused_beliefs
-        self.timestamp_maps = fused_timestamps
+        gather_indices = winner_indices.unsqueeze(2)
+        source_beliefs = self.belief_maps.unsqueeze(1).expand_as(source_timestamps)
+        source_beliefs = torch.gather(
+            source_beliefs,
+            2,
+            source_order.view(1, num_agents, num_agents, 1, 1).expand(
+                num_processes,
+                num_agents,
+                num_agents,
+                self.height,
+                self.width,
+            ),
+        )
+        self.timestamp_maps = torch.gather(
+            source_timestamps,
+            2,
+            gather_indices,
+        ).squeeze(2)
+        self.belief_maps = torch.gather(
+            source_beliefs,
+            2,
+            gather_indices,
+        ).squeeze(2)
         self.entropy_maps = None
         return self.belief_maps, self.timestamp_maps
 
@@ -261,51 +324,52 @@ class LocalMapBank:
         comm_mask: [P, A, A]
         returns: bool [P, A, H, W], receiver-owned local Voronoi cells
         """
-        masks = torch.zeros(
-            self.num_processes,
-            self.num_agents,
-            self.height,
-            self.width,
-            device=self.device,
-            dtype=torch.bool,
-        )
-        grid_xy = torch.stack([self.cell_world_x, self.cell_world_y], dim=-1)
+        num_processes, num_agents = agent_positions.shape[:2]
         alive_bool = None if alive_mask is None else alive_mask > 0.5
 
-        for proc_idx in range(self.num_processes):
-            for receiver_idx in range(self.num_agents):
-                if alive_bool is not None and not alive_bool[proc_idx, receiver_idx]:
-                    continue
-                if scope == "self":
-                    masks[proc_idx, receiver_idx].fill_(True)
-                    continue
+        if scope == "self":
+            masks = torch.ones(
+                num_processes,
+                num_agents,
+                self.height,
+                self.width,
+                device=self.device,
+                dtype=torch.bool,
+            )
+            if alive_bool is not None:
+                masks = masks & alive_bool.view(num_processes, num_agents, 1, 1)
+            return masks
 
-                source_indices = torch.nonzero(
-                    comm_mask[proc_idx, receiver_idx],
-                    as_tuple=False,
-                ).flatten()
-                if source_indices.numel() == 0:
-                    source_indices = torch.tensor(
-                        [receiver_idx], device=self.device, dtype=torch.long
-                    )
-                if not (source_indices == receiver_idx).any():
-                    source_indices = torch.cat([
-                        torch.tensor(
-                            [receiver_idx], device=self.device, dtype=torch.long
-                        ),
-                        source_indices,
-                    ])
+        comm_mask = comm_mask.bool().clone()
+        eye = torch.eye(num_agents, device=self.device, dtype=torch.bool)
+        comm_mask = comm_mask | eye.unsqueeze(0)
 
-                source_positions = agent_positions[proc_idx, source_indices]
-                dist_sq = (
-                    grid_xy.unsqueeze(0) - source_positions.view(-1, 1, 1, 2)
-                ).square().sum(dim=-1)
-                closest_source = dist_sq.argmin(dim=0)
-                receiver_source_idx = torch.nonzero(
-                    source_indices == receiver_idx, as_tuple=False
-                ).flatten()[0]
-                masks[proc_idx, receiver_idx] = closest_source == receiver_source_idx
+        grid_x = self.cell_world_x.view(1, 1, self.height, self.width)
+        grid_y = self.cell_world_y.view(1, 1, self.height, self.width)
+        pos_x = agent_positions[..., 0].view(num_processes, num_agents, 1, 1)
+        pos_y = agent_positions[..., 1].view(num_processes, num_agents, 1, 1)
+        source_dist_sq = (grid_x - pos_x).square() + (grid_y - pos_y).square()
 
+        scores = source_dist_sq.unsqueeze(1).expand(
+            num_processes,
+            num_agents,
+            num_agents,
+            self.height,
+            self.width,
+        )
+        scores = scores.masked_fill(
+            ~comm_mask.view(num_processes, num_agents, num_agents, 1, 1),
+            float("inf"),
+        )
+        closest_source = scores.argmin(dim=2)
+        receiver_ids = torch.arange(
+            num_agents,
+            device=self.device,
+            dtype=closest_source.dtype,
+        ).view(1, num_agents, 1, 1)
+        masks = closest_source == receiver_ids
+        if alive_bool is not None:
+            masks = masks & alive_bool.view(num_processes, num_agents, 1, 1)
         return masks
 
     def get_agents_heatmap(self, agent_positions, radius=0.05):
@@ -371,6 +435,62 @@ class LocalMapBank:
         return torch.as_tensor(
             detections, dtype=torch.float32, device=self.device
         ).view(-1, 2)
+
+    def _detections_batch_tensor(self, local_detections, num_processes, num_agents):
+        max_detections = 0
+        for proc_idx in range(num_processes):
+            for agent_idx in range(num_agents):
+                max_detections = max(
+                    max_detections,
+                    len(local_detections[proc_idx][agent_idx]),
+                )
+        if max_detections == 0:
+            return (
+                torch.zeros(
+                    num_processes,
+                    num_agents,
+                    0,
+                    2,
+                    device=self.device,
+                    dtype=torch.float32,
+                ),
+                torch.zeros(
+                    num_processes,
+                    num_agents,
+                    0,
+                    device=self.device,
+                    dtype=torch.bool,
+                ),
+            )
+
+        positions = torch.zeros(
+            num_processes,
+            num_agents,
+            max_detections,
+            2,
+            device=self.device,
+            dtype=torch.float32,
+        )
+        mask = torch.zeros(
+            num_processes,
+            num_agents,
+            max_detections,
+            device=self.device,
+            dtype=torch.bool,
+        )
+        for proc_idx in range(num_processes):
+            for agent_idx in range(num_agents):
+                detections = self._detections_tensor(
+                    local_detections,
+                    proc_idx,
+                    agent_idx,
+                )
+                if detections.numel() == 0:
+                    continue
+                count = detections.size(0)
+                positions[proc_idx, agent_idx, :count] = detections
+                mask[proc_idx, agent_idx, :count] = True
+        return positions, mask
 
     def _step_values(self, step_id, num_processes):
         if isinstance(step_id, torch.Tensor):
