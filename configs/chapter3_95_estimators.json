@@ -1,0 +1,58 @@
+{
+  "experiment": "chapter3_95_estimators_20260905",
+  "policy_checkpoint": "../marlsave/save_new/chapter2_94_attn_fallback_20260905_05/ep400.pt",
+  "output_directory": "../marlsave/save_new/chapter3_95_estimators_20260905",
+  "observation_radius": 0.5,
+  "episodes": 1000,
+  "episode_split": {
+    "train": 700,
+    "validation": 150,
+    "test": 150
+  },
+  "trajectory_seed_base": 7378,
+  "communication_seed_base": 20260905,
+  "world_dt_seconds": 0.1,
+  "kalman": {
+    "transition": "constant_velocity",
+    "measurement": "position_only",
+    "q_r_multipliers": [0.25, 1.0, 4.0],
+    "covariance_update": "Joseph"
+  },
+  "commdrop": {
+    "hidden_dim": 128,
+    "task_dim": 64,
+    "time_dim": 16,
+    "omega_seconds": {
+      "count": 8,
+      "minimum": 0.1,
+      "maximum": 5.0,
+      "spacing": "geometric"
+    },
+    "delta_source_seconds": 0.3,
+    "lambda_q": 1.0,
+    "lambda_edge_task": 1.0,
+    "kappa": 3.0,
+    "lambda_sparse": 0.001,
+    "epsilon": 0.0001,
+    "optimizer": {
+      "name": "AdamW",
+      "learning_rate": 0.001,
+      "weight_decay": 0.00001,
+      "episode_batch_size": 16,
+      "max_epochs": 100,
+      "gradient_clip": 1.0,
+      "early_stopping_patience": 15
+    },
+    "validation_fallback_search": {
+      "hidden_dim": [128, 256],
+      "learning_rate": [0.0003, 0.001],
+      "lambda_sparse": [0.0001, 0.001],
+      "kappa": [1.0, 3.0]
+    }
+  },
+  "validation_gate": {
+    "each_level_commdrop_spatial_edge_below_stale": true,
+    "macro_commdrop_spatial_edge_below_kf": true,
+    "test_split_sealed_until_pass": true
+  }
+}

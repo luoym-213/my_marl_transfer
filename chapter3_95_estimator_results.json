@@ -1,0 +1,6 @@
+{
+  "status": "not_run",
+  "reason": "Formal 1000-episode collection, three-level training, and gated 150-episode evaluation have not been executed yet.",
+  "protocol_config": "configs/chapter3_95_estimators.json",
+  "result_command": "PYTHONPATH=src/multiagent/mape:src/gym-vecenv /home/robo/anaconda3/envs/mpe_trans/bin/python evaluate_estimators.py --mode both --no-cuda --require-formal-dataset --num-closed-loop-episodes 150"
+}
