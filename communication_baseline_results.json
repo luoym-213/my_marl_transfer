@@ -1,0 +1,52 @@
+{
+  "checkpoint": "/home/robo/lym/new-marl/marlsave/save_new/chapter2_94_attn_fallback_20260905_05/ep400.pt",
+  "trajectory_seed": 7378,
+  "communication_seed": 20260905,
+  "mask_observation_radius": 0.5,
+  "results": [
+    {
+      "condition": "ideal",
+      "episodes": 50,
+      "successes": 47,
+      "success_rate": 0.94,
+      "mean_episode_steps": 31.94000000000002,
+      "mean_success_steps": 30.78723404255319,
+      "mean_per_step_reward": -0.03754671993102992,
+      "mean_high_per_step_reward": 0.8381198365263588,
+      "mean_final_distance": 0.07631919085487211
+    },
+    {
+      "condition": "mild",
+      "episodes": 50,
+      "successes": 41,
+      "success_rate": 0.82,
+      "mean_episode_steps": 36.92,
+      "mean_success_steps": 34.048780487804876,
+      "mean_per_step_reward": -0.16992619557826366,
+      "mean_high_per_step_reward": 0.6705280364357352,
+      "mean_final_distance": 0.1165628877943922
+    },
+    {
+      "condition": "medium",
+      "episodes": 50,
+      "successes": 34,
+      "success_rate": 0.68,
+      "mean_episode_steps": 42.93999999999999,
+      "mean_success_steps": 39.61764705882353,
+      "mean_per_step_reward": -0.20795601898555388,
+      "mean_high_per_step_reward": 0.4995414149811262,
+      "mean_final_distance": 0.15064760351689926
+    },
+    {
+      "condition": "severe",
+      "episodes": 50,
+      "successes": 22,
+      "success_rate": 0.44,
+      "mean_episode_steps": 46.43999999999999,
+      "mean_success_steps": 41.90909090909091,
+      "mean_per_step_reward": -0.21086966943796057,
+      "mean_high_per_step_reward": 0.38330981331037,
+      "mean_final_distance": 0.21950171836855256
+    }
+  ]
+}
