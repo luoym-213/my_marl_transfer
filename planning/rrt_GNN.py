@@ -607,9 +607,11 @@ def plan_batch(
     expand_dis: int = 4,
     max_iterations: int = 50,
     top_k: int = 10,
-) -> List[List[List[float]]]:
+    temperature: float = 1.0,
+    uniform_ratio: float = 0.3,
+) -> np.ndarray:
     """
-    Batch 版本：对 B 份数据逐个运行 RRT_GNN（不是向量化并行，只是统一入口）
+    Vectorized batch RRT planning.
 
     输入:
       - starts: (B, 2) 的栅格索引 [[x,y], ...]
@@ -617,28 +619,225 @@ def plan_batch(
       - entropy_maps: (B, H, W) float
 
     输出:
-      - results: 长度为 B 的 list；每个元素是 RRT_GNN.planning() 的返回(list[list])
-                 即 [[x, y, value], ...]
+      - results: (B, top_k, 3) float32 array，最后一维是 [x, y, value]
+
+    Candidate extraction, probability construction, random sampling and nearest-node
+    search are batched. The iteration loop remains because each RRT expansion depends
+    on the tree produced by the preceding iteration.
     """
+    starts = np.asarray(starts, dtype=np.int32)
+    voronoi_masks = np.asarray(voronoi_masks, dtype=bool)
+    entropy_maps = np.asarray(entropy_maps, dtype=np.float32)
+
+    if starts.ndim != 2 or starts.shape[-1] != 2:
+        raise ValueError("starts 需要是 (B,2)")
     if voronoi_masks.ndim != 3 or entropy_maps.ndim != 3:
         raise ValueError("voronoi_masks 与 entropy_maps 需要是 (B,H,W)")
-    if len(starts) != voronoi_masks.shape[0] or len(starts) != entropy_maps.shape[0]:
+    if voronoi_masks.shape != entropy_maps.shape:
+        raise ValueError("voronoi_masks 与 entropy_maps 的形状必须一致")
+    if starts.shape[0] != voronoi_masks.shape[0]:
         raise ValueError("starts 与 masks/maps 的 batch 维度 B 不一致")
+    if temperature <= 0:
+        raise ValueError("temperature 必须大于0")
+    if not 0.0 <= uniform_ratio <= 1.0:
+        raise ValueError("uniform_ratio 必须位于[0,1]")
 
-    results: List[List[dict]] = []
-    B = voronoi_masks.shape[0]
-    for b in range(B):
-        rrt = RRT_GNN(
-            start=list(starts[b]),
-            voronoi_mask=voronoi_masks[b],
-            entropy_map=entropy_maps[b],
-            entropy_threshold=entropy_threshold,
-            radius=radius,
-            expand_dis=expand_dis,
-            max_iterations=max_iterations,
-            top_k=top_k,
+    batch_size, height, width = entropy_maps.shape
+    if batch_size == 0 or top_k <= 0:
+        return np.empty((batch_size, max(top_k, 0), 3), dtype=np.float32)
+
+    starts = starts.copy()
+    starts[:, 0] = np.clip(starts[:, 0], 0, height - 1)
+    starts[:, 1] = np.clip(starts[:, 1], 0, width - 1)
+
+    disk_kernel = RRT_GNN._make_disk_kernel(int(radius))[None, ...]
+    local_entropy_maps = convolve(
+        entropy_maps,
+        disk_kernel,
+        mode="constant",
+        cval=0.0,
+    ).astype(np.float32, copy=False)
+
+    # Empty Voronoi rows use the same clipped 11x11 neighbourhood fallback.
+    candidate_masks = voronoi_masks.reshape(batch_size, -1).copy()
+    candidate_counts = candidate_masks.sum(axis=1)
+    for batch_idx in np.flatnonzero(candidate_counts == 0):
+        start_x, start_y = starts[batch_idx]
+        xs = np.clip(np.arange(start_x - 5, start_x + 6), 0, height - 1)
+        ys = np.clip(np.arange(start_y - 5, start_y + 6), 0, width - 1)
+        candidate_masks[batch_idx, (xs[:, None] * width + ys[None, :]).ravel()] = True
+    candidate_counts = candidate_masks.sum(axis=1)
+
+    flat_entropy = entropy_maps.reshape(batch_size, -1)
+    entropy_weights = np.exp(flat_entropy / temperature) * candidate_masks
+    entropy_probs = entropy_weights / entropy_weights.sum(axis=1, keepdims=True)
+    uniform_probs = candidate_masks / candidate_counts[:, None]
+    sample_probs = (
+        uniform_ratio * uniform_probs
+        + (1.0 - uniform_ratio) * entropy_probs
+    )
+    sample_cdf = np.cumsum(sample_probs, axis=1)
+    sample_cdf[:, -1] = 1.0
+
+    iteration_count = max(int(max_iterations), 0)
+    if iteration_count:
+        random_values = np.random.random((batch_size, iteration_count))
+        sampled_flat_indices = np.sum(
+            sample_cdf[:, None, :] < random_values[:, :, None],
+            axis=-1,
+            dtype=np.int32,
         )
-        results.append(rrt.planning())
+        sampled_nodes = np.stack(
+            (sampled_flat_indices // width, sampled_flat_indices % width),
+            axis=-1,
+        ).astype(np.int32, copy=False)
+    else:
+        sampled_nodes = np.empty((batch_size, 0, 2), dtype=np.int32)
+
+    node_positions = np.zeros(
+        (batch_size, iteration_count + 1, 2), dtype=np.int32
+    )
+    node_values = np.full(
+        (batch_size, iteration_count + 1), -np.inf, dtype=np.float64
+    )
+    node_positions[:, 0] = starts
+    batch_rows = np.arange(batch_size)
+    node_values[:, 0] = local_entropy_maps[
+        batch_rows, starts[:, 0], starts[:, 1]
+    ]
+    node_counts = np.ones(batch_size, dtype=np.int32)
+
+    for iteration in range(iteration_count):
+        sampled = sampled_nodes[:, iteration]
+        visible_slots = iteration + 1
+        deltas = (
+            node_positions[:, :visible_slots].astype(np.float32)
+            - sampled[:, None, :]
+        )
+        squared_distances = np.sum(deltas * deltas, axis=-1)
+        valid_nodes = (
+            np.arange(visible_slots)[None, :] < node_counts[:, None]
+        )
+        squared_distances[~valid_nodes] = np.inf
+        nearest_indices = np.argmin(squared_distances, axis=1)
+        nearest = node_positions[batch_rows, nearest_indices]
+
+        steer_delta = sampled.astype(np.float32) - nearest.astype(np.float32)
+        steer_distance = np.sqrt(np.sum(steer_delta * steer_delta, axis=1))
+        active = steer_distance > 0.0
+        new_nodes = sampled.copy()
+        long_step = active & (steer_distance > expand_dis)
+        if np.any(long_step):
+            scaled_delta = (
+                expand_dis
+                * steer_delta[long_step]
+                / steer_distance[long_step, None]
+            )
+            # Python int() in the legacy implementation truncates towards zero.
+            new_nodes[long_step] = (
+                nearest[long_step].astype(np.float32) + scaled_delta
+            ).astype(np.int32)
+
+        active &= (
+            (new_nodes[:, 0] >= 0)
+            & (new_nodes[:, 0] < height)
+            & (new_nodes[:, 1] >= 0)
+            & (new_nodes[:, 1] < width)
+        )
+        active_rows = np.flatnonzero(active)
+        if active_rows.size == 0:
+            continue
+        insertion_slots = node_counts[active_rows]
+        node_positions[active_rows, insertion_slots] = new_nodes[active_rows]
+        node_values[active_rows, insertion_slots] = (
+            node_values[active_rows, nearest_indices[active_rows]]
+            + local_entropy_maps[
+                active_rows,
+                new_nodes[active_rows, 0],
+                new_nodes[active_rows, 1],
+            ]
+        )
+        node_counts[active_rows] += 1
+
+    results = np.empty((batch_size, top_k, 3), dtype=np.float32)
+    flat_local_entropy = local_entropy_maps.reshape(batch_size, -1)
+
+    # Finalization is a small per-tree loop so stable priority, de-duplication and
+    # fallback remain unchanged while all expensive grid/tree work stays batched.
+    for batch_idx in range(batch_size):
+        result = []
+        seen = set()
+
+        def add_point(x, y, value=None):
+            if len(result) >= top_k:
+                return
+            x = int(np.clip(x, 0, height - 1))
+            y = int(np.clip(y, 0, width - 1))
+            key = (x, y)
+            if key in seen:
+                return
+            seen.add(key)
+            if value is None:
+                value = local_entropy_maps[batch_idx, x, y]
+            result.append([x, y, float(value) / 1500.0])
+
+        count = int(node_counts[batch_idx])
+        node_order = np.argsort(
+            -node_values[batch_idx, :count], kind="stable"
+        )
+        for node_idx in node_order:
+            x, y = node_positions[batch_idx, node_idx]
+            add_point(x, y, node_values[batch_idx, node_idx])
+
+        if len(result) < top_k:
+            candidate_indices = np.flatnonzero(candidate_masks[batch_idx])
+            candidate_x = candidate_indices // width
+            candidate_y = candidate_indices % width
+            candidate_values = flat_local_entropy[
+                batch_idx, candidate_indices
+            ]
+            fallback_order = np.lexsort(
+                (-candidate_y, -candidate_x, -candidate_values)
+            )
+            for candidate_idx in fallback_order:
+                add_point(
+                    candidate_x[candidate_idx],
+                    candidate_y[candidate_idx],
+                    candidate_values[candidate_idx],
+                )
+                if len(result) >= top_k:
+                    break
+
+        max_unique_points = height * width
+        fallback_radius = 1
+        while len(result) < top_k:
+            before_count = len(result)
+            start_x, start_y = starts[batch_idx]
+            for dx in range(-fallback_radius, fallback_radius + 1):
+                for dy in range(-fallback_radius, fallback_radius + 1):
+                    add_point(start_x + dx, start_y + dy)
+                    if len(result) >= top_k:
+                        break
+                if len(result) >= top_k:
+                    break
+            fallback_radius += 1
+            if (
+                len(seen) >= max_unique_points
+                or (
+                    len(result) == before_count
+                    and fallback_radius > max(height, width) + 1
+                )
+            ):
+                break
+
+        while len(result) < top_k:
+            result.append(
+                result[-1].copy()
+                if result
+                else [int(starts[batch_idx, 0]), int(starts[batch_idx, 1]), 0.0]
+            )
+        results[batch_idx] = np.asarray(result, dtype=np.float32)
+
     return results
 
 

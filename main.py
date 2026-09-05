@@ -26,7 +26,7 @@ def train(args, return_early=False):
     print("state shape: ", env_state.shape)
     master.initialize_obs(obs)
     master.initialize_env_state(env_state)
-    master.envs_info = reset_info
+    master.set_envs_info(reset_info)
 
     n = len(master.all_agents)
     episode_rewards = torch.zeros([args.num_processes, n], device=args.device)
@@ -54,7 +54,7 @@ def train(args, return_early=False):
             ### 验证
             # print(f"Step {step} goal world coord: ", goals_list[0][0][0:2])
             # print(f"Step {step} obs sample: ", obs[0,0,2:4])  # 打印第一个环境的观测样本
-            master.envs_info = info
+            master.set_envs_info(info)
             high_reward = torch.from_numpy(np.stack(high_reward)).float().to(args.device)
             reward = torch.from_numpy(np.stack(reward)).float().to(args.device)
             episode_rewards += reward

@@ -184,12 +184,10 @@ class MultiAgentEnv(gym.Env):
         info_n['map'].append(centroids)
         info_n['map'].append(target_positions)
         # 将高层策略需要的通道图、是否达到目标点分别加入
-        info_n['belief_map'] = self.global_belief_map.belief_grid
         info_n['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         info_n['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agents_pos, self.agents_done)
         info_n['goal_done'] = self._get_goal_dones(self.agents)
         info_n['heatmap'] = self.global_belief_map.get_agents_heatmap(agents_pos,0.05)
-        info_n['landmark_heatmap'] = self.global_belief_map.landmark_heatmap
 
         # 碰撞惩罚、边界惩罚
         common_penaltie = self._compute_penaltie()
@@ -262,7 +260,6 @@ class MultiAgentEnv(gym.Env):
 
         # 将高层策略需要的通道图、是否达到目标点分别加入
         
-        reset_info['belief_map'] = self.global_belief_map.belief_grid
         reset_info['entropy_map'] = self.global_belief_map.compute_shannon_entropy()
         reset_info['voronoi_masks'] = self.global_belief_map.get_voronoi_region_masks(agent_positions)
         reset_info['heatmap'] = self.global_belief_map.get_agents_heatmap(agent_positions, 0.05)

@@ -639,45 +639,60 @@ class MPNN(nn.Module):
     def attn_dim(self):
         return 64
 
-    def get_explore_nodes(self, top_k, rrt_max_iter, vec_inp, map_inp, agent_indices=None, deterministic=False):
+    def get_explore_nodes(self, top_k, rrt_max_iter, vec_inp,
+                          entropy_maps, voronoi_masks,
+                          agent_indices=None, deterministic=False):
         """
         vec_inp: [Batch, num_agents, 4]，世界坐标：[x_pos, y_pos, x_goal, y_goal]
-        map_inp: [2, Batch, num_agents, H, W], (0: entropy, 1: voronoi_mask)
+        entropy_maps/voronoi_masks: CPU NumPy arrays. When agent_indices is set,
+          shape is [Batch, H, W]; otherwise shape is [Batch, num_agents, H, W].
         agent_indices: [N] 可选，仅在部分智能体更新时提供
         """
 
-        # 1. 通过RRT生成候选目标点
-        ## 输入vec_inp:[Batch, 2], map_inp:[2,Batch, H, W]
-        ## 输出候选目标点B_candidate:[Batch, K, 3]，离散栅格坐标
-        ### vec_inp转化为离散栅格坐标
-        B_pro = vec_inp.size(0) 
+        B_pro = vec_inp.size(0)
         if agent_indices is not None:
-            # agent_indices: [B_pro]
             batch_idx = torch.arange(B_pro, device=vec_inp.device)
-            
-            # [B_pro, num_agents, 4] -> [B_pro, 1, 4]
             update_nodes = vec_inp[batch_idx, agent_indices].unsqueeze(1)
-            
-            # [2, B_pro, num_agents, H, W] -> [B_pro, 1, H, W]
-            voronoi_np = map_inp[1, batch_idx, agent_indices].unsqueeze(1).detach().cpu().numpy().astype(bool)
-            entropy_np = map_inp[0, batch_idx, agent_indices].unsqueeze(1).detach().cpu().numpy().astype(np.float32)
+            entropy_np = np.asarray(entropy_maps, dtype=np.float32)[:, None]
+            voronoi_np = np.asarray(voronoi_masks, dtype=bool)[:, None]
         else:
             update_nodes = vec_inp
-            voronoi_np = map_inp[1].detach().cpu().numpy().astype(bool)
-            entropy_np = map_inp[0].detach().cpu().numpy().astype(np.float32)
+            entropy_np = np.asarray(entropy_maps, dtype=np.float32)
+            voronoi_np = np.asarray(voronoi_masks, dtype=bool)
 
-        B_agents = update_nodes.size(1) # 如果指定了indices，这里是1；否则是num_agents        
+        B_agents = update_nodes.size(1)
+        expected_prefix = (B_pro, B_agents)
+        if entropy_np.shape[:2] != expected_prefix or voronoi_np.shape[:2] != expected_prefix:
+            raise ValueError(
+                "RRT map batch shape does not match selected agents: {} vs {} / {}".format(
+                    expected_prefix, entropy_np.shape, voronoi_np.shape
+                )
+            )
 
-        # update_nodes: [B_pro, B_agents, 4] -> 选取位置部分 [B_pro*B_agents, 2]
-        starte_nodes = self._world_to_grid_torch(update_nodes.view(-1, update_nodes.size(2))[:, :2], H=100, W=100)  # [B_pro*B_agents, 2] 整数栅格坐标
-        voronoi_inp = voronoi_np.reshape(-1, voronoi_np.shape[-2], voronoi_np.shape[-1])  # [B_pro*B_agents, H, W]
-        entropy_inp = entropy_np.reshape(-1, entropy_np.shape[-2], entropy_np.shape[-1])  # [B_pro*B_agents, H, W]
-        
-        batch_rtt = plan_batch(starte_nodes, voronoi_inp, entropy_inp, max_iterations=rrt_max_iter, top_k=top_k)  # [B_pro*B_agents, K, 3]
-        batch_rtt = torch.tensor(batch_rtt, dtype=torch.float32, device=vec_inp.device).view(B_pro, B_agents, -1, 3)  # [B_pro, B_agents, K, 3]
+        height, width = entropy_np.shape[-2:]
+        start_nodes = self._world_to_grid_torch(
+            update_nodes.reshape(-1, update_nodes.size(-1))[:, :2],
+            H=height,
+            W=width,
+        ).cpu().numpy()
+        voronoi_inp = voronoi_np.reshape(-1, height, width)
+        entropy_inp = entropy_np.reshape(-1, height, width)
+
+        batch_rtt_np = plan_batch(
+            start_nodes,
+            voronoi_inp,
+            entropy_inp,
+            max_iterations=rrt_max_iter,
+            top_k=top_k,
+        )
+        batch_rtt = torch.from_numpy(batch_rtt_np).to(vec_inp.device).view(
+            B_pro, B_agents, top_k, 3
+        )
         
         ## 转为世界坐标
-        explore_nodes_world = self._grid_to_world_torch(batch_rtt[..., :2], H=100, W=100)  # [B_pro, B_agents, K, 2]
+        explore_nodes_world = self._grid_to_world_torch(
+            batch_rtt[..., :2], H=height, W=width
+        )  # [B_pro, B_agents, K, 2]
         
         # update_nodes: [B_pro, B_agents, 4]，前两维是 ego 的位置
         ego_positions = update_nodes[..., :2]  # [B_pro, B_agents, 2]

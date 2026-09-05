@@ -131,10 +131,49 @@ class Learner(object):
         self.device = args.device
         self.env = env
         self.envs_info = None
+        self.landmark_heatmap_cache = None
         self.high_level_interval = args.high_level_interval
 
         self.top_k = args.top_k
         self.rrt_max_iter = args.rrt_max_iter
+
+    def set_envs_info(self, envs_info):
+        """Store environment info and refresh reset-only landmark heatmaps."""
+        self.envs_info = envs_info
+        infos = list(envs_info) if isinstance(envs_info, (list, tuple)) else [envs_info]
+        heatmap_indices = [
+            index for index, info in enumerate(infos)
+            if 'landmark_heatmap' in info
+        ]
+
+        cache_needs_initialization = (
+            self.landmark_heatmap_cache is None
+            or self.landmark_heatmap_cache.size(0) != len(infos)
+        )
+        if cache_needs_initialization:
+            if len(heatmap_indices) != len(infos):
+                raise RuntimeError(
+                    "landmark_heatmap cache must be initialized from reset info"
+                )
+            heatmaps = np.stack([
+                np.asarray(info['landmark_heatmap'], dtype=np.float32)
+                for info in infos
+            ])
+            self.landmark_heatmap_cache = torch.from_numpy(heatmaps).to(self.device)
+            return
+
+        if heatmap_indices:
+            heatmaps = np.stack([
+                np.asarray(infos[index]['landmark_heatmap'], dtype=np.float32)
+                for index in heatmap_indices
+            ])
+            index_tensor = torch.as_tensor(
+                heatmap_indices, dtype=torch.long, device=self.device
+            )
+            heatmap_tensor = torch.from_numpy(heatmaps).to(self.device)
+            self.landmark_heatmap_cache.index_copy_(
+                0, index_tensor, heatmap_tensor
+            )
 
     @property
     def all_policies(self):
@@ -164,9 +203,7 @@ class Learner(object):
         for team, policy in zip(self.teams_list, self.policies_list):
             # concatenate all inputs
             all_obs = torch.cat([agent.rollouts.obs[step] for agent in team])
-            all_hidden = torch.cat([agent.rollouts.recurrent_hidden_states[step] for agent in team])
             all_masks = torch.cat([agent.rollouts.masks[step] for agent in team])
-            all_env_state = torch.cat([agent.rollouts.env_states[step] for agent in team]) # 实际上只需要其中一个agent的环境状态就够了，即all_env_state[:num_processes]
 
             # 默认采取之前的目标分配，[num_agents * num_processes, 2]，以及任务类型[num_agents * num_processes, 1]
             # 即使step=0时，也复制goals[-1]的值，保证goal有效
@@ -187,18 +224,26 @@ class Learner(object):
             env_dones = (episode_dones.sum(dim=1) == 0)  # [num_processes]，True表示该process的episode结束
 
             # ⭐ 构建Critic输入
-            entropy_maps = torch.stack([torch.from_numpy(np.array(info['entropy_map'])).float() 
-                                        for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
-            heatmaps = torch.stack([torch.from_numpy(np.array(info['heatmap'])).float() 
-                                    for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
-            landmark_heatmaps = torch.stack([torch.from_numpy(np.array(info['landmark_heatmap'])).float() 
-                                            for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
-            all_critic_map_inp = torch.stack([entropy_maps, heatmaps, landmark_heatmaps], dim=1)  # [num_processes, 3, H, W]
+            entropy_maps_np = np.stack([
+                np.asarray(info['entropy_map'], dtype=np.float32)
+                for info in self.envs_info
+            ])
+            heatmaps_np = np.stack([
+                np.asarray(info['heatmap'], dtype=np.float32)
+                for info in self.envs_info
+            ])
+            entropy_maps = torch.from_numpy(entropy_maps_np).to(self.device)
+            heatmaps = torch.from_numpy(heatmaps_np).to(self.device)
+            all_critic_map_inp = torch.stack([
+                entropy_maps, heatmaps, self.landmark_heatmap_cache
+            ], dim=1)
             
             # ⭐ 收集goal_done和battery信息
-            goal_done_list = [info['goal_done'] for info in self.envs_info]
-            goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)
-            has_high_decisions = bool(goal_done_mask.any())
+            goal_done_np = np.asarray([
+                info['goal_done'] for info in self.envs_info
+            ], dtype=bool)
+            goal_done_mask = torch.from_numpy(goal_done_np).to(self.device)
+            has_high_decisions = bool(goal_done_np.any())
             agent_world_steps = torch.tensor(
                 [info['world_steps'] for info in self.envs_info], 
                 dtype=torch.float32, 
@@ -207,8 +252,10 @@ class Learner(object):
             agent_batterys = (50.0 - agent_world_steps) / 50.0
 
             # ⭐ 生成landmark节点
-            detected_maps = [torch.from_numpy(np.array(info['map'][1])).float().to(self.device) 
-                            for info in self.envs_info] # num_processes list of Tensor [num_detected, 2]
+            detected_maps = [
+                np.asarray(info['map'][1], dtype=np.float32).reshape(-1, 2)
+                for info in self.envs_info
+            ]
             new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, 
                                                                          all_landmark_masks, 
                                                                          detected_maps, 
@@ -219,12 +266,10 @@ class Learner(object):
 
 
             # ⭐ 准备智能体节点数据
-            agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)
-            voronoi_masks = torch.stack([
-                torch.stack([torch.from_numpy(np.array(info['voronoi_masks'][a])).float() 
-                            for a in range(num_agents)]) 
+            voronoi_masks_np = np.stack([
+                np.asarray(info['voronoi_masks'], dtype=bool)
                 for info in self.envs_info
-            ]).to(self.device)
+            ])
             agent_positions = all_obs[:, 2:4].view(num_agents, num_processes, 2).transpose(0, 1)
             agent_vels = all_obs[:, 0:2].view(num_agents, num_processes, 2).transpose(0, 1)
             agent_goals = all_goals.view(num_agents, num_processes, 2).transpose(0, 1)
@@ -247,14 +292,12 @@ class Learner(object):
 
             # ⭐ 高层决策（如果需要）
             if has_high_decisions:
-                update_indices = torch.nonzero(goal_done_mask, as_tuple=False)
+                update_indices_np = np.argwhere(goal_done_np)
+                update_indices = torch.from_numpy(update_indices_np).to(self.device)
                 proc_indices = update_indices[:, 0]
                 agent_indices = update_indices[:, 1]
-                
-                map_inps = torch.stack([
-                    agent_entropy_maps[proc_indices],
-                    voronoi_masks[proc_indices]
-                ], dim=0)
+                proc_indices_np = update_indices_np[:, 0]
+                agent_indices_np = update_indices_np[:, 1]
                 vec_inp_agents = agent_nodes[proc_indices] # [N, A, 4]
 
                 # ⭐ 生成队友节点
@@ -270,7 +313,14 @@ class Learner(object):
                 batch_teammate_masks[batch_indices, agent_indices, 0] = 0.0
                 
                 # ⭐ RRT生成探索节点，# [B_pro(N), B_agents(1), K, 4]
-                batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)
+                batch_explore_nodes = policy.get_explore_nodes(
+                    self.top_k,
+                    self.rrt_max_iter,
+                    vec_inp_agents,
+                    entropy_maps_np[proc_indices_np],
+                    voronoi_masks_np[proc_indices_np, agent_indices_np],
+                    agent_indices,
+                )
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])
                 # batch_explore_nodes: Tensor shape [N, K, 4]
                 
@@ -307,33 +357,34 @@ class Learner(object):
                 all_tasks[linear_indices] = batch_goals["action_modes"]
                 all_higoal_log_probs[linear_indices] = batch_goals["node_log_probs"]
                 
-                for i, lin_idx in enumerate(linear_indices):
-                    if batch_goals["action_modes"][i, 0] == 1:  # 选择的是 landmark
-                        # 获取选中的 waypoint（绝对世界坐标）
-                        selected_waypoint = batch_goals["waypoints"][i]  # [2]
-                        
-                        # 在对应的 landmark 列表中找到匹配的 landmark
-                        landmarks = new_detected[lin_idx]  # [max_landmarks, 4]
-                        landmark_mask = new_detected_masks[lin_idx]  # [max_landmarks, 1]
-                        
-                        # 找到有效的 landmark
-                        valid_mask = landmark_mask[:, 0] > 0.5
-                        if valid_mask.any():
-                            # 计算距离（使用绝对坐标）
-                            landmark_positions = landmarks[:, :2]  # [max_landmarks, 2]
-                            distances = torch.norm(landmark_positions - selected_waypoint, dim=1)  # [max_landmarks]
-                            distances = distances.masked_fill(~valid_mask, float('inf'))
-                            
-                            # 找到最近的 landmark
-                            min_idx = distances.argmin()
-                            if distances[min_idx] < 0.05:  # 匹配阈值 0.05
-                                new_detected[:, min_idx, 3] = 1.0  # 设置 is_targeted = 1
-                                # ⭐ 修复：只更新当前环境(process)中所有智能体的 landmark 状态
-                                # lin_idx = agent_idx * num_processes + proc_idx
-                                current_proc_idx = lin_idx % num_processes
-                                # 获取该环境所有智能体的索引: [proc_idx, proc_idx+P, proc_idx+2P, ...]
-                                process_agent_indices = torch.arange(current_proc_idx, new_detected.shape[0], num_processes)
-                                new_detected[process_agent_indices, min_idx, 3] = 1.0
+                decision_landmarks = new_detected[linear_indices]
+                decision_landmark_masks = new_detected_masks[
+                    linear_indices, :, 0
+                ] > 0.5
+                selected_distances = torch.linalg.vector_norm(
+                    decision_landmarks[:, :, :2]
+                    - batch_goals["waypoints"][:, None, :],
+                    dim=-1,
+                ).masked_fill(~decision_landmark_masks, float('inf'))
+                selected_min_distance, selected_slots = selected_distances.min(dim=1)
+                selected_landmark_rows = (
+                    (batch_goals["action_modes"][:, 0] == 1)
+                    & (selected_min_distance < 0.05)
+                )
+                selected_processes = proc_indices[selected_landmark_rows]
+                selected_slots = selected_slots[selected_landmark_rows]
+                selected_count = selected_processes.size(0)
+                broadcast_agents = torch.arange(
+                    num_agents, device=self.device
+                )[:, None].expand(-1, selected_count).reshape(-1)
+                broadcast_processes = selected_processes.repeat(num_agents)
+                broadcast_slots = selected_slots.repeat(num_agents)
+                broadcast_linear_indices = (
+                    broadcast_agents * num_processes + broadcast_processes
+                )
+                new_detected[
+                    broadcast_linear_indices, broadcast_slots, 3
+                ] = 1.0
                 
                 # 更新所有智能体的 landmark 数据
                 all_landmark_datas = new_detected
@@ -445,174 +496,133 @@ class Learner(object):
     
     def update_landmark_info(self,prev_landmark_data, prev_landmark_mask, detected_map_list, device, env_dones = None, match_threshold=0.1, cleanup_threshold=0.06):
         """
-        更新地标信息，结合之前的地标数据和当前检测到的地图信息。
-        ⭐ 新增：自动清理与当前detected_map不一致的旧landmark
-        
-        参数:
-        - prev_landmark_data: 上一步的地标数据，形状为 [num_agents * num_processes, max_landmarks, 4]
-          每个 landmark 包含: [x, y, utility, is_targeted]
-        - prev_landmark_mask: 上一步的地标掩码，形状为 [num_agents * num_processes, max_landmarks, 1]
-          1 表示有效，0 表示空槽位
-        - detected_map_list: list of torch.Tensor, 长度为 num_processes
-          每个元素形状为 [num_detected, 2]，num_detected 可能不同
-        - device: 设备（CPU 或 GPU）
-        - match_threshold: landmark 匹配的距离阈值
-        - cleanup_threshold: 清理旧landmark的距离阈值（如果landmark与所有detected点的距离都超过此值，则移除）
-        - env_dones: Tensor shape [num_processes]，表示哪些process的episode结束
-        
-        返回:
-        - updated_landmark_data: 更新后的地标数据，形状同 prev_landmark_data[num_agents * num_processes, max_landmarks, 4]
-        - updated_landmark_mask: 更新后的地标掩码，形状同 prev_landmark_mask[num_agents * num_processes, max_landmarks, 1]
+        Batch landmark cleanup/matching while preserving detection order.
+
+        Landmark state is agent-major. Agent 0 owns the shared state for each
+        process; the final result is broadcast to every teammate in one operation.
         """
-        # 1. 深拷贝上一步的数据
-        updated_landmark_data = prev_landmark_data.clone()
-        updated_landmark_mask = prev_landmark_mask.clone()
-        
-        # 2. 解析形状信息
         num_agents_processes, max_landmarks, _ = prev_landmark_data.shape
         num_processes = len(detected_map_list)
+        if num_processes == 0:
+            return prev_landmark_data.clone(), prev_landmark_mask.clone()
+        if num_agents_processes % num_processes != 0:
+            raise ValueError("landmark batch is not divisible by num_processes")
         num_agents = num_agents_processes // num_processes
+        target_device = prev_landmark_data.device
 
-        # 3. 处理 episode 结束的 process，清空其 landmark 数据
-        if env_dones is not None and env_dones.any():
-            # 使用广播机制一次性处理所有完成的 episodes
-            # env_dones: [num_processes]，True 表示该 process 的 episode 结束
-            
-            # 生成需要清空的索引：对于 done 的 process，所有 agent 都需要清空
-            # 使用 meshgrid 创建索引
-            proc_indices = torch.arange(num_processes, device=self.device)[env_dones]
-            agent_indices = torch.arange(num_agents, device=self.device)
-            
-            # 生成笛卡尔积索引 [num_done_procs * num_agents]
-            proc_mesh, agent_mesh = torch.meshgrid(proc_indices, agent_indices, indexing='ij')
-            linear_indices = agent_mesh.flatten() * num_processes + proc_mesh.flatten()
-            
-            # 一次性清空所有需要重置的 landmark 数据
-            updated_landmark_mask[linear_indices, :, 0] = 0.0
-            updated_landmark_data[linear_indices, :, :] = 0.0
-        
-        
-        # 4. 遍历每个 process，更新对应的 landmark 数据
-        for proc_idx, detected_map in enumerate(detected_map_list):
-            # detected_map: [num_detected, 2]，可能为空 [0, 2]
-            num_detected = detected_map.shape[0]
-            
-            # 线性索引 = agent_idx * num_processes + proc_idx
-            # 对于第一个智能体（agent_idx=0），线性索引 = proc_idx
-            linear_idx = proc_idx  # 假设团队共享，使用第一个智能体的索引
-            
-            # 获取该智能体当前的 landmarks
-            current_landmarks = updated_landmark_data[linear_idx]  # [max_landmarks, 4]
-            current_mask = updated_landmark_mask[linear_idx]  # [max_landmarks, 1]
-            
-            # ========== 清理逻辑 ==========
-            # 如果detected_map为空（例如环境reset后），清空所有landmark
-            if num_detected == 0:
-                updated_landmark_mask[linear_idx, :, 0] = 0.0
-                updated_landmark_data[linear_idx, :, :] = 0.0  # is_targeted也清0
-                continue
-            
-            # 标记哪些旧landmark需要保留（即与detected_map中某个点距离<cleanup_threshold）
-            valid_landmarks_indices = []
-            for lm_idx in range(max_landmarks):
-                if current_mask[lm_idx, 0] < 0.5:
-                    continue  # 该槽位本身就是空的，跳过
-                
-                lm_pos = current_landmarks[lm_idx, :2]  # [2]
-                # 计算到所有detected点的距离
-                distances_to_detected = torch.norm(detected_map - lm_pos.unsqueeze(0), dim=1)  # [num_detected]
-                min_dist = distances_to_detected.min()
-                
-                # 如果最近距离超过cleanup_threshold，说明这个landmark已经不存在了，移除
-                if min_dist > cleanup_threshold:
-                    updated_landmark_mask[linear_idx, lm_idx, 0] = 0.0
-                    updated_landmark_data[linear_idx, lm_idx, 3] = 0.0
-                else:
-                    valid_landmarks_indices.append(lm_idx)
-            
-            # ========== 匹配或新增 landmark ==========
-            for det_pos in detected_map:  # det_pos: [2]
-                # 6.1 查找是否匹配现有 landmark
-                matched_idx = self._find_landmark_match(det_pos, current_landmarks, 
-                    current_mask, match_threshold)
-                
-                if matched_idx is not None:
-                    # 6.2 更新已存在的 landmark位置为新旧位置的加权平均（更倾向新位置）
-                    old_pos = updated_landmark_data[linear_idx, matched_idx, 0:2]
-                    updated_landmark_data[linear_idx, matched_idx, 0:2] = 0.3 * old_pos + 0.7 * det_pos  # 70%新位置
-                    # utility 和 is_targeted 保持不变，后续统一更新
-                else:
-                    # 6.3 寻找空闲槽位添加新 landmark
-                    empty_idx = self._find_empty_slot(updated_landmark_mask[linear_idx])
-                    
-                    if empty_idx is not None:
-                        updated_landmark_data[linear_idx, empty_idx, 0:2] = det_pos  # x, y
-                        updated_landmark_data[linear_idx, empty_idx, 2] = 2.0  # utility
-                        updated_landmark_data[linear_idx, empty_idx, 3] = 0.0  # is_targeted
-                        updated_landmark_mask[linear_idx, empty_idx, 0] = 1.0  # 激活该槽位
-                    else:
-                        # 没有空闲槽位，跳过（可以打印警告）
-                        print(f"Warning: No empty slot for new landmark at process {proc_idx}")
+        detected_arrays = []
+        for detected_map in detected_map_list:
+            detected_array = np.asarray(detected_map, dtype=np.float32).reshape(-1, 2)
+            detected_arrays.append(detected_array)
+        max_detected = max(array.shape[0] for array in detected_arrays)
+        padded_detected = np.zeros(
+            (num_processes, max_detected, 2), dtype=np.float32
+        )
+        detected_valid_np = np.zeros(
+            (num_processes, max_detected), dtype=bool
+        )
+        for process_idx, detected_array in enumerate(detected_arrays):
+            count = detected_array.shape[0]
+            padded_detected[process_idx, :count] = detected_array
+            detected_valid_np[process_idx, :count] = True
 
-            # ==================== 7. 广播给该 process 的所有智能体 ====================
-            # 将更新后的 landmark 数据复制给该 process 的其他智能体
-            for agent_idx in range(1, num_agents):
-                broadcast_linear_idx = agent_idx * num_processes + proc_idx
-                updated_landmark_data[broadcast_linear_idx] = updated_landmark_data[linear_idx].clone()
-                updated_landmark_mask[broadcast_linear_idx] = updated_landmark_mask[linear_idx].clone()
-        
+        detected = torch.from_numpy(padded_detected).to(target_device)
+        detected_valid = torch.from_numpy(detected_valid_np).to(target_device)
+        process_rows = torch.arange(num_processes, device=target_device)
+
+        team_data = prev_landmark_data[:num_processes].clone()
+        team_valid = prev_landmark_mask[:num_processes, :, 0] > 0.5
+        if env_dones is None:
+            done_mask = torch.zeros(
+                num_processes, dtype=torch.bool, device=target_device
+            )
+        else:
+            done_mask = torch.as_tensor(
+                env_dones, dtype=torch.bool, device=target_device
+            )
+        team_data = team_data.masked_fill(done_mask[:, None, None], 0.0)
+        team_valid &= ~done_mask[:, None]
+
+        if max_detected:
+            cleanup_distances = torch.cdist(team_data[:, :, :2], detected)
+            cleanup_distances = cleanup_distances.masked_fill(
+                ~detected_valid[:, None, :], float('inf')
+            )
+            retained = team_valid & (
+                cleanup_distances.min(dim=-1).values <= cleanup_threshold
+            )
+        else:
+            retained = torch.zeros_like(team_valid)
+
+        removed = team_valid & ~retained
+        team_data[:, :, 3] = torch.where(
+            removed,
+            torch.zeros_like(team_data[:, :, 3]),
+            team_data[:, :, 3],
+        )
+        team_valid = retained
+
+        no_detections = ~detected_valid.any(dim=1)
+        team_data = team_data.masked_fill(no_detections[:, None, None], 0.0)
+
+        # Detection order is semantically significant because a newly inserted
+        # landmark can match a later detection. Only this short dimension loops.
+        for detection_idx in range(max_detected):
+            detection_position = detected[:, detection_idx]
+            active_detection = detected_valid[:, detection_idx]
+            distances = torch.linalg.vector_norm(
+                team_data[:, :, :2] - detection_position[:, None, :], dim=-1
+            )
+            distances = distances.masked_fill(~team_valid, float('inf'))
+            min_distance, matched_slot = distances.min(dim=1)
+            matched = active_detection & (min_distance < match_threshold)
+
+            old_position = team_data[process_rows, matched_slot, :2]
+            blended_position = (
+                0.3 * old_position + 0.7 * detection_position
+            )
+            team_data[process_rows, matched_slot, :2] = torch.where(
+                matched[:, None], blended_position, old_position
+            )
+
+            empty_slots = ~team_valid
+            has_empty_slot = empty_slots.any(dim=1)
+            first_empty_slot = empty_slots.to(torch.int64).argmax(dim=1)
+            inserted = active_detection & ~matched & has_empty_slot
+            old_landmark = team_data[process_rows, first_empty_slot]
+            new_landmark = torch.cat([
+                detection_position,
+                torch.full(
+                    (num_processes, 1), 2.0,
+                    dtype=team_data.dtype,
+                    device=target_device,
+                ),
+                torch.zeros(
+                    (num_processes, 1),
+                    dtype=team_data.dtype,
+                    device=target_device,
+                ),
+            ], dim=1)
+            team_data[process_rows, first_empty_slot] = torch.where(
+                inserted[:, None], new_landmark, old_landmark
+            )
+            team_valid[process_rows, first_empty_slot] |= inserted
+
+        updated_landmark_data = (
+            team_data.unsqueeze(0)
+            .expand(num_agents, -1, -1, -1)
+            .reshape(num_agents_processes, max_landmarks, 4)
+            .clone()
+        )
+        updated_landmark_mask = (
+            team_valid.to(prev_landmark_mask.dtype)
+            .unsqueeze(0)
+            .unsqueeze(-1)
+            .expand(num_agents, -1, -1, -1)
+            .reshape(num_agents_processes, max_landmarks, 1)
+            .clone()
+        )
         return updated_landmark_data.to(device), updated_landmark_mask.to(device)
-
-    def _find_landmark_match(self, position, landmarks_data, landmarks_mask, threshold):
-        """
-        在张量中查找匹配的 landmark
-        
-        参数:
-        - position: [2] 检测到的位置
-        - landmarks_data: [max_landmarks, 4] landmark 数据
-        - landmarks_mask: [max_landmarks, 1] 有效性掩码
-        - threshold: 匹配阈值
-        
-        返回:
-        - matched_idx: int or None
-        """
-        # 只考虑有效的 landmarks
-        valid_mask = landmarks_mask[:, 0] > 0.5  # [max_landmarks]
-        
-        if not valid_mask.any():
-            return None
-        
-        # 计算距离
-        landmark_positions = landmarks_data[:, 0:2]  # [max_landmarks, 2]
-        distances = torch.norm(landmark_positions - position.unsqueeze(0), dim=1)  # [max_landmarks]
-        
-        # 对无效的 landmark 设置为无穷大
-        distances = distances.masked_fill(~valid_mask, float('inf'))
-        
-        # 找到最近的 landmark
-        min_dist, min_idx = distances.min(dim=0)
-        
-        if min_dist < threshold:
-            return min_idx.item()
-        
-        return None
-
-    def _find_empty_slot(self, landmarks_mask):
-        """
-        查找第一个空闲槽位
-        
-        参数:
-        - landmarks_mask: [max_landmarks, 1] 有效性掩码
-        
-        返回:
-        - empty_idx: int or None
-        """
-        empty_mask = landmarks_mask[:, 0] < 0.5  # [max_landmarks]
-        
-        if empty_mask.any():
-            return empty_mask.nonzero(as_tuple=False)[0].item()
-        
-        return None
     
     def wrap_horizon(self):
         # 需要根据最后一步的obs计算next_value，然后传入每个agent的rollout中，因为目的是计算GAE，而GAE的每一步return都需要用到下一步的value
@@ -620,7 +630,6 @@ class Learner(object):
         for team, policy in zip(self.teams_list,self.policies_list):
             last_obs = torch.cat([agent.rollouts.obs[-1] for agent in team])
             last_masks = torch.cat([agent.rollouts.masks[-1] for agent in team])
-            last_env_state = torch.cat([agent.rollouts.env_states[-1] for agent in team])
 
             # 默认采取之前的目标分配，[num_agents * num_processes, 2]
             last_goals = torch.cat([agent.rollouts.goals[-1] for agent in team])
@@ -640,18 +649,25 @@ class Learner(object):
             env_dones = (episode_dones.sum(dim=1) == 0)  # [num_processes]，True表示该process的episode结束
 
             # 1. 批量构建 critic map input 和 critic vec input
-            entropy_maps = torch.stack([torch.from_numpy(np.array(info['entropy_map'])).float() 
-                                        for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
-            heatmaps = torch.stack([torch.from_numpy(np.array(info['heatmap'])).float() 
-                                    for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
-            landmark_heatmaps = torch.stack([torch.from_numpy(np.array(info['landmark_heatmap'])).float() 
-                                            for info in self.envs_info]).to(self.device)  # [num_processes, H, W]
-
-            all_critic_map_inp = torch.stack([entropy_maps, heatmaps, landmark_heatmaps], dim=1)  # [num_processes, 3, H, W]
+            entropy_maps_np = np.stack([
+                np.asarray(info['entropy_map'], dtype=np.float32)
+                for info in self.envs_info
+            ])
+            heatmaps_np = np.stack([
+                np.asarray(info['heatmap'], dtype=np.float32)
+                for info in self.envs_info
+            ])
+            entropy_maps = torch.from_numpy(entropy_maps_np).to(self.device)
+            heatmaps = torch.from_numpy(heatmaps_np).to(self.device)
+            all_critic_map_inp = torch.stack([
+                entropy_maps, heatmaps, self.landmark_heatmap_cache
+            ], dim=1)
 
             # 2. 收集所有 goal_done 状态并构建mask
-            goal_done_list = [info['goal_done'] for info in self.envs_info]  # list of lists
-            goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)  # [num_processes, num_agents]
+            goal_done_np = np.asarray([
+                info['goal_done'] for info in self.envs_info
+            ], dtype=bool)
+            has_high_decisions = bool(goal_done_np.any())
             # 收集当前的 world_step 信息，并广播为 [num_processes, num_agents, 1] 的张量
             agent_world_steps = torch.tensor(
                 [info['world_steps'] for info in self.envs_info], 
@@ -662,20 +678,20 @@ class Learner(object):
             agent_batterys = (50.0 - agent_world_steps) / 50.0  # [num_processes, num_agents, 1]
 
             # 3. 批量生成 landmark node
-            detected_maps = [torch.from_numpy(np.array(info['map'][1])).float().to(self.device) 
-                            for info in self.envs_info] # [num_processes, x, 2], 不规则形状，每个 process 检测到的目标数量不同
+            detected_maps = [
+                np.asarray(info['map'][1], dtype=np.float32).reshape(-1, 2)
+                for info in self.envs_info
+            ]
             
             new_detected, new_detected_masks = self.update_landmark_info(all_landmark_datas, all_landmark_masks, detected_maps, self.device, env_dones) 
             # [num_agents * num_processes, max_landmarks, 4], [num_agents * num_processes, max_landmarks, 1]
 
             # 4. 批量通过RTT生成K个候选目标点
             ## 生成两张地图
-            agent_entropy_maps = entropy_maps.unsqueeze(1).repeat(1, num_agents, 1, 1)  # [num_processes, num_agents, H, W]
-            voronoi_masks = torch.stack([
-                torch.stack([torch.from_numpy(np.array(info['voronoi_masks'][a])).float() 
-                            for a in range(num_agents)]) 
+            voronoi_masks_np = np.stack([
+                np.asarray(info['voronoi_masks'], dtype=bool)
                 for info in self.envs_info
-            ]).to(self.device)  # [num_processes, num_agents, H, W]   
+            ])
 
             ## 从all_obs批量生成智能体信息（栅格索引） [num_processes, num_agents, 2]
             agent_positions = last_obs[:, 2:4].view(num_agents, num_processes, 2).transpose(0, 1) # 位置[num_processes, num_agents, 2]
@@ -692,18 +708,16 @@ class Learner(object):
             # Global mask from last_masks
             global_teammate_mask = last_masks.view(num_agents, num_processes).t().unsqueeze(-1) # [P, A, 1]
 
-            if goal_done_mask.any():
+            if has_high_decisions:
                 # 获取需要更新的索引 (process_idx, agent_idx)
-                update_indices = torch.nonzero(goal_done_mask, as_tuple=False)  # [N, 2] where N is number of True values
+                update_indices_np = np.argwhere(goal_done_np)
+                update_indices = torch.from_numpy(update_indices_np).to(self.device)
                 
                 # 选择需要更新的智能体所在环境输入
                 proc_indices = update_indices[:, 0]
                 agent_indices = update_indices[:, 1]
-                
-                map_inps = torch.stack([
-                    agent_entropy_maps[proc_indices],
-                    voronoi_masks[proc_indices]
-                ], dim=0)  # [2, N, num_agents, H, W]
+                proc_indices_np = update_indices_np[:, 0]
+                agent_indices_np = update_indices_np[:, 1]
                 
                 vec_inp_agents = agent_nodes[proc_indices]  # [N, num_agents, 4]
 
@@ -716,7 +730,14 @@ class Learner(object):
                 batch_teammate_masks[batch_indices, agent_indices, 0] = 0.0
 
                 # 4.2 通过RTT生成候选探索点
-                batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
+                batch_explore_nodes = policy.get_explore_nodes(
+                    self.top_k,
+                    self.rrt_max_iter,
+                    vec_inp_agents,
+                    entropy_maps_np[proc_indices_np],
+                    voronoi_masks_np[proc_indices_np, agent_indices_np],
+                    agent_indices,
+                )
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])  # [B_pro*B_agents, K, 4]
                 # 4.3 ego nodes
                 batch_ego_nodes = ego_nodes[proc_indices, agent_indices]  # [N, 5]
@@ -816,14 +837,19 @@ class Learner(object):
 
             obs_tensor = torch.cat(obs, dim=0).to(self.device) # [num_agents, obs_dim]
 
-            # 1.1. 构建 entropy_map, heatmap, landmark_heatmap
-            entropy_map = torch.from_numpy(np.array(self.envs_info['entropy_map'])).float().unsqueeze(0).to(self.device)  # [1, H, W]
-            heatmap = torch.from_numpy(np.array(self.envs_info['heatmap'])).float().unsqueeze(0).to(self.device)  # [1, H, W]
-            landmark_heatmap = torch.from_numpy(np.array(self.envs_info['landmark_heatmap'])).float().unsqueeze(0).to(self.device)  # [1, H, W]
+            # Evaluation only needs the CPU maps used by RRT; no critic is run here.
+            entropy_map_np = np.asarray(
+                self.envs_info['entropy_map'], dtype=np.float32
+            )[None]
+            voronoi_masks_np = np.asarray(
+                self.envs_info['voronoi_masks'], dtype=bool
+            )[None]
 
             # 1.2. 收集所有 goal_done 状态并构建mask
-            goal_done_list = [self.envs_info['goal_done']]  # ✅ 包装成列表
-            goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)  # [1, num_agents]   
+            goal_done_np = np.asarray(
+                [self.envs_info['goal_done']], dtype=bool
+            )
+            has_high_decisions = bool(goal_done_np.any())
 
             # 1.3. 收集当前的 world_step 信息，并广播为 [1, num_agents, 1] 的张量
             agent_world_steps = torch.tensor(
@@ -835,7 +861,9 @@ class Learner(object):
             agent_batterys = (50.0 - agent_world_steps) / 50.0  # [1, num_agents, 1]
 
             # 1.4. 收集 landmark data 和 mask
-            detected_map = torch.from_numpy(np.array(self.envs_info['map'][1])).float().to(self.device)
+            detected_map = np.asarray(
+                self.envs_info['map'][1], dtype=np.float32
+            ).reshape(-1, 2)
 
             new_detected, new_detected_masks = self.update_landmark_info(
                 landmark_data, 
@@ -845,13 +873,6 @@ class Learner(object):
             )  # [num_agents * 1, max_landmarks, 4], [num_agents * 1, max_landmarks, 1]
 
             # 2. 生成动态异构图结构的节点表示
-            # 2.1. 输入准备，包括地图输入和向量输入
-            agent_entropy_map = entropy_map.unsqueeze(1).repeat(1, num_agents, 1, 1) # [num_processes, num_agents, H, W]
-            voronoi_masks = torch.stack([
-                torch.from_numpy(np.array(self.envs_info['voronoi_masks'][a])).float()
-                for a in range(num_agents)
-            ]).unsqueeze(0).to(self.device)  # [1, num_agents, H, W]
-
             ## 从all_obs批量生成智能体信息（栅格索引） [num_processes, num_agents, 2]
             agent_positions = obs_tensor[:, 2:4].view(1, num_agents, 2) # 位置[1, num_agents, 2]
             agent_vels = obs_tensor[:, 0:2].view(1, num_agents, 2)      # 速度[1, num_agents, 2]
@@ -867,18 +888,16 @@ class Learner(object):
             # Global mask (all alive in eval)
             global_teammate_mask = masks.view(num_agents, 1).t().unsqueeze(-1) # [1, A, 1]
 
-            if goal_done_mask.any():
+            if has_high_decisions:
                 # 获取需要更新的索引 (process_idx, agent_idx)
-                update_indices = torch.nonzero(goal_done_mask, as_tuple=False)  # [N, 2] where N is number of True values
+                update_indices_np = np.argwhere(goal_done_np)
+                update_indices = torch.from_numpy(update_indices_np).to(self.device)
                    
                 # 只选择需要更新的智能体
                 proc_indices = update_indices[:, 0]
                 agent_indices = update_indices[:, 1]
-                
-                map_inps = torch.stack([
-                    agent_entropy_map[proc_indices],
-                    voronoi_masks[proc_indices],
-                ], dim=0)  # [2, N, num_agents, H, W]
+                proc_indices_np = update_indices_np[:, 0]
+                agent_indices_np = update_indices_np[:, 1]
                 
                 vec_inp_agents = agent_nodes[proc_indices]  # [N, num_agents, 4]
 
@@ -891,7 +910,14 @@ class Learner(object):
                 batch_teammate_masks[batch_indices, agent_indices, 0] = 0.0
 
                 # 2.2. 通过RTT生成候选探索点
-                batch_explore_nodes = policy.get_explore_nodes(self.top_k, self.rrt_max_iter, vec_inp_agents, map_inps, agent_indices)  # [B_pro, B_agents, K, 4]
+                batch_explore_nodes = policy.get_explore_nodes(
+                    self.top_k,
+                    self.rrt_max_iter,
+                    vec_inp_agents,
+                    entropy_map_np[proc_indices_np],
+                    voronoi_masks_np[proc_indices_np, agent_indices_np],
+                    agent_indices,
+                )
                 batch_explore_nodes = batch_explore_nodes.reshape(-1, batch_explore_nodes.shape[-2], batch_explore_nodes.shape[-1])  # [B_pro*B_agents, K, 4]
                 # 2.3. ego nodes
                 batch_ego_nodes = ego_nodes[proc_indices, agent_indices]  # [N, 5]
@@ -933,32 +959,27 @@ class Learner(object):
                 all_goals[linear_indices] = batch_goals["waypoints"]  # [N, 2] 转换为float
                 all_tasks[linear_indices] = batch_goals["action_modes"]  # [N, 1] 转换为float
 
-                # 4.3. 更新 landmark data 和 mask
-                # 如果智能体选择的任务是 landmark，则更新对应 landmark 的 is_targeted 属性
-                for i, lin_idx in enumerate(linear_indices):
-                    if batch_goals["action_modes"][i, 0] == 1:  # 选择的是 landmark
-                        # 获取选中的 waypoint（绝对世界坐标）
-                        selected_waypoint = batch_goals["waypoints"][i]  # [2]
-                        
-                        # 在对应的 landmark 列表中找到匹配的 landmark
-                        landmarks = new_detected[lin_idx]  # [max_landmarks, 4]
-                        landmark_mask = new_detected_masks[lin_idx]  # [max_landmarks, 1]
-                        
-                        # 找到有效的 landmark
-                        valid_mask = landmark_mask[:, 0] > 0.5
-                        if valid_mask.any():
-                            # 计算距离（使用绝对坐标）
-                            landmark_positions = landmarks[:, :2]  # [max_landmarks, 2]
-                            distances = torch.norm(landmark_positions - selected_waypoint, dim=1)  # [max_landmarks]
-                            distances = distances.masked_fill(~valid_mask, float('inf'))
-                            
-                            # 找到最近的 landmark
-                            min_idx = distances.argmin()
-                            if distances[min_idx] < 0.05:  # 匹配阈值 0.05
-                                # new_detected[lin_idx, min_idx, 3] = 1.0  # 设置 is_targeted = 1
-                                # 所有agent的障碍物is_targeted同步更新
-                                # 在 eval 模式下 num_processes=1，[:] 是安全的，但为了逻辑统一：
-                                new_detected[:, min_idx, 3] = 1.0
+                decision_landmarks = new_detected[linear_indices]
+                decision_landmark_masks = new_detected_masks[
+                    linear_indices, :, 0
+                ] > 0.5
+                selected_distances = torch.linalg.vector_norm(
+                    decision_landmarks[:, :, :2]
+                    - batch_goals["waypoints"][:, None, :],
+                    dim=-1,
+                ).masked_fill(~decision_landmark_masks, float('inf'))
+                selected_min_distance, selected_slots = selected_distances.min(dim=1)
+                selected_rows = (
+                    (batch_goals["action_modes"][:, 0] == 1)
+                    & (selected_min_distance < 0.05)
+                )
+                selected_slots = selected_slots[selected_rows]
+                selected_count = selected_slots.size(0)
+                target_agents = torch.arange(
+                    num_agents, device=self.device
+                )[:, None].expand(-1, selected_count).reshape(-1)
+                target_slots = selected_slots.repeat(num_agents)
+                new_detected[target_agents, target_slots, 3] = 1.0
                 
                 # 更新所有智能体的 landmark_data 和 landmark_mask
                 landmark_data = new_detected

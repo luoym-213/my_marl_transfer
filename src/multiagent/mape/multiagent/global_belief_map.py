@@ -119,6 +119,9 @@ class GlobalBeliefMap:
             for lx, ly in self.landmark_positions:
                 dist_sq = (self.cell_world_x - lx)**2 + (self.cell_world_y - ly)**2
                 self.landmark_map |= (dist_sq <= self.landmark_radius**2)
+            # Landmark positions are randomized at episode reset. Recompute this
+            # static-per-episode channel once, then let the learner cache it.
+            self.landmark_heatmap = self.get_landmarks_heatmap()
 
     def world_to_grid(self, world_pos):
         """将世界坐标转换为栅格索引"""
