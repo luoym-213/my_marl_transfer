@@ -1,9 +1,57 @@
+import os
+import warnings
+
 import numpy as np
 from multiprocessing import Process, Pipe
 from .vec_env import VecEnv, CloudpickleWrapper
 
+
+def _get_cpu_affinity():
+    """Return the CPUs available to the parent process, when supported."""
+    if not hasattr(os, 'sched_getaffinity'):
+        return None
+
+    try:
+        cpu_affinity = tuple(sorted(os.sched_getaffinity(0)))
+    except OSError:
+        return None
+
+    return cpu_affinity or None
+
+
+def _restore_cpu_affinity(cpu_affinity):
+    """Restore the parent's CPU set after multiprocessing's fork hooks run."""
+    if cpu_affinity is None or not hasattr(os, 'sched_setaffinity'):
+        return False
+
+    requested_affinity = set(cpu_affinity)
+    try:
+        os.sched_setaffinity(0, requested_affinity)
+        actual_affinity = set(os.sched_getaffinity(0))
+    except OSError as error:
+        warnings.warn(
+            'Unable to restore environment worker CPU affinity: {}'.format(error),
+            RuntimeWarning,
+        )
+        return False
+
+    if actual_affinity != requested_affinity:
+        warnings.warn(
+            'Environment worker CPU affinity was restricted from {} to {}'.format(
+                sorted(requested_affinity), sorted(actual_affinity)
+            ),
+            RuntimeWarning,
+        )
+        return False
+
+    return True
+
+
 # 每个子环境的独立进程，负责接收指令，执行环境操作，并返回结果。
-def worker(remote, parent_remote, env_fn_wrapper):
+def worker(remote, parent_remote, env_fn_wrapper, cpu_affinity=None):
+    # Some PyTorch/OpenMP combinations narrow forked children to CPUs 0-1.
+    # Restore the CPU set captured from the parent before constructing the env.
+    _restore_cpu_affinity(cpu_affinity)
     parent_remote.close()
     env = env_fn_wrapper.x()
     while True:
@@ -43,8 +91,11 @@ class SubprocVecEnv(VecEnv):
         self.waiting = False
         self.closed = False
         nenvs = len(env_fns)
+        cpu_affinity = _get_cpu_affinity()
         self.remotes, self.work_remotes = zip(*[Pipe() for _ in range(nenvs)])
-        self.ps = [Process(target=worker, args=(work_remote, remote, CloudpickleWrapper(env_fn)))
+        self.ps = [Process(target=worker, args=(work_remote, remote,
+                                               CloudpickleWrapper(env_fn),
+                                               cpu_affinity))
             for (work_remote, remote, env_fn) in zip(self.work_remotes, self.remotes, env_fns)]
         for p in self.ps:
             p.daemon = True # if the main process crashes, we should not cause things to hang
