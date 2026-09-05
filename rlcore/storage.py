@@ -112,7 +112,6 @@ class RolloutStorage(object):
         self.tasks[self.step].copy_(task)
         self.higoal_log_probs[self.step].copy_(higoal_log_probs)
         self.high_values[self.step].copy_(high_values)
-        self.high_values[self.step].copy_(high_values)
         self.goal_dones[self.step + 1].copy_(goal_dones)
         self.ego_nodes[self.step].copy_(ego_nodes)
         self.explore_nodes[self.step].copy_(explore_nodes)

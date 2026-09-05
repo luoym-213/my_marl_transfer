@@ -198,6 +198,7 @@ class Learner(object):
             # ⭐ 收集goal_done和battery信息
             goal_done_list = [info['goal_done'] for info in self.envs_info]
             goal_done_mask = torch.tensor(goal_done_list, dtype=torch.bool, device=self.device)
+            has_high_decisions = bool(goal_done_mask.any())
             agent_world_steps = torch.tensor(
                 [info['world_steps'] for info in self.envs_info], 
                 dtype=torch.float32, 
@@ -245,7 +246,7 @@ class Learner(object):
             all_landmark_nodes = torch.zeros(num_processes * num_agents, new_detected.shape[1], 4, device=self.device)
 
             # ⭐ 高层决策（如果需要）
-            if goal_done_mask.any():
+            if has_high_decisions:
                 update_indices = torch.nonzero(goal_done_mask, as_tuple=False)
                 proc_indices = update_indices[:, 0]
                 agent_indices = update_indices[:, 1]
@@ -347,19 +348,25 @@ class Learner(object):
             all_teammate_nodes = teammate_nodes.repeat(num_agents, 1, 1)    # [num_agents * num_processes, num_agents, 5]
             all_teammate_masks = global_teammate_mask.repeat(num_agents, 1, 1)  # [num_agents * num_processes, num_agents, 1]
             all_explore_nodes = torch.zeros(num_processes * num_agents, K, 4, device=self.device)
-            if goal_done_mask.any():
+            if has_high_decisions:
                 # 将决策智能体的 explore nodes 填充到对应位置
                 all_explore_nodes[linear_indices] = batch_explore_nodes  # batch_explore_nodes: [N, K, 4]
                 # 将teammate_masks中self-masking的部分也更新
                 all_teammate_masks[linear_indices] = batch_teammate_masks
                 
-            # 8. 计算高层value
+            # 8. 只为当前存在高层决策的 process 计算 value。
+            # 非决策点在 SMDP return 中会被 goal_dones 屏蔽。
             # Vector Input: Tensor shape [Batch, N_agents, 4] [x,y,x_g,y_g]
             # Map Input: Tensor shape [Batch, 3, H, W]。
-            # all_critic_vec_inp = [x,y,x_g,y_g]
-            ## 拼接成[num_processes, num_agents, 4]
             all_critic_nodes = torch.cat([agent_positions, all_goals.view(num_agents, num_processes, 2).transpose(0, 1)], dim=-1)  # [num_processes, num_agents, 4]
-            all_high_value = policy.get_high_value(all_critic_map_inp, all_critic_nodes) # 计算所有process的高层value： [num_processes, num_agents]
+            all_high_value = torch.zeros(num_processes, num_agents, device=self.device)
+            decision_process_mask = goal_done_mask.any(dim=1)
+            if has_high_decisions:
+                decision_process_values = policy.get_high_value(
+                    all_critic_map_inp[decision_process_mask],
+                    all_critic_nodes[decision_process_mask]
+                )
+                all_high_value[decision_process_mask] = decision_process_values
 
             # ⭐ 底层策略
             props = policy.low_level_act(all_obs, all_goals, deterministic=False)

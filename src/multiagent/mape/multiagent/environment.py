@@ -159,8 +159,9 @@ class MultiAgentEnv(gym.Env):
         agents_pos = np.array([a.state.p_pos for a in self.agents])
 
         # 必须在更新全图信息图前获取高层奖励，因为高层奖励依赖于step前的全局信息图
-        agents_explore_rewards = self.global_belief_map.get_agent_step_explore_entropy(agents_pos, self.world.mask_obs_dist)
-        agents_discover_target_rewards = self.global_belief_map.get_agent_discover_target_reward(agents_pos, self.world.mask_obs_dist)
+        step_rewards = self.global_belief_map.get_agent_step_rewards(agents_pos, self.world.mask_obs_dist)
+        agents_explore_rewards = step_rewards['explore_rewards']
+        agents_discover_target_rewards = step_rewards['discover_rewards']
         # 到达目标点奖励，需要满足当前当前task = 1，即collect模式，且距离目标点小于阈值
         goal_dones = self._get_goal_dones(self.agents) # 获取当前step后，智能体是否达到目标点的布尔列表
         agents_reach_target_rewards = self.get_target_reward(agents_pos, task_n, goal_dones)
